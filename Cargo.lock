@@ -525,6 +525,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
+dependencies = [
+ "libloading 0.9.0",
+]
+
+[[package]]
 name = "cxx"
 version = "1.0.194"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1843,6 +1852,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "clap",
+ "cudarc 0.19.4",
  "half",
  "ndarray",
  "objc",
@@ -2255,7 +2265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e33e2037d309568bc023bb161c9ea23168ac0e345d398c912061d63dc3fb8415"
 dependencies = [
  "autocxx",
- "cudarc",
+ "cudarc 0.11.9",
  "cxx",
  "libc",
  "libloading 0.9.0",
