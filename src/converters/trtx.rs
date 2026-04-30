@@ -432,10 +432,13 @@ impl TrtxConverter {
     }
 
     /// Build TensorRT network from WebNN graph.
+    ///
+    /// Returns every operand tensor still in the definition (inputs, constants, and all operation
+    /// outputs), keyed by graph operand index.
     pub fn build_network<'a>(
         graph: &'a GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
-    ) -> Result<(), GraphError> {
+    ) -> Result<HashMap<u32, trtx::Tensor<'a>>, GraphError> {
         let mut tensor_map: HashMap<u32, trtx::Tensor<'a>> = HashMap::new();
         let promoted_constants: HashSet<u32> = HashSet::new();
         let constants_stored_flat: HashSet<u32> = HashSet::new();
@@ -595,7 +598,7 @@ impl TrtxConverter {
             }
         }
 
-        Ok(())
+        Ok(tensor_map)
     }
 
     /// Add a single operation to the network
@@ -12632,7 +12635,7 @@ impl GraphConverter for TrtxConverter {
                 reason: format!("Failed to create TensorRT network: {}", e),
             })?;
 
-        Self::build_network(graph_info, &mut network)?;
+        let _tensor_map = Self::build_network(graph_info, &mut network)?;
 
         // Create builder config
         let mut config = builder

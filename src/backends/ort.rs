@@ -17,8 +17,7 @@ use crate::converters::{GraphConverter, OnnxConverter};
 use crate::error::Error;
 use crate::executors::onnx::ensure_ort_initialized;
 use crate::mlcontext::{
-    ListDevices, MLBackendBuilder, MLBackendContext, MLGraph, MLOperand, MLTensor,
-    MLTensorDescriptor,
+    ListDevices, MLBackendContext, MLGraph, MLGraphBuilder, MLOperand, MLTensor, MLTensorDescriptor,
 };
 
 trait ToDispatchResult<T> {
@@ -87,8 +86,16 @@ impl fmt::Debug for OrtBuilder<'_> {
     }
 }
 
-impl<'context> MLBackendBuilder<'context> for OrtBuilder<'context> {
-    fn build(
+impl<'context> OrtBuilder<'context> {
+    pub(crate) fn load_graph(
+        &mut self,
+        graph: &'context GraphInfo,
+    ) -> crate::error::Result<HashMap<String, MLOperand>> {
+        self.graph = Some(graph);
+        Ok(HashMap::new())
+    }
+
+    pub(crate) fn build(
         &mut self,
         _outputs: &HashMap<&str, MLOperand>,
     ) -> crate::error::Result<MLGraph<'context>> {
@@ -109,11 +116,6 @@ impl<'context> MLBackendBuilder<'context> for OrtBuilder<'context> {
                 std::marker::PhantomData,
             ),
         })
-    }
-
-    fn load_graph(&mut self, graph: &'context GraphInfo) -> crate::error::Result<()> {
-        self.graph = Some(graph);
-        Ok(())
     }
 }
 
@@ -437,8 +439,8 @@ impl<'context> MLBackendContext<'context> for OrtContext {
 
     fn create_builder(
         &mut self,
-    ) -> crate::error::Result<Box<dyn MLBackendBuilder<'context> + 'context>> {
-        Ok(Box::new(OrtBuilder { graph: None }))
+    ) -> crate::error::Result<MLGraphBuilder<'context>> {
+        Ok(MLGraphBuilder::Ort(OrtBuilder { graph: None }))
     }
 
     fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> crate::error::Result<MLTensor> {

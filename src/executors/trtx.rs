@@ -17,10 +17,10 @@ use trtx::{CudaEngine, Tensor};
 use crate::GraphInfo;
 use crate::converters::TrtxConverter;
 use crate::error::{Error, GraphError};
-use crate::graph::{OperandDescriptor, get_static_or_max_size};
+use crate::graph::{OperandDescriptor, OperandKind, get_static_or_max_size};
 use crate::mlcontext::MLTensor;
 use crate::mlcontext::{ListDevices, MLOperand};
-use crate::mlcontext::{MLBackendBuilder, MLGraph};
+use crate::mlcontext::{MLGraph, MLGraphBuilder};
 use crate::mlcontext::{MLBackendContext, MLBackendGraph};
 
 // Reexport to allow downstream users (e.g. pywebnn) to set path to TensorRT RTX lib
@@ -482,6 +482,50 @@ impl<'context> TrtxContext<'context> {
     }
 }
 
+/// Build [`HashMap<String, MLOperand>`] keys for [`TrtxBuilder::load_graph`]: WebNN / TRT I/O
+/// names when unique, else `name_operandId` disambiguation, else `webnn_operand_{id}`.
+fn trtx_operand_lookup_strings(
+    graph: &GraphInfo,
+    sorted_operand_ids: &[u32],
+) -> HashMap<String, MLOperand> {
+    let io = TrtxConverter::engine_io_binding_names(graph);
+    let mut preferred: Vec<(u32, String)> = Vec::with_capacity(sorted_operand_ids.len());
+    for &id in sorted_operand_ids {
+        let Some(op) = graph.operand(id) else {
+            continue;
+        };
+        let base = if matches!(op.kind, OperandKind::Input | OperandKind::Output) {
+            io.get(&id)
+                .cloned()
+                .unwrap_or_else(|| TrtxConverter::engine_binding_name(id))
+        } else if let Some(ref n) = op.name {
+            let t = n.trim();
+            if !t.is_empty() {
+                t.to_string()
+            } else {
+                TrtxConverter::engine_binding_name(id)
+            }
+        } else {
+            TrtxConverter::engine_binding_name(id)
+        };
+        preferred.push((id, base));
+    }
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for (_, ref b) in &preferred {
+        *freq.entry(b.clone()).or_insert(0) += 1;
+    }
+    let mut out = HashMap::new();
+    for (id, base) in preferred {
+        let key = if freq[&base] > 1 {
+            format!("{base}_{id}")
+        } else {
+            base
+        };
+        out.insert(key, MLOperand { id: id as usize });
+    }
+    out
+}
+
 #[allow(dead_code)]
 pub(crate) struct TrtxBuilder<'builder> {
     network: trtx::NetworkDefinition<'builder>,
@@ -490,6 +534,9 @@ pub(crate) struct TrtxBuilder<'builder> {
     cuda_context: Arc<CudaContext>,
     runtime: Rc<Mutex<trtx::Runtime<'builder>>>,
     _tensors: Vec<Tensor<'builder>>,
+    /// Populated by [`TrtxBuilder::load_graph`]; cleared in [`TrtxBuilder::build`] before the
+    /// network is serialized (tensor handles are only valid until then).
+    tensor_by_operand_id: HashMap<u32, Tensor<'builder>>,
     //_parser: Option<OnnxParser<'builder>>,
 }
 impl std::fmt::Debug for TrtxBuilder<'_> {
@@ -498,19 +545,23 @@ impl std::fmt::Debug for TrtxBuilder<'_> {
     }
 }
 
-impl<'context> MLBackendBuilder<'context> for TrtxBuilder<'context> {
-    /*async */
-    fn build(
+impl<'context> TrtxBuilder<'context> {
+    pub(crate) fn load_graph(
+        &mut self,
+        graph: &'context GraphInfo,
+    ) -> crate::error::Result<HashMap<String, MLOperand>> {
+        let tensor_map = TrtxConverter::build_network(graph, &mut self.network).map_err(Into::into)?;
+        let mut keys: Vec<u32> = tensor_map.keys().copied().collect();
+        keys.sort_unstable();
+        self.tensor_by_operand_id = tensor_map;
+        Ok(trtx_operand_lookup_strings(graph, &keys))
+    }
+
+    pub(crate) fn build(
         &mut self,
         _outputs: &HashMap<&str, MLOperand>,
     ) -> crate::error::Result<crate::mlcontext::MLGraph<'context>> {
-        // TODO: keep track of id->tensor during building via builder API and also get this mapping
-        // from converter API
-
-        //for (name, tensor) in outputs.iter() {
-        //let trt_tensor = self.network.get_te
-        // unset all outputs, then set outputs according to MLOperands
-        //}
+        self.tensor_by_operand_id.clear();
 
         let host_mem = self
             .builder
@@ -543,8 +594,10 @@ impl<'context> MLBackendBuilder<'context> for TrtxBuilder<'context> {
         })
     }
 
-    fn load_graph(&mut self, graph: &'context GraphInfo) -> crate::error::Result<()> {
-        TrtxConverter::build_network(graph, &mut self.network).map_err(|e| e.into())
+    /// TensorRT network tensor for a graph operand, valid only after [`TrtxBuilder::load_graph`]
+    /// and before [`TrtxBuilder::build`].
+    pub fn trtx_tensor(&self, op: &MLOperand) -> Option<&Tensor<'context>> {
+        self.tensor_by_operand_id.get(&(op.id as u32))
     }
 }
 
@@ -556,8 +609,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
 
     fn create_builder(
         &'_ mut self,
-    ) -> crate::error::Result<Box<dyn crate::mlcontext::MLBackendBuilder<'context> + 'context>>
-    {
+    ) -> crate::error::Result<MLGraphBuilder<'context>> {
         let network = self
             .builder
             .lock()
@@ -567,13 +619,14 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
                 source: Box::new(e),
             })?;
         //self.networks.push(network);
-        Ok(Box::new(TrtxBuilder {
+        Ok(MLGraphBuilder::Trtx(TrtxBuilder {
             network,
             builder: Rc::clone(&self.builder),
             config: Rc::clone(&self.config),
             runtime: Rc::clone(&self.runtime),
             cuda_context: Arc::clone(&self.cuda_ctx),
             _tensors: vec![],
+            tensor_by_operand_id: HashMap::new(),
         }))
     }
 

@@ -3,12 +3,12 @@
 use log::info;
 
 use crate::{GraphInfo, backend_selection::BackendDevice, error::Result};
+#[cfg(feature = "onnx-runtime")]
+use crate::backends::ort::OrtContext;
 #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
-use crate::{
-    backends::ort::OrtContext,
-    error::Error,
-    executors::trtx::{TrtxContext, TrtxGraph},
-};
+use crate::error::Error;
+#[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+use crate::executors::trtx::{TrtxContext, TrtxGraph};
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
@@ -26,7 +26,7 @@ pub(crate) trait ListDevices {
 // could make public later if interface stabilized
 pub(crate) trait MLBackendContext<'context>: std::fmt::Debug {
     fn accelerated(&self) -> bool;
-    fn create_builder(&mut self) -> Result<Box<dyn MLBackendBuilder<'context> + 'context>>;
+    fn create_builder(&mut self) -> Result<MLGraphBuilder<'context>>;
     fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> Result<MLTensor>;
     fn create_constant_tensor(
         &mut self,
@@ -43,12 +43,6 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug {
         inputs: &HashMap<&str, &MLTensor>,
         outputs: &HashMap<&str, &MLTensor>,
     ) -> Result<()>;
-}
-
-pub(crate) trait MLBackendBuilder<'context>: std::fmt::Debug {
-    /*async*/
-    fn build(&mut self, outputs: &HashMap<&str, MLOperand>) -> Result<MLGraph<'context>>;
-    fn load_graph(&mut self, graph: &'context GraphInfo) -> Result<()>;
 }
 
 // can be made a Box<dyn better_any::Tid<'context> + 'context> for dynamic dispatch
@@ -213,6 +207,13 @@ pub struct MLOperand {
     pub(crate) id: usize,
 }
 
+impl MLOperand {
+    /// Graph operand index in [`GraphInfo::operands`].
+    pub fn operand_index(&self) -> u32 {
+        self.id as u32
+    }
+}
+
 impl std::ops::Deref for MLTensorDescriptor {
     type Target = MLOperandDescriptor;
 
@@ -357,24 +358,77 @@ impl<'context> MLContext<'context> {
     }
 }
 
+/// Backend-specific graph builder (ONNX Runtime or TensorRT network).
 #[derive(Debug)]
-pub struct MLGraphBuilder<'context> {
-    backend: Box<dyn MLBackendBuilder<'context> + 'context>,
+pub enum MLGraphBuilder<'context> {
+    #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+    Trtx(crate::executors::trtx::TrtxBuilder<'context>),
+    #[cfg(feature = "onnx-runtime")]
+    Ort(crate::backends::ort::OrtBuilder<'context>),
+    #[cfg(all(
+        not(any(feature = "trtx-runtime", feature = "trtx-runtime-mock")),
+        not(feature = "onnx-runtime")
+    ))]
+    Unsupported(std::marker::PhantomData<&'context ()>),
 }
 
 impl<'context> MLGraphBuilder<'context> {
-    fn new(context: &'_ mut MLContext<'context>) -> Result<Self> {
-        let backend = context.backend.create_builder()?;
-        Ok(Self { backend })
+    pub(crate) fn new(context: &'_ mut MLContext<'context>) -> Result<Self> {
+        context.backend.create_builder()
     }
 
-    fn load_graph(&mut self, graph: &'context GraphInfo) -> Result<()> {
-        self.backend.load_graph(graph)
+    /// Loads a graph and returns each named operand as an [`MLOperand`] (graph operand index in
+    /// [`MLOperand::operand_index`]). For TensorRT, use [`Self::trtx_tensor`] until [`Self::build`].
+    pub fn load_graph(&mut self, graph: &'context GraphInfo) -> Result<HashMap<String, MLOperand>> {
+        match self {
+            #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+            Self::Trtx(b) => b.load_graph(graph),
+            #[cfg(feature = "onnx-runtime")]
+            Self::Ort(b) => b.load_graph(graph),
+            #[cfg(all(
+                not(any(feature = "trtx-runtime", feature = "trtx-runtime-mock")),
+                not(feature = "onnx-runtime")
+            ))]
+            Self::Unsupported(_) => Err(crate::error::Error::GraphBuildError {
+                source: "MLGraphBuilder: compile with onnx-runtime or trtx-runtime"
+                    .into(),
+            }),
+        }
     }
 
-    /*async*/
-    fn build(&mut self, outputs: &HashMap<&str, MLOperand>) -> Result<MLGraph<'context>> {
-        self.backend.build(outputs)
+    pub fn build(&mut self, outputs: &HashMap<&str, MLOperand>) -> Result<MLGraph<'context>> {
+        match self {
+            #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+            Self::Trtx(b) => b.build(outputs),
+            #[cfg(feature = "onnx-runtime")]
+            Self::Ort(b) => b.build(outputs),
+            #[cfg(all(
+                not(any(feature = "trtx-runtime", feature = "trtx-runtime-mock")),
+                not(feature = "onnx-runtime")
+            ))]
+            Self::Unsupported(_) => Err(crate::error::Error::GraphBuildError {
+                source: "MLGraphBuilder: compile with onnx-runtime or trtx-runtime"
+                    .into(),
+            }),
+        }
+    }
+
+    /// TensorRT tensor for this operand after [`Self::load_graph`] and before [`Self::build`].
+    #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+    pub fn trtx_tensor(
+        &self,
+        op: &MLOperand,
+    ) -> Option<&trtx::Tensor<'_>> {
+        match self {
+            Self::Trtx(b) => b.trtx_tensor(op),
+            #[cfg(feature = "onnx-runtime")]
+            Self::Ort(_) => None,
+            #[cfg(all(
+                not(any(feature = "trtx-runtime", feature = "trtx-runtime-mock")),
+                not(feature = "onnx-runtime")
+            ))]
+            Self::Unsupported(_) => None,
+        }
     }
 }
 
@@ -466,7 +520,13 @@ webnn_graph "sample_graph" v1 {
         desc.set_writable(true);
 
         let mut builder = MLGraphBuilder::new(&mut context).unwrap();
-        builder.load_graph(&graph_info).unwrap();
+        let operands = builder.load_graph(&graph_info).unwrap();
+        assert!(operands.contains_key("lhs"));
+        #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+        {
+            let lhs_op = operands.get("lhs").unwrap();
+            assert!(builder.trtx_tensor(lhs_op).is_some());
+        }
         let mut graph = builder.build(&HashMap::new()).unwrap();
 
         let tensor = context.create_tensor(&desc).unwrap();
