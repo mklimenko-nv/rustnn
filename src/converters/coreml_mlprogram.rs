@@ -1531,14 +1531,17 @@ impl CoremlMlProgramConverter {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
 
-                if !new_shape.is_empty() {
-                    let shape_values =
-                        crate::operator_options::mldimensions_static_or_max(new_shape);
-                    inputs.insert(
-                        "shape".to_string(),
-                        Self::create_immediate_int_array(&shape_values),
-                    );
-                }
+                // MIL `reshape` declares `shape` as a required input. Always emit
+                // it, including the valid WebNN scalar-output case (`new_shape = []`)
+                let shape_values = if new_shape.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::operator_options::mldimensions_static_or_max(new_shape)
+                };
+                inputs.insert(
+                    "shape".to_string(),
+                    Self::create_immediate_int_array(&shape_values),
+                );
             }
 
             // Convolution operations: input, filter + parameters
