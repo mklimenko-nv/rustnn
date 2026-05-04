@@ -49,8 +49,8 @@ tokenizers = { version = "0.22", optional = true }
 half = "2.4"
 trtx = { version = "0.5.0", optional = true }
 regex = "1.11"
-webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main" }
-webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
+webnn-graph = "0.3"
+webnn-onnx-utils = "0.1"
 
 web-sys = { version = "0.3.91", git = "https://github.com/theHamsta/wasm-bindgen", branch = "webnn", features = [
     "console",
