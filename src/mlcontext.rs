@@ -29,8 +29,11 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug {
     fn create_builder(&mut self) -> Result<Box<dyn MLBackendBuilder<'context> + 'context>>;
     fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> Result<MLTensor>;
     fn rustnn_resize_tensor(&mut self, tensor: &mut MLTensor, new_shape: &[u64]) -> Result<()>;
-    fn rustnn_set_tensor_capacity(&mut self, tensor: &mut MLTensor, max_shape: &[u64])
-    -> Result<()>;
+    fn rustnn_set_tensor_capacity(
+        &mut self,
+        tensor: &mut MLTensor,
+        max_shape: &[u64],
+    ) -> Result<()>;
     fn create_constant_tensor(
         &mut self,
         descriptor: &MLTensorDescriptor,
@@ -367,6 +370,18 @@ impl<'context> MLContext<'context> {
         }
         self.backend
             .write_tensor(tensor, bytemuck::cast_slice(array))
+    }
+
+    pub fn rustnn_resize_tensor(&mut self, tensor: &mut MLTensor, new_shape: &[u64]) -> Result<()> {
+        self.backend.rustnn_resize_tensor(tensor, new_shape)
+    }
+
+    pub fn rustnn_set_tensor_capacity(
+        &mut self,
+        tensor: &mut MLTensor,
+        max_shape: &[u64],
+    ) -> Result<()> {
+        self.backend.rustnn_set_tensor_capacity(tensor, max_shape)
     }
 }
 
