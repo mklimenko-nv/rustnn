@@ -147,8 +147,8 @@ fn init_state(layout: &Layout) -> StepState {
     }
 }
 
-fn make_tensor(
-    context: &mut MLContext,
+fn make_tensor<'context>(
+    context: &'_ mut MLContext<'context, 'context>,
     dtype: MLOperandDataType,
     shape: Vec<u64>,
     writable: bool,
@@ -159,10 +159,10 @@ fn make_tensor(
     td.set_readable(readable);
     context
         .create_tensor(&td)
-        .map_err(|e| anyhow!("create tensor: {e:?}"))
+        .map_err(move |e| anyhow!("create tensor: {e:?}"))
 }
 
-fn init_step_tensors(context: &mut MLContext, layout: &Layout) -> anyhow::Result<StepTensors> {
+fn init_step_tensors<'context>(context: &'_ mut MLContext<'context, 'context>, layout: &Layout) -> anyhow::Result<StepTensors> {
     let h = layout.num_heads as u64;
     let d = layout.head_dim as u64;
     let max_seq = layout.max_cache_len as u64;
@@ -297,8 +297,8 @@ fn store_present(
 
 // Each step: resize cached tensors to the active shapes, write inputs, dispatch, read outputs.
 // Buffers were pre-sized with `rustnn_set_tensor_capacity` in `init_step_tensors`.
-fn run_step(
-    context: &mut MLContext,
+fn run_step<'context>(
+    context: &mut MLContext<'context, 'context>,
     graph: &mut MLGraph,
     layout: &Layout,
     tensors: &mut StepTensors,
@@ -512,7 +512,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow!("Failed to create MLGraphBuilder:\n{e}"))?;
     info!("Building graph...");
     let mut graph = builder
-        .build_graph_info(&graph_info)
+        .build_graph_info(graph_info)
         .map_err(|e| anyhow!("Failed to build graph:\n{e}"))?;
     info!("Graph built");
 

@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    graph::DataType,
-    mlcontext::{MLTensor, MLTensorDescriptor},
+    Operand, graph::DataType, mlcontext::{MLOperand, MLTensor, MLTensorDescriptor}
 };
 #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
 use cudarc::driver::DriverError;
@@ -10,6 +9,21 @@ use serde_json::Error as JsonError;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Error)]
+pub enum GraphBuilderError {
+    #[error("Failed to build: requested MLGraphBuilder.build with an empty output map")]
+    EmptyOutputHashMap,
+
+    #[error("Failed to build: did not provide name for MLOperand {0:?}")]
+    EmptyOutputName(MLOperand),
+
+    #[error("Failed to build: requested an MLOperand {0:?} as an output that is already an input")]
+    RequestedInputAsOutput(Operand),
+
+    #[error("Failed to build: requested an MLOperand {0:?} as an output that is already an constant")]
+    RequestedConstantAsOutput(Operand),
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -30,7 +44,13 @@ pub enum Error {
         source: GraphError,
     },
 
-    #[error("Failed to convert graph: {source}")]
+    #[error("An error occurred while using the graph builder API: {source}")]
+    GraphBuilderError {
+        #[from]
+        source: GraphBuilderError,
+    },
+
+    #[error("Failed to build graph: {source}")]
     GraphBuildError {
         #[from]
         source: Box<dyn std::error::Error>,

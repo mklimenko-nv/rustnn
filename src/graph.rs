@@ -184,7 +184,7 @@ pub struct ConstantData {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GraphInfo {
     pub operands: Vec<Operand>,
     #[serde(default)]

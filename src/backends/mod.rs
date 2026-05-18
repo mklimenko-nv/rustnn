@@ -16,14 +16,14 @@ pub mod ort {
             panic!("Tried to create disabled ONNX backend");
         }
     }
-    impl<'context> mlcontext::MLBackendContext<'context> for OrtContext {
+    impl<'context, 'builder> mlcontext::MLBackendContext<'context, 'builder> for OrtContext {
         fn accelerated(&self) -> bool {
             todo!()
         }
 
         fn create_builder(
             &mut self,
-        ) -> crate::error::Result<Box<dyn mlcontext::MLBackendBuilder<'context> + 'context>>
+        ) -> crate::error::Result<Box<dyn mlcontext::MLBackendBuilder<'context, 'builder> + 'builder>>
         {
             todo!()
         }
@@ -97,14 +97,14 @@ pub mod trtx {
             panic!("Tried to create disabled Trtx backend");
         }
     }
-    impl<'context> mlcontext::MLBackendContext<'context> for TrtxContext {
+    impl<'context> mlcontext::MLBackendContext<'context, 'builder> for TrtxContext {
         fn accelerated(&self) -> bool {
             todo!()
         }
 
         fn create_builder(
             &mut self,
-        ) -> crate::error::Result<Box<dyn mlcontext::MLBackendBuilder<'context> + 'context>>
+        ) -> crate::error::Result<Box<dyn mlcontext::MLBackendBuilder<'context, 'builder> + 'builder>>
         {
             todo!()
         }

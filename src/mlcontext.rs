@@ -2,15 +2,18 @@
 
 use log::info;
 
+use crate::OperandDescriptor;
 #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
 use crate::backends::trtx::TrtxGraph;
 use crate::error::Error;
+use crate::graph::Dimension;
 use crate::{GraphInfo, backend_selection::BackendDevice, error::Result};
 
 use crate::backends::ort::OrtContext;
 use crate::backends::trtx::TrtxContext;
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
+pub use crate::mlgraphbuilder::MLGraphBuilder;
 use crate::{
     backend_selection::{select_backend, select_backend_by_gpu},
     operator_enums::MLOperandDataType,
@@ -24,9 +27,11 @@ pub(crate) trait ListDevices {
 }
 
 // could make public later if interface stabilized
-pub(crate) trait MLBackendContext<'context>: std::fmt::Debug {
+pub(crate) trait MLBackendContext<'context, 'builder>: std::fmt::Debug {
     fn accelerated(&self) -> bool;
-    fn create_builder(&mut self) -> Result<Box<dyn MLBackendBuilder<'context> + 'context>>;
+    fn create_builder(
+        &mut self,
+    ) -> Result<Box<dyn MLBackendBuilder<'context, 'builder> + 'builder>>;
     fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> Result<MLTensor>;
     fn rustnn_resize_tensor(&mut self, tensor: &mut MLTensor, new_shape: &[u64]) -> Result<()>;
     fn rustnn_set_tensor_capacity(
@@ -51,10 +56,9 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug {
     ) -> Result<()>;
 }
 
-pub(crate) trait MLBackendBuilder<'context>: std::fmt::Debug {
+pub(crate) trait MLBackendBuilder<'context, 'builder>: std::fmt::Debug {
     /*async*/
-    fn build(&mut self, outputs: &HashMap<&str, MLOperand>) -> Result<MLGraph<'context>>;
-    fn load_graph(&mut self, graph: &'context GraphInfo) -> Result<()>;
+    fn build(&mut self, graph: GraphInfo) -> Result<MLGraph<'context>>;
 }
 
 // can be made a Box<dyn better_any::Tid<'context> + 'context> for dynamic dispatch
@@ -165,6 +169,20 @@ pub struct MLOpSupportLimits {}
 pub struct MLOperandDescriptor {
     data_type: MLOperandDataType,
     shape: Vec<u64>,
+}
+
+impl Into<OperandDescriptor> for &MLOperandDescriptor {
+    fn into(self) -> OperandDescriptor {
+        OperandDescriptor {
+            data_type: self.data_type.into(),
+            shape: self
+                .shape
+                .iter()
+                .map(|s| Dimension::Static(*s as u32))
+                .collect(),
+            pending_permutation: Default::default(),
+        }
+    }
 }
 
 impl MLOperandDescriptor {
@@ -278,17 +296,17 @@ impl MLTensorDescriptor {
 }
 
 #[derive(Debug)]
-pub struct MLContext<'context> {
-    pub(crate) backend: Box<dyn MLBackendContext<'context> + 'context>,
+pub struct MLContext<'context, 'builder> {
+    pub(crate) backend: Box<dyn MLBackendContext<'context, 'builder> + 'context>,
 }
 
-impl<'context> MLContext<'context> {
+impl<'context: 'builder, 'builder> MLContext<'context, 'builder> {
     // those are methods on `create_context`
     //pub async
     pub fn create(options: &MLContextOptions) -> Result<Self> {
         let desc = select_backend(options)?;
         info!("Backend selected: {desc:?}");
-        let backend: Box<dyn MLBackendContext<'context> + 'context> = match desc {
+        let backend: Box<dyn MLBackendContext<'context, 'builder> + 'context> = match desc {
             crate::backend_selection::BackendDevice::Onnx { ep_device_idx, .. } => {
                 Box::new(OrtContext::new_from_ep_idx(ep_device_idx)?)
             }
@@ -387,7 +405,7 @@ impl<'context> MLContext<'context> {
 
 #[cfg(test)]
 mod test {
-    use crate::{mlcontext::*, webnn_json::from_graph_json};
+    use crate::{mlcontext::*, mlgraphbuilder::MLGraphBuilder, webnn_json::from_graph_json};
 
     #[test]
     fn test_tensor_desc() {
@@ -480,7 +498,8 @@ webnn_graph "sample_graph" v1 {
         desc.set_writable(true);
 
         let mut builder = MLGraphBuilder::new(&mut context).unwrap();
-        let mut graph = builder.build_graph_info(&graph_info).unwrap();
+        let mut graph = builder.build_graph_info(graph_info).unwrap();
+        drop(builder); // TODO: should probably just consume builder on build
 
         let tensor = context.create_tensor(&desc).unwrap();
         let mut inputs = HashMap::new();

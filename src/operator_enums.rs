@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::DataType;
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -12,6 +13,21 @@ pub enum MLOperandDataType {
     Uint64,
     Int8,
     Uint8,
+}
+
+impl Into<DataType> for MLOperandDataType {
+    fn into(self) -> DataType {
+        match self {
+            MLOperandDataType::Float32 => DataType::Float32,
+            MLOperandDataType::Float16 => DataType::Float16,
+            MLOperandDataType::Int32 => DataType::Int32,
+            MLOperandDataType::Uint32 => DataType::Uint32,
+            MLOperandDataType::Int64 => DataType::Int64,
+            MLOperandDataType::Uint64 => DataType::Uint64,
+            MLOperandDataType::Int8 => DataType::Int8,
+            MLOperandDataType::Uint8 => DataType::Uint8,
+        }
+    }
 }
 
 impl MLOperandDataType {
