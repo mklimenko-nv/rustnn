@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use crate::{
-    Operand, graph::DataType, mlcontext::{MLOperand, MLTensor, MLTensorDescriptor}
+    Operand,
+    graph::DataType,
+    mlcontext::{MLOperand, MLOperandDescriptor, MLTensor, MLTensorDescriptor},
 };
 #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
 use cudarc::driver::DriverError;
@@ -15,14 +17,27 @@ pub enum GraphBuilderError {
     #[error("Failed to build: requested MLGraphBuilder.build with an empty output map")]
     EmptyOutputHashMap,
 
+    #[error("Failed to build: did not provide an input name for tensor with descriptor {0:?}")]
+    EmptyInputName(MLOperandDescriptor),
+
     #[error("Failed to build: did not provide name for MLOperand {0:?}")]
     EmptyOutputName(MLOperand),
 
-    #[error("Failed to build: requested an MLOperand {0:?} as an output that is already an input")]
-    RequestedInputAsOutput(Operand),
+    #[error(
+        "Failed to build: requested an MLOperand with id {id} as an output that is already an input:\n{operand:#?}"
+    )]
+    RequestedInputAsOutput { operand: Operand, id: usize },
 
-    #[error("Failed to build: requested an MLOperand {0:?} as an output that is already an constant")]
-    RequestedConstantAsOutput(Operand),
+    #[error(
+        "Failed to build: requested an MLOperand with id {id} as an output that is already an constant:\n{operand:#?}"
+    )]
+    RequestedConstantAsOutput { operand: Operand, id: usize },
+
+    #[error("Graph already built: a MLGraphBuilder can only build one graph")]
+    GraphAlreadyBuilt,
+
+    #[error("Invalid operand. Was this operand produced by a different GraphBuilder?")]
+    InvalidOperand,
 }
 
 #[derive(Debug, Error)]
