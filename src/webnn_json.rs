@@ -198,6 +198,9 @@ pub fn to_graph_json(graph: &GraphInfo, quantized: bool) -> Result<GraphJson, Gr
                     );
                 }
             }
+            OperandKind::Intermediate => {
+                // Intermediates are not in graph json
+            }
             OperandKind::Output => {
                 // Outputs are handled separately below
             }
@@ -383,7 +386,7 @@ pub fn from_graph_json(graph_json: &GraphJson) -> Result<GraphInfo, GraphError> 
                             shape: Vec::new(),            // Will be inferred
                             pending_permutation: Vec::new(),
                         },
-                        kind: OperandKind::Output, // Mark as Output (intermediate results)
+                        kind: OperandKind::Intermediate,
                     });
 
                     Ok::<u32, GraphError>(idx)
@@ -474,10 +477,9 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
         for v in arr {
             if let Some(n) = v.as_i64() {
                 out.push(n);
-            } else if let Some(n) = v.as_u64() {
-                out.push(n as i64);
             } else {
-                return None;
+                let n = v.as_u64()?;
+                out.push(n as i64);
             }
         }
         Some(out)
