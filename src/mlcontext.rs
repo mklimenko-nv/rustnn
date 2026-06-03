@@ -6,8 +6,9 @@ use crate::OperandDescriptor;
 #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
 use crate::backends::trtx::TrtxGraph;
 use crate::error::Error;
-use crate::graph::{Dimension, get_static_or_max_size};
+use crate::graph::{DataType, Dimension, Operand, get_static_or_max_size};
 use crate::mlgraphbuilder::get_operand;
+use crate::runtime_checks::{RuntimeShapeState, TensorKind};
 use crate::{GraphInfo, backend_selection::BackendDevice, error::Result};
 
 use crate::backends::ort::OrtContext;
@@ -167,7 +168,97 @@ impl MLTensor {
 #[derive(Debug)]
 pub struct MLGraph<'context> {
     pub(crate) backend: MLBackendGraph<'context>,
+
+    // inputs/outputs of compiled graph
+    pub input_descriptors: HashMap<String, OperandDescriptor>,
+    pub output_descriptors: HashMap<String, OperandDescriptor>,
 }
+
+impl<'context> MLGraph<'context> {
+    pub(crate) fn new(backend: MLBackendGraph<'context>, graph_info: &GraphInfo) -> Result<Self> {
+        let (input_descriptors, output_descriptors) = graph_info
+            .io_binding_maps()
+            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        Ok(Self {
+            backend,
+            input_descriptors,
+            output_descriptors,
+        })
+    }
+
+    fn operand_descriptors(
+        operands: &HashMap<String, Operand>,
+    ) -> HashMap<String, OperandDescriptor> {
+        operands
+            .iter()
+            .map(|(name, op)| (name.clone(), op.descriptor.clone()))
+            .collect()
+    }
+
+    fn verify_dispatch_bindings(
+        &mut self,
+        inputs: &HashMap<&str, &MLTensor>,
+        outputs: &HashMap<&str, &MLTensor>,
+    ) -> Result<()> {
+        let input_shapes: HashMap<String, Vec<usize>> = inputs
+            .iter()
+            .map(|(&name, tensor)| {
+                (
+                    name.to_string(),
+                    tensor.shape().iter().map(|&d| d as usize).collect(),
+                )
+            })
+            .collect();
+        let output_shapes: HashMap<String, Vec<usize>> = outputs
+            .iter()
+            .map(|(&name, tensor)| {
+                (
+                    name.to_string(),
+                    tensor.shape().iter().map(|&d| d as usize).collect(),
+                )
+            })
+            .collect();
+
+        let mut runtime_shape_state = RuntimeShapeState::new();
+        runtime_shape_state
+            .validate_named_shapes(&input_shapes, &self.input_descriptors, TensorKind::Input)
+            .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+        runtime_shape_state
+            .validate_named_shapes(&output_shapes, &self.output_descriptors, TensorKind::Output)
+            .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+
+        for (&name, tensor) in inputs {
+            let expected = self.input_descriptors.get(name).expect("validated above");
+            if DataType::from(tensor.data_type()) != expected.data_type {
+                return Err(Error::GraphDispatchError {
+                    source: format!(
+                        "input '{name}' data type mismatch (expected {:?}, got {:?})",
+                        expected.data_type,
+                        tensor.data_type()
+                    )
+                    .into(),
+                });
+            }
+        }
+
+        for (&name, tensor) in outputs {
+            let expected = self.output_descriptors.get(name).expect("validated above");
+            if DataType::from(tensor.data_type()) != expected.data_type {
+                return Err(Error::GraphDispatchError {
+                    source: format!(
+                        "output '{name}' data type mismatch (expected {:?}, got {:?})",
+                        expected.data_type,
+                        tensor.data_type()
+                    )
+                    .into(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct MLOpSupportLimits {}
 
@@ -277,7 +368,7 @@ pub struct MLTensorDescriptor {
     writable: bool,
 }
 
-#[derive(Debug, Eq, PartialEq, Default, Copy, Clone)]
+#[derive(Debug, Eq, PartialEq, Default, Copy, Clone, Hash)]
 pub struct MLOperand {
     pub(crate) id: usize,
 }
@@ -444,6 +535,7 @@ impl<'context> MLContext<'context> {
             }
         }
 
+        graph.verify_dispatch_bindings(inputs, outputs)?;
         self.backend.dispatch(graph, inputs, outputs)
     }
 
@@ -516,6 +608,50 @@ impl<'context> MLContext<'context> {
 mod test {
     use crate::{mlcontext::*, mlgraphbuilder::MLGraphBuilder, webnn_json::from_graph_json};
 
+    fn create_add_graph_context_and_graph() -> Option<(MLContext<'static>, MLGraph<'static>)> {
+        let contents = r#"
+webnn_graph "sample_graph" v1 {
+  inputs {
+    lhs: f32[2, 2];
+  }
+
+  consts {
+    rhs: f32[2, 2] @scalar(1.0);
+  }
+
+  nodes {
+    sum = add(lhs, rhs);
+  }
+
+  outputs { sum; }
+}"#;
+
+        let _ = pretty_env_logger::try_init();
+        let sanitized = crate::loader::sanitize_webnn_identifiers(contents);
+        let graph_json = webnn_graph::parser::parse_wg_text(&sanitized).unwrap();
+        let graph_info = from_graph_json(&graph_json).unwrap();
+
+        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
+        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+            return None;
+        };
+
+        let mut context = context.unwrap();
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let graph = builder.build_graph_info(graph_info).unwrap();
+        drop(builder);
+
+        Some((context, graph))
+    }
+
+    fn rw_tensor_desc(shape: Vec<u64>) -> MLTensorDescriptor {
+        let mut desc =
+            MLTensorDescriptor::new(crate::operator_enums::MLOperandDataType::Float32, shape);
+        desc.set_readable(true);
+        desc.set_writable(true);
+        desc
+    }
+
     #[test]
     fn test_tensor_desc() {
         let default_operand_desc = MLOperandDescriptor::default();
@@ -565,44 +701,11 @@ mod test {
 
     #[test]
     fn test_dispatch() {
-        let contents = r#"
-webnn_graph "sample_graph" v1 {
-  inputs {
-    lhs: f32[2, 2];
-  }
-
-  consts {
-    rhs: f32[2, 2] @scalar(1.0);
-  }
-
-  nodes {
-    sum = add(lhs, rhs);
-  }
-
-  outputs { sum; }
-}"#;
-
-        let _ = pretty_env_logger::try_init();
-        let sanitized = crate::loader::sanitize_webnn_identifiers(contents);
-        let graph_json = webnn_graph::parser::parse_wg_text(&sanitized).unwrap();
-        let graph_info = from_graph_json(&graph_json).unwrap();
-
-        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
-        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+        let Some((mut context, mut graph)) = create_add_graph_context_and_graph() else {
             return;
         };
-        let mut context = context.unwrap();
         dbg!(&context);
-        let mut desc = MLTensorDescriptor::new(
-            crate::operator_enums::MLOperandDataType::Float32,
-            [2, 2].to_vec(),
-        );
-        desc.set_readable(true);
-        desc.set_writable(true);
-
-        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
-        let mut graph = builder.build_graph_info(graph_info).unwrap();
-        drop(builder); // TODO: should probably just consume builder on build
+        let desc = rw_tensor_desc([2, 2].to_vec());
 
         let tensor = context.create_tensor(&desc).unwrap();
         let mut inputs = HashMap::new();
@@ -618,5 +721,72 @@ webnn_graph "sample_graph" v1 {
         context.dispatch(&mut graph, &inputs, &outputs).unwrap();
         context.read_tensor(&tensor, &mut download).unwrap();
         assert_eq!(&vec![2.0f32, 3., 4., 5.], &download);
+    }
+
+    #[test]
+    fn test_dispatch_invalid_input_name_error_message() {
+        let Some((mut context, mut graph)) = create_add_graph_context_and_graph() else {
+            return;
+        };
+
+        let desc = rw_tensor_desc([2, 2].to_vec());
+        let tensor = context.create_tensor(&desc).unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert("invalid_input", &tensor);
+        let mut outputs = HashMap::new();
+        outputs.insert("sum", &tensor);
+
+        let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
+        std::assert_matches!(
+            err,
+            crate::error::Error::GraphDispatchError { source }
+                if source.to_string() == "missing runtime input tensor `lhs`"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_invalid_input_shape_error_message() {
+        let Some((mut context, mut graph)) = create_add_graph_context_and_graph() else {
+            return;
+        };
+
+        let desc = rw_tensor_desc([2, 3].to_vec());
+        let tensor = context.create_tensor(&desc).unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert("lhs", &tensor);
+        let mut outputs = HashMap::new();
+        outputs.insert("sum", &tensor);
+
+        let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
+        std::assert_matches!(
+            err,
+            crate::error::Error::GraphDispatchError { source }
+                if source.to_string()
+                    == "runtime input tensor `lhs` dimension 1 mismatch (expected 2, got 3)"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_invalid_output_shape_error_message() {
+        let Some((mut context, mut graph)) = create_add_graph_context_and_graph() else {
+            return;
+        };
+
+        let in_desc = rw_tensor_desc([2, 2].to_vec());
+        let out_desc = rw_tensor_desc([2, 3].to_vec());
+        let input_tensor = context.create_tensor(&in_desc).unwrap();
+        let output_tensor = context.create_tensor(&out_desc).unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert("lhs", &input_tensor);
+        let mut outputs = HashMap::new();
+        outputs.insert("sum", &output_tensor);
+
+        let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
+        std::assert_matches!(
+            err,
+            crate::error::Error::GraphDispatchError { source }
+                if source.to_string()
+                    == "runtime output tensor `sum` dimension 1 mismatch (expected 2, got 3)"
+        );
     }
 }
