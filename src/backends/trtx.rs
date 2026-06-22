@@ -1,5 +1,8 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::ops::Deref;
+use std::sync::LazyLock;
 
 use cudarc::driver::CudaSlice;
 use cudarc::driver::CudaStream;
@@ -9,19 +12,58 @@ use log::debug;
 use log::info;
 use log::trace;
 use log::warn;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use trtx::CudaEngine;
 use trtx::ExecutionContext;
-use trtx::Tensor;
+use trtx::Refitter;
+use trtx::host_memory::HostMemory;
 
 use crate::GraphInfo;
+use crate::backends::caching::CacheResult;
+use crate::backends::caching::DefaultCache;
+use crate::backends::caching::PersistentCache;
+use crate::converters::TrtxConverter;
 use crate::error::Error;
 
+use crate::error::GraphBuilderError;
 use crate::mlcontext::MLTensor;
 use crate::mlcontext::{ListDevices, MLOperand};
 use crate::mlcontext::{MLBackendBuilder, MLGraph};
 use crate::mlcontext::{MLBackendContext, MLBackendGraph};
+
+// TODO: also used in trtexec-rs. Should be part of trtx API?
+enum HostMemoryOrVec<'memory> {
+    HostMemory(HostMemory<'memory>),
+    Cow(Cow<'memory, [u8]>),
+}
+
+impl<'memory> AsRef<[u8]> for HostMemoryOrVec<'memory> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            HostMemoryOrVec::HostMemory(host_memory) => host_memory.as_ref(),
+            HostMemoryOrVec::Cow(items) => items.as_ref(),
+        }
+    }
+}
+
+impl<'memory> Deref for HostMemoryOrVec<'memory> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl<'buffer> From<HostMemory<'buffer>> for HostMemoryOrVec<'buffer> {
+    fn from(value: HostMemory<'buffer>) -> Self {
+        HostMemoryOrVec::HostMemory(value)
+    }
+}
+impl<'memory> From<Cow<'memory, [u8]>> for HostMemoryOrVec<'memory> {
+    fn from(value: Cow<'memory, [u8]>) -> Self {
+        HostMemoryOrVec::Cow(value)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrtxError {
@@ -129,9 +171,9 @@ pub(crate) struct TrtxContext<'context> {
     cuda_ctx: Arc<CudaContext>,
     tensors: Vec<TrtxTensor>,
     events: Vec<CudaEvent>,
-    runtime: Rc<Mutex<trtx::Runtime<'context>>>,
-    config: Rc<Mutex<trtx::BuilderConfig<'context>>>, // needs to be destroyed before builder
-    builder: Rc<Mutex<trtx::Builder<'context>>>,
+    runtime: Arc<Mutex<trtx::Runtime<'context>>>,
+    config: Arc<Mutex<trtx::BuilderConfig<'context>>>, // needs to be destroyed before builder
+    builder: Arc<Mutex<trtx::Builder<'context>>>,
 }
 
 impl std::fmt::Debug for TrtxContext<'_> {
@@ -154,15 +196,20 @@ impl<'context> TrtxContext<'context> {
         // this retains the primary context
         let cuda_ctx = CudaContext::new(cuda_device_idx as usize)?;
         let mut builder = trtx::Builder::new(&LOGGER)?;
-        let config = Rc::new(builder.create_config()?.into());
-        let runtime = Rc::new(trtx::Runtime::new(&LOGGER)?.into());
+        let mut config = builder.create_config()?;
+        // Strip marked weights weights from engine and makes them refittable, keeps other weights
+        // (mostly scalars)
+        config.set_flag(trtx::trtx_sys::BuilderFlag::kREFIT_INDIVIDUAL);
+        config.set_flag(trtx::trtx_sys::BuilderFlag::kSTRIP_PLAN);
+        let config = Arc::new(config.into());
+        let runtime = Arc::new(trtx::Runtime::new(&LOGGER)?.into());
         debug!("Created new TrtxContext");
         Ok(Self {
             cuda_ctx,
             tensors: vec![],
             events: vec![],
             runtime,
-            builder: Rc::new(builder.into()),
+            builder: Arc::new(builder.into()),
             config,
         })
     }
@@ -170,20 +217,32 @@ impl<'context> TrtxContext<'context> {
 
 #[allow(dead_code)]
 pub(crate) struct TrtxBuilder<'builder> {
-    network: Option<trtx::NetworkDefinition<'builder>>,
-    builder: Rc<Mutex<trtx::Builder<'builder>>>,
-    config: Rc<Mutex<trtx::BuilderConfig<'builder>>>,
+    network: Mutex<Option<trtx::NetworkDefinition<'builder>>>,
+    builder: Arc<Mutex<trtx::Builder<'builder>>>,
+    config: Arc<Mutex<trtx::BuilderConfig<'builder>>>,
     cuda_context: Arc<CudaContext>,
-    runtime: Rc<Mutex<trtx::Runtime<'builder>>>,
+    runtime: Arc<Mutex<trtx::Runtime<'builder>>>,
     operands: HashMap<String, MLOperand>,
-    tensors: Vec<Tensor<'builder>>,
     strings: Vec<String>, //_parser: Option<OnnxParser<'builder>>,
+    caching_enabled: bool,
 }
+
 impl std::fmt::Debug for TrtxBuilder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TrtxBuilder").finish()
     }
 }
+
+static ENGINE_CACHE: LazyLock<CacheResult<DefaultCache>> =
+    LazyLock::new(|| DefaultCache::new("trtx"));
+static TRTX_SUFFIX: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "trtx_{}.{}.{}",
+        unsafe { trtx::trtx_sys::get_tensorrt_major_version() },
+        unsafe { trtx::trtx_sys::get_tensorrt_minor_version() },
+        unsafe { trtx::trtx_sys::get_tensorrt_patch_version() }
+    )
+});
 
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'context> {
     /*async */
@@ -191,30 +250,117 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
         &mut self,
         graph: GraphInfo,
     ) -> crate::error::Result<crate::mlcontext::MLGraph<'context>> {
-        let mut network = self.network.take().unwrap();
-        crate::converters::TrtxConverter::build_network(&graph, &mut network)?;
+        let mut engine_bytes: Option<HostMemoryOrVec> = None;
+        let mut hash_key: Option<String> = None;
 
-        let host_mem = self
-            .builder
-            .lock()
-            .unwrap()
-            .build_serialized_network(&mut network, &mut self.config.lock().unwrap())
-            .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
+        if self.caching_enabled {
+            let key = graph.hash_identifier_without_weights(&TRTX_SUFFIX);
+            if let Ok(cache) = ENGINE_CACHE.as_ref()
+                && let Ok(engine) = cache.get(&key)
+            {
+                debug!("Using cached engine of size {}", engine.len());
+                engine_bytes = Some(engine.into());
+            } else {
+                debug!("Could not get cached engine. Rebuilding from network defintion...");
+            }
+            hash_key = Some(key);
+        }
+
+        if engine_bytes.is_none() {
+            let mut network = self
+                .network
+                .lock()
+                .unwrap()
+                .take()
+                .expect("Frontend API should prevent TrtxBuilder::build to be called twice");
+            crate::converters::TrtxConverter::build_network(&graph, &mut network)?;
+            for constant_id in graph.constant_operand_ids_to_handles.keys() {
+                network.mark_weights_refittable(&format!("{constant_id}"))?;
+            }
+
+            let host_mem = self
+                .builder
+                .lock()
+                .unwrap()
+                .build_serialized_network(&mut network, &mut self.config.lock().unwrap())
+                .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
+            if let Ok(cache) = ENGINE_CACHE.as_ref()
+                && let Some(key) = hash_key
+                && let Err(error) = cache.set(&key, &host_mem)
+            {
+                warn!("Failed to write engine to cache: {error}");
+            }
+            engine_bytes = Some(host_mem.into());
+        }
+
+        let engine_bytes =
+            engine_bytes.expect("already got cached engine or tried building engine");
 
         self.cuda_context.bind_to_thread()?;
         let mut engine = self
             .runtime
             .lock()
             .unwrap()
-            .deserialize_cuda_engine(&host_mem)
+            .deserialize_cuda_engine(&engine_bytes)
             .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
+
+        // TODO: wrap_err, when this fails usually the engine was built without kREFIT flag
+        let mut refitter = Refitter::new(&engine, &LOGGER)?;
+
+        for (id, constant) in graph.constant_operand_ids_to_handles.iter() {
+            let operand = graph.operands.get(*id as usize);
+            if let Some(operand) = operand.as_ref() {
+                let trt_type = TrtxConverter::webnn_to_trt_dtype(operand.descriptor.data_type)?;
+                let element_count = operand.descriptor.element_count().ok_or_else(|| {
+                    std::convert::Into::<crate::error::Error>::into(
+                        GraphBuilderError::InconsistentGraphInfo {
+                            message: format!(
+                                "Constant with dynamic size: id={id} operand={operand:#?}"
+                            ),
+                        },
+                    )
+                })?;
+                let expected_bytes = element_count * trt_type.size_bits() / 8;
+                if constant.data.len() != expected_bytes {
+                    return Err(GraphBuilderError::InconsistentGraphInfo {
+                        message: format!(
+                            "Weight size mismatch: expected {expected_bytes} bytes, got {} bytes",
+                            constant.data.len()
+                        ),
+                    }
+                    .into());
+                }
+                let weight_name = format!("{id}");
+                trace!("Trying to refit weight {weight_name}");
+                unsafe {
+                    refitter.set_named_weights_with_location(
+                        &weight_name, // TODO: add API to name weights to trtx
+                        trtx::trtx_sys::Weights {
+                            type_: trt_type.into(),
+                            values: constant.data.as_ptr() as *const std::ffi::c_void,
+                            count: element_count as i64,
+                        },
+                        // TODO: register and upload during build, refit with device location
+                        trtx::trtx_sys::nvinfer1::TensorLocation::kHOST,
+                    )?
+                };
+            } else {
+                return Err(GraphBuilderError::InconsistentGraphInfo {
+                    message: format!(
+                        "Inconsistent GraphInfo: Constant operation with {id} is missing operations"
+                    ),
+                }
+                .into());
+            }
+        }
+        refitter.refit_cuda_engine()?;
 
         let exec = engine
             .create_execution_context()
             .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
 
-        Ok(MLGraph {
-            backend: MLBackendGraph::TrtxEngine(TrtxGraph {
+        MLGraph::new(
+            MLBackendGraph::TrtxEngine(TrtxGraph {
                 _engine: engine,
                 exec,
                 cuda_stream: self
@@ -222,7 +368,8 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
                     .new_stream()
                     .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?,
             }),
-        })
+            &graph,
+        )
     }
 }
 
@@ -248,17 +395,22 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
                 .map_err(|e| Error::BuilderCreationError {
                     source: Box::new(e),
                 })?,
-        );
+        )
+        .into();
         //self.networks.push(network);
         Ok(Box::new(TrtxBuilder {
             network,
-            builder: Rc::clone(&self.builder),
-            config: Rc::clone(&self.config),
-            runtime: Rc::clone(&self.runtime),
+            builder: Arc::clone(&self.builder),
+            config: Arc::clone(&self.config),
+            runtime: Arc::clone(&self.runtime),
             cuda_context: Arc::clone(&self.cuda_ctx),
             operands: HashMap::new(),
-            tensors: vec![],
             strings: vec![],
+            // disabled for now, since feature experimental.
+            // can be enabled with more test coverage, but will remain a double-sided sword
+            // e.g. if you change trtx converter, changes might not be visible, since cache skips conversion
+            // maybe the build hash of certain trtx related files could be included in hash
+            caching_enabled: false,
         }))
     }
 

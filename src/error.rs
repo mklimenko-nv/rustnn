@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::{
     Operand, Operation,
+    backends::caching::CacheError,
     graph::DataType,
     mlcontext::{MLOperand, MLOperandDescriptor, MLTensor, MLTensorDescriptor},
 };
@@ -96,6 +97,15 @@ pub enum GraphBuilderError {
     #[error("Failed to build: requested MLGraphBuilder.build with an empty output map")]
     EmptyOutputHashMap,
 
+    #[error(
+        "Duplicates in outputs: used MLOperand {operand:?} for ouput name {first_name:?} and {second_name:?}"
+    )]
+    DuplicateOutput {
+        operand: MLOperand,
+        first_name: String,
+        second_name: String,
+    },
+
     #[error("Failed to build: did not provide an input name for tensor with descriptor {0:?}")]
     EmptyInputName(MLOperandDescriptor),
 
@@ -135,6 +145,22 @@ pub enum GraphBuilderError {
         required_size: usize,
         provided_size: usize,
     },
+
+    #[error(
+        "Build with invalid operand: operand {operand:?} assigned to name {name:?} is not part of this graph"
+    )]
+    BuildWithInvalidOperand { operand: MLOperand, name: String },
+
+    #[error("A cache error occurred: {source}")]
+    CacheError {
+        #[from]
+        source: CacheError,
+    },
+
+    // TODO: this should not be needed, instead GraphInfo should ensure via methods to be always consistent
+    // and impossible to construct invalid variants
+    #[error("Internal error: inconsistent GraphInfo: {message}")]
+    InconsistentGraphInfo { message: String },
 }
 
 #[derive(Debug, Error)]
@@ -298,6 +324,24 @@ pub enum GraphError {
         operand: u32,
         expected: usize,
         actual: usize,
+    },
+    // TODO: this indicates an invalid state of GraphError. Prevent this from occurring in GraphError and then remove the
+    // error
+    #[error(
+        "graph input operand ids doesn't match the ids of OperandKind::Input: {input_ids:?} vs {input_ids_in_operands:?}"
+    )]
+    InputIdListMismatch {
+        input_ids: Vec<u32>,
+        input_ids_in_operands: Vec<u32>,
+    },
+    // TODO: this indicates an invalid state of GraphError. Prevent this from occurring in GraphError and then remove the
+    // error
+    #[error(
+        "graph output operand ids doesn't match the ids of OperandKind::Input: {output_ids:?} vs {output_ids_in_operands:?}"
+    )]
+    OutputIdListMismatch {
+        output_ids: Vec<u32>,
+        output_ids_in_operands: Vec<u32>,
     },
     #[error("graph input operand list does not match operand table")]
     InputOperandListMismatch,
