@@ -9,8 +9,12 @@ on:
 jobs:
   # Rust tests
   rust-test:
-    name: Rust Tests
-    runs-on: ubuntu-latest
+    name: Rust Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -23,14 +27,22 @@ jobs:
         uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Install Rust formatting toolchain
+        if: runner.os == 'Linux'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
-      - name: Install protobuf compiler
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+          protoc --version
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
           protoc --version
 
       - name: Cache cargo registry
@@ -55,6 +67,7 @@ jobs:
         run: cargo +1.95.0 fetch --locked
 
       - name: Run cargo fmt check
+        if: runner.os == 'Linux'
         run: cargo +stable fmt --all -- --check
 
       - name: Run cargo check
@@ -67,19 +80,31 @@ jobs:
         run: cargo +1.95.0 check --no-default-features --features onnx-runtime
 
       - name: Run cargo check (TensorRT)
+        if: runner.os == 'Linux'
         run: cargo +1.95.0 check -F trtx-runtime
 
       - name: Run cargo check (LiteRT)
+        if: runner.os == 'Linux'
         run: cargo +1.95.0 check --features litert-runtime
+
+      - name: Run cargo check (CoreML)
+        if: runner.os == 'macOS'
+        run: cargo +1.95.0 check --features coreml-runtime
 
       - name: Run cargo test (library only)
         run: cargo +1.96.0 test --lib
 
+      - name: Run cargo test (library only, CoreML)
+        if: runner.os == 'macOS'
+        run: cargo +1.96.0 test --lib --features coreml-runtime
+
       - name: Check backend operator report is up to date
+        if: runner.os == 'Linux'
         run: |
           python3 scripts/generate_backend_operator_report.py --check
 
       - name: Run backend operator report parser tests
+        if: runner.os == 'Linux'
         run: |
           python3 -m unittest scripts/test_generate_backend_operator_report.py
 
