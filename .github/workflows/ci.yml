@@ -83,6 +83,60 @@ jobs:
         run: |
           python3 -m unittest scripts/test_generate_backend_operator_report.py
 
+  wpt-conformance:
+    name: WPT Conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache WPT checkout
+        uses: actions/cache@v4
+        with:
+          path: .cache/wpt
+          key: wpt-${{ runner.os }}-${{ hashFiles('scripts/fetch_wpt.mjs') }}
+          restore-keys: |
+            wpt-${{ runner.os }}-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-wpt-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Fetch WPT corpus
+        run: node scripts/fetch_wpt.mjs
+
+      - name: Run WPT conformance tests
+        env:
+          WPT_REPORT_JSON: reports/wpt-conformance.json
+          RUSTNN_GIT_SHA: ${{ github.sha }}
+          RUSTNN_GIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: make test-wpt
+
+      - name: Upload WPT conformance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-conformance-report
+          path: |
+            reports/wpt-conformance.json
+            reports/wpt-conformance.html
+
+  # Legacy rustnnpt gate: keeps branch protection happy until "RustNNPT Conformance Gate"
+  # is replaced with "WPT Conformance" in repo settings. Remove once admins update checks.
   rustnnpt-gate:
     name: RustNNPT Conformance Gate
     runs-on: ubuntu-latest

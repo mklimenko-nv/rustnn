@@ -2008,6 +2008,37 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         self.backend.build(graph)
     }
 
+    /// Serialize the in-progress graph (with outputs marked) as `.webnn` text for debugging.
+    pub fn rustnn_webnn_text_for_outputs(
+        &self,
+        outputs: &HashMap<&str, MLOperand>,
+    ) -> Option<String> {
+        let graph = self.graph.as_ref()?;
+        if outputs.is_empty() {
+            return None;
+        }
+
+        let mut graph = graph.clone();
+        graph.output_operands.clear();
+        for (name, operand) in outputs {
+            let op = graph.operands.get_mut(operand.id)?;
+            if op.kind == OperandKind::Input || op.kind == OperandKind::Constant {
+                return None;
+            }
+            op.kind = OperandKind::Output;
+            op.name = Some(name.to_string());
+            graph.output_operands.push(operand.id as u32);
+        }
+        graph.output_operands.sort_unstable();
+
+        let graph_json = to_graph_json(&graph, false).ok()?;
+        webnn_graph::serialize::serialize_graph_to_wg_text(
+            &graph_json,
+            SerializeOptions { quantized: false },
+        )
+        .ok()
+    }
+
     /*async*/
     pub fn build(
         &mut self,
@@ -2386,6 +2417,30 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             input: input.id as u32,
             splits: splits.to_vec(),
             split_equal_parts: None,
+            options: Some(options),
+            outputs: output_ids,
+        };
+        self.add_multi_output_operation(operation)
+    }
+
+    pub fn split_equal_with_options(
+        &mut self,
+        input: MLOperand,
+        num_splits: u32,
+        options: MLSplitOptions,
+    ) -> Result<Vec<MLOperand>> {
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
+        let output_ids: Vec<u32> = (0u32..num_splits)
+            .map(|i| graph.operands.len() as u32 + i)
+            .collect();
+
+        let operation = Operation::Split {
+            input: input.id as u32,
+            splits: Vec::new(),
+            split_equal_parts: Some(num_splits),
             options: Some(options),
             outputs: output_ids,
         };
@@ -2959,7 +3014,7 @@ mod test {
     fn add_inputs() {
         let _ = pretty_env_logger::try_init();
         let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
-        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable)) {
             return;
         };
 
@@ -3004,7 +3059,7 @@ mod test {
     fn unused_incompatible_inputs() {
         let _ = pretty_env_logger::try_init();
         let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
-        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable)) {
             return;
         };
 
@@ -3090,7 +3145,7 @@ mod test {
     fn add_mat_plus_scalar() {
         let _ = pretty_env_logger::try_init();
         let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
-        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable)) {
             return;
         };
 
@@ -3170,7 +3225,7 @@ mod test {
     fn quantize_dequantize_linear_output_dtype() {
         let _ = pretty_env_logger::try_init();
         let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
-        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable)) {
             return;
         }
 
