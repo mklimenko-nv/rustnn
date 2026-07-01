@@ -101,7 +101,7 @@ fn shape_element_count(shape: &[u32]) -> usize {
 
 fn packed_storage_byte_length(elements: usize) -> usize {
     let n = elements.max(1);
-    ((4 * n) + 7) / 8
+    (4 * n).div_ceil(8)
 }
 
 fn storage_byte_count(data_type: &str, element_count: usize) -> usize {
@@ -178,27 +178,27 @@ fn is_operand_ref(value: &serde_json::Value, operand_names: &HashSet<String>) ->
 }
 
 fn normalize_option_value(op_name: &str, key: &str, value: serde_json::Value) -> serde_json::Value {
-    if op_name == "pad" && key == "mode" {
-        if let Some(arr) = value.as_array() {
-            if arr.len() == 1 {
-                return arr[0].clone();
-            }
-            if !arr.is_empty() {
-                return arr[0].clone();
-            }
+    if op_name == "pad"
+        && key == "mode"
+        && let Some(arr) = value.as_array()
+    {
+        if arr.len() == 1 {
+            return arr[0].clone();
+        }
+        if !arr.is_empty() {
+            return arr[0].clone();
         }
     }
-    if (op_name == "pad" && key == "value")
-        || (op_name == "clamp" && matches!(key, "minValue" | "maxValue"))
+    if ((op_name == "pad" && key == "value")
+        || (op_name == "clamp" && matches!(key, "minValue" | "maxValue")))
+        && let Some(s) = value.as_str()
     {
-        if let Some(s) = value.as_str() {
-            return match s {
-                "NaN" => serde_json::json!("NaN"),
-                "Infinity" | "+Infinity" => serde_json::json!("Infinity"),
-                "-Infinity" => serde_json::json!("-Infinity"),
-                _ => value,
-            };
-        }
+        return match s {
+            "NaN" => serde_json::json!("NaN"),
+            "Infinity" | "+Infinity" => serde_json::json!("Infinity"),
+            "-Infinity" => serde_json::json!("-Infinity"),
+            _ => value,
+        };
     }
     value
 }
@@ -234,21 +234,21 @@ fn resolve_options_object(
             );
             continue;
         }
-        if let Some(arr) = value.as_array() {
-            if arr.iter().all(|x| is_operand_ref(x, operand_names)) {
-                let ids: Vec<serde_json::Value> = arr
-                    .iter()
-                    .map(|x| {
-                        let name = x.as_str().unwrap();
-                        serde_json::Value::Number(name_to_id.get(name).copied().unwrap_or(0).into())
-                    })
-                    .collect();
-                out.insert(
-                    option_json_key(op_name, &opt_key),
-                    serde_json::Value::Array(ids),
-                );
-                continue;
-            }
+        if let Some(arr) = value.as_array()
+            && arr.iter().all(|x| is_operand_ref(x, operand_names))
+        {
+            let ids: Vec<serde_json::Value> = arr
+                .iter()
+                .map(|x| {
+                    let name = x.as_str().unwrap();
+                    serde_json::Value::Number(name_to_id.get(name).copied().unwrap_or(0).into())
+                })
+                .collect();
+            out.insert(
+                option_json_key(op_name, &opt_key),
+                serde_json::Value::Array(ids),
+            );
+            continue;
         }
         out.insert(
             option_json_key(op_name, &opt_key),
@@ -326,21 +326,21 @@ pub fn build_method_args(
             continue;
         }
 
-        if let Some(arr) = value.as_array() {
-            if arr.iter().all(|x| is_operand_ref(x, operand_names)) {
-                let ops: Vec<MLOperand> = arr
-                    .iter()
-                    .map(|x| {
-                        let name = x.as_str().unwrap();
-                        operand_map
-                            .get(name)
-                            .copied()
-                            .ok_or_else(|| format!("unknown operand '{name}'"))
-                    })
-                    .collect::<Result<_, _>>()?;
-                positional.push(PositionalArg::Operands(ops));
-                continue;
-            }
+        if let Some(arr) = value.as_array()
+            && arr.iter().all(|x| is_operand_ref(x, operand_names))
+        {
+            let ops: Vec<MLOperand> = arr
+                .iter()
+                .map(|x| {
+                    let name = x.as_str().unwrap();
+                    operand_map
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| format!("unknown operand '{name}'"))
+                })
+                .collect::<Result<_, _>>()?;
+            positional.push(PositionalArg::Operands(ops));
+            continue;
         }
 
         if op_name == "cast" && key == "type" {

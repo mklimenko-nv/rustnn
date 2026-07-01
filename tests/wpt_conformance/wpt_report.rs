@@ -249,15 +249,15 @@ impl WptReportCollector {
         };
 
         let report = self.build_report();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!(
-                        "failed to create report directory {}: {e}",
-                        parent.display()
-                    )
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create report directory {}: {e}",
+                    parent.display()
+                )
+            })?;
         }
         let json = serde_json::to_string_pretty(&report)
             .map_err(|e| format!("failed to serialize WPT report: {e}"))?;
@@ -390,10 +390,10 @@ pub fn report_output_path() -> Option<PathBuf> {
 }
 
 fn report_html_output_path(json_path: &Path) -> PathBuf {
-    if let Ok(path) = std::env::var("WPT_REPORT_HTML") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
+    if let Ok(path) = std::env::var("WPT_REPORT_HTML")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
     }
     json_path.with_extension("html")
 }
