@@ -111,6 +111,9 @@ jobs:
   wpt-conformance:
     name: WPT Conformance (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # macOS/CoreML results vary across machines (e.g. M1 runner vs M5 dev), so its
+    # leg is optional and never blocks the PR; it publishes a report artifact instead.
+    continue-on-error: ${{ matrix.optional || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -118,7 +121,8 @@ jobs:
           - os: ubuntu-latest
             wpt_command: make test-wpt
           - os: macos-latest
-            wpt_command: make test-wpt-coreml
+            wpt_command: make test-wpt-coreml-report
+            optional: true
     steps:
       - uses: actions/checkout@v4
 

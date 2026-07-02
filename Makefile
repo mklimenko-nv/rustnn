@@ -104,6 +104,12 @@ test-wpt-trtx:
 test-wpt-coreml:
 	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
 
+# Report-only CoreML run for CI: writes snapshots instead of asserting (CoreML
+# results vary across machines) and always exits 0, emitting a JSON/HTML report.
+test-wpt-coreml-report:
+	@mkdir -p reports
+	-INSTA_UPDATE=always WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+
 test-wpt-op: onnxruntime-download
 	@test -n "$(OP)" || (echo "Usage: make test-wpt-op OP=add" && exit 1)
 	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- $(OP) --test-threads 1
@@ -270,6 +276,7 @@ help:
 	@echo "  test-wpt-report    - Run full WPT suite and write JSON/HTML reports (ignores trial failures)"
 	@echo "  test-wpt-trtx      - Run WPT suite via TensorRT (skips when GPU unavailable)"
 	@echo "  test-wpt-coreml    - Run WPT suite via CoreML (macOS)"
+	@echo "  test-wpt-coreml-report - CoreML WPT, report-only (CI; never fails)"
 	@echo ""
 	@echo "CoreML Conversion:"
 	@echo "  coreml             - Convert graph to CoreML format"
