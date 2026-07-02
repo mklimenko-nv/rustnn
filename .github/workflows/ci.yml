@@ -9,12 +9,16 @@ on:
 jobs:
   # Rust tests
   rust-test:
-    name: Rust Tests (${{ matrix.os }})
+    name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            label: Rust Tests
+          - os: macos-latest
+            label: Rust Tests (macos-latest)
     env:
       RUSTFLAGS: -D warnings
     steps:
