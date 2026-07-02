@@ -1,19 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-transpose.https.any.js transpose float32 2D tensor options.permutation, coreml
- Failed to dispatch graph: coreml runtime failed: prediction failed: According to model description, feature 'transposeInput' must be of rank 4, instead got a multi-array value of rank 2.
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    transposeInput: f32[4, 6];
-  }
-
-  nodes {
-    [transposeOutput] = transpose(transposeInput, label="", permutation=[1, 0]);
-  }
-
-  outputs { transposeOutput; }
-}
+(
+    "transpose.https.any.js",
+    "transpose float32 2D tensor options.permutation",
+    "coreml",
+    "PASS",
+)

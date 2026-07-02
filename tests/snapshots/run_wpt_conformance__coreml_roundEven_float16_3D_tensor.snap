@@ -1,19 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-round_even.https.any.js roundEven float16 3D tensor, coreml
- Failed to build graph: coreml runtime failed: MLModel compile failed: Failed to parse the model specification. Error: Failed to read int32 value because field number 1 uses wireType 2. It should have used wireType 0.
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    roundEvenInput: f16[1, 2, 2];
-  }
-
-  nodes {
-    [roundEvenOutput] = roundEven(roundEvenInput, label="");
-  }
-
-  outputs { roundEvenOutput; }
-}
+(
+    "round_even.https.any.js",
+    "roundEven float16 3D tensor",
+    "coreml",
+    "PASS",
+)

@@ -1,19 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-leaky_relu.https.any.js leakyRelu float32 2D tensor default options, coreml
- Failed to dispatch graph: coreml runtime failed: prediction failed: According to model description, feature 'leakyReluInput' must be of rank 3, instead got a multi-array value of rank 2.
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    leakyReluInput: f32[4, 6];
-  }
-
-  nodes {
-    [leakyReluOutput] = leakyRelu(leakyReluInput, alpha=0.01, label="");
-  }
-
-  outputs { leakyReluOutput; }
-}
+(
+    "leaky_relu.https.any.js",
+    "leakyRelu float32 2D tensor default options",
+    "coreml",
+    "PASS",
+)

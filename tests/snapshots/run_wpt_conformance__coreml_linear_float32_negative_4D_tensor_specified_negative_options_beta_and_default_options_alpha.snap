@@ -1,26 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-linear.https.any.js linear float32 negative 4D tensor specified negative options.beta and default options.alpha, coreml
- linear :: linear float32 negative 4D tensor specified negative options.beta and default options.alpha: index 0: actual=-31.803995 expected=-11.017641 ulp=13510227 tolerance=4
-  inputs: linearInput: [-5.098546028137207, -3.381463050842285, -8.054762840270996, -8.074773788452148, -0.47079092264175415, -5.243824005126953, -3.827306032180786, -5.3697686195373535, -6.1033172607421875, -3.750578641891479, -0.7479738593101501, -1.8931976556777952, -1.9056464433670044, -7.863316059112549, -4.58075475692749, -9.373635292053224, -6.584214210510254, -9.344809532165527, -5.16057825088501, -0.8060914278030396, -9.130533218383787, -3.1937403678894043, -5.748293399810791, -4.113487720489502]
-  expected linearOutput: [-11.017641, -9.300558, -13.973858, -13.99387, -6.3898864, -11.16292, -9.746402, -11.288864, -12.022413, -9.669674 ...] (len=24)
-  actual linearOutput: [-31.803995, -19.099651, -53.676434, -53.82449, 2.4358106, -32.87888, -22.398352, -33.810715, -39.23809, -21.830662 ...] (len=24)
-  expected linearOutput full nd:
-[-11.017641, -9.300558, -13.973858, -13.99387, -6.3898864, -11.16292, -9.746402, -11.288864, -12.022413, -9.669674, ...] (len=24, shape=[2, 2, 2, 3])
-  actual linearOutput full nd:
-[-31.803995, -19.099651, -53.676434, -53.82449, 2.4358106, -32.87888, -22.398352, -33.810715, -39.23809, -21.830662, ...] (len=24, shape=[2, 2, 2, 3])
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    linearInput: f32[2, 2, 2, 3];
-  }
-
-  nodes {
-    [linearOutput] = linear(linearInput, alpha=1.0, beta=-5.919095653700928, label="");
-  }
-
-  outputs { linearOutput; }
-}
+(
+    "linear.https.any.js",
+    "linear float32 negative 4D tensor specified negative options.beta and default options.alpha",
+    "coreml",
+    "PASS",
+)

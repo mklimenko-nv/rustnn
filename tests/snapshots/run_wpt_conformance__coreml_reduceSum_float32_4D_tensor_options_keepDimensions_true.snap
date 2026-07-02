@@ -1,28 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-reduce_sum.https.any.js reduceSum float32 4D tensor options.keepDimensions=true, coreml
- reduce_sum :: reduceSum float32 4D tensor options.keepDimensions=true: index 0: actual=355.21942 expected=1313.8794 ulp=15900686 tolerance=24
-  inputs: reduceSumInput: [69.6038589477539, 99.17485809326172, 32.78234100341797, 8.881362915039063, 16.094295501708984, 11.80689525604248, 32.64223861694336, 43.99836349487305, 77.01776885986328, 79.79425811767578, 45.00794982910156, 24.397796630859375, 57.502685546875, 57.60173034667969, 80.26985931396484, 43.65110778808594, 87.5036849975586, 94.50203704833984, 35.54289627075195, 42.856414794921875, 88.58631896972656, 98.85772705078124, 25.626853942871097, 60.1761360168457]
-  expected reduceSumOutput: [1313.8794]
-  actual reduceSumOutput: [355.21942]
-  expected reduceSumOutput full nd:
-(shape [1, 1, 1, 1])
-  [1313.8794]
-  actual reduceSumOutput full nd:
-(shape [1, 1, 1, 1])
-  [355.21942]
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    reduceSumInput: f32[2, 2, 2, 3];
-  }
-
-  nodes {
-    [reduceSumOutput] = reduceSum(reduceSumInput, axes=null, keepDimensions=true, label="");
-  }
-
-  outputs { reduceSumOutput; }
-}
+(
+    "reduce_sum.https.any.js",
+    "reduceSum float32 4D tensor options.keepDimensions=true",
+    "coreml",
+    "PASS",
+)

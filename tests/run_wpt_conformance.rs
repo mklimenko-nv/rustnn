@@ -14,12 +14,12 @@ use wpt_conformance::wpt_report::{WptReportCollector, report_output_path};
 use wpt_conformance::wpt_types::WptLoadedCase;
 use wpt_conformance::{run_one_test_case, should_skip_test, wpt_types::WptTestCase};
 
-/// Marks the test binary as a single-trial worker (set on the spawned child).
-const ISOLATE_CHILD_ENV: &str = "WPT_ISOLATE_CHILD";
+/// Path the worker writes its outcome to (set on the spawned child). A dedicated
+/// file, not stdout: CoreML writes diagnostics to stdout that would otherwise
+/// contaminate the outcome.
+const ISOLATE_OUTCOME_ENV: &str = "WPT_ISOLATE_OUTCOME";
 /// Optional override: `1`/`true` forces isolation on for every backend, `0`/`false` off.
 const ISOLATE_ENV: &str = "WPT_ISOLATE";
-/// Marker the worker prints before its outcome so the parent can find it past log noise.
-const OUTCOME_SENTINEL: &str = "@@WPT_ISOLATED_OUTCOME@@";
 
 /// Whether trials for `backend_prefix` run in their own worker process. Enabled by
 /// default only for CoreML, whose models can trigger uncatchable native crashes that
@@ -53,9 +53,18 @@ fn run_trial(
         .map_err(Failed::from)
 }
 
-/// Worker entry point: run one [`IsolatedJob`] from stdin and print its outcome. A
-/// native crash kills this process before it prints, which the parent detects.
+/// Worker entry point: run one [`IsolatedJob`] from stdin and write its outcome to
+/// the [`ISOLATE_OUTCOME_ENV`] file. A native crash kills this process before it
+/// writes, which the parent detects. stdout/stderr are left for CoreML's own
+/// diagnostics so they never contaminate the outcome.
 fn run_isolated_child() -> ! {
+    let outcome_path = match std::env::var(ISOLATE_OUTCOME_ENV) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("[WPT worker] {ISOLATE_OUTCOME_ENV} not set");
+            std::process::exit(2);
+        }
+    };
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
         eprintln!("[WPT worker] failed to read job from stdin: {e}");
@@ -73,22 +82,12 @@ fn run_isolated_child() -> ! {
         std::process::exit(2);
     };
 
-    let outcome = run_trial(&backend, &job.operation, &job.case);
-    let mut stdout = std::io::stdout();
-    match outcome {
-        Ok(Completion::Completed) => {
-            let _ = writeln!(stdout, "{OUTCOME_SENTINEL}COMPLETED");
-        }
-        Ok(Completion::Ignored { reason }) => {
-            let _ = writeln!(stdout, "{OUTCOME_SENTINEL}IGNORED");
-            let _ = write!(stdout, "{}", reason.unwrap_or_default());
-        }
-        Err(failed) => {
-            let _ = writeln!(stdout, "{OUTCOME_SENTINEL}FAILED");
-            let _ = write!(stdout, "{}", failed.message().unwrap_or("test failed"));
-        }
-    }
-    let _ = stdout.flush();
+    let payload = match run_trial(&backend, &job.operation, &job.case) {
+        Ok(Completion::Completed) => "COMPLETED".to_string(),
+        Ok(Completion::Ignored { reason }) => format!("IGNORED\n{}", reason.unwrap_or_default()),
+        Err(failed) => format!("FAILED\n{}", failed.message().unwrap_or("test failed")),
+    };
+    let _ = std::fs::write(&outcome_path, payload);
     std::process::exit(0);
 }
 
@@ -134,11 +133,12 @@ fn run_trial_isolated(
     };
     let job_json = serde_json::to_string(&job).map_err(|e| Failed::from(e.to_string()))?;
     let exe = std::env::current_exe().map_err(|e| Failed::from(e.to_string()))?;
+    let outcome_path = unique_outcome_path();
 
     let mut child = Command::new(exe)
-        .env(ISOLATE_CHILD_ENV, "1")
+        .env(ISOLATE_OUTCOME_ENV, &outcome_path)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| Failed::from(format!("failed to spawn WPT worker: {e}")))?;
@@ -148,13 +148,14 @@ fn run_trial_isolated(
         // Drop closes stdin so the worker's read returns.
     }
 
-    let output = child
-        .wait_with_output()
+    let status = child
+        .wait()
         .map_err(|e| Failed::from(format!("failed to wait for WPT worker: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let outcome = std::fs::read_to_string(&outcome_path).ok();
+    let _ = std::fs::remove_file(&outcome_path);
 
-    if let Some(rest) = stdout.split(OUTCOME_SENTINEL).nth(1) {
-        let (status_line, message) = rest.split_once('\n').unwrap_or((rest, ""));
+    if let Some(text) = outcome {
+        let (status_line, message) = text.split_once('\n').unwrap_or((text.as_str(), ""));
         match status_line.trim() {
             "COMPLETED" => return Ok(Completion::Completed),
             "IGNORED" => return Ok(Completion::ignored_with(message.to_string())),
@@ -163,11 +164,19 @@ fn run_trial_isolated(
         }
     }
 
-    // No outcome printed: the worker crashed before reporting.
+    // No outcome written: the worker crashed before reporting.
     Err(Failed::from(format!(
         "WPT worker did not report an outcome ({}); treated as a native crash",
-        describe_exit(output.status)
+        describe_exit(status)
     )))
+}
+
+/// A unique temp path for one worker's outcome file.
+fn unique_outcome_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("wpt_outcome_{}_{}", std::process::id(), n))
 }
 
 fn push_backend_trials(
@@ -228,7 +237,7 @@ fn main() {
     let _ = pretty_env_logger::try_init();
 
     // Worker mode: run exactly one trial handed to us over stdin, then exit.
-    if std::env::var(ISOLATE_CHILD_ENV).is_ok() {
+    if std::env::var(ISOLATE_OUTCOME_ENV).is_ok() {
         run_isolated_child();
     }
 

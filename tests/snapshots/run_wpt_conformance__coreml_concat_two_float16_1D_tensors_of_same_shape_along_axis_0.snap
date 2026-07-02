@@ -1,20 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-concat.https.any.js concat two float16 1D tensors of same shape along axis 0, coreml
- Failed to dispatch graph: coreml runtime failed: prediction failed: MultiArray shape (12) does not match the shape (8) specified in the model description
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    concatInput1: f16[12];
-    concatInput2: f16[12];
-  }
-
-  nodes {
-    [concatOutput] = concat(concatInput1, concatInput2, label="");
-  }
-
-  outputs { concatOutput; }
-}
+(
+    "concat.https.any.js",
+    "concat two float16 1D tensors of same shape along axis 0",
+    "coreml",
+    "PASS",
+)

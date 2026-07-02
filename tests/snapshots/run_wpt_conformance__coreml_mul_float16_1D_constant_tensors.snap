@@ -3,7 +3,7 @@ source: tests/run_wpt_conformance.rs
 expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
 ---
 mul.https.any.js mul float16 1D constant tensors, coreml
- Failed to build graph: coreml runtime failed: MLModel load failed: Failed to build the model execution plan using a model architecture file '/private/var/folders/fv/xdj1sjg16zndg0hpptw8n1_c0000gn/T/rustnn_coreml_1782983302332_0.mlmodelc/model.mil' with error code: -14.
+ Failed to build graph: coreml runtime failed: MLModel load failed: Failed to build the model execution plan using a model architecture file '<coreml-temp-model>' with error code: -14.
 
 --- built graph ---
 webnn_graph "graph" v2 {
@@ -18,6 +18,3 @@ webnn_graph "graph" v2 {
 
   outputs { output; }
 }
-Error(s) occurred compiling MIL to BNNS graph:
-[CreateBnnsGraphProgramFromMIL]: BNNS failed to compile due to an exception: Storage Reader expects file format version 2. at location 
- @ CreateBnnsGraphProgramFromMIL

@@ -1,21 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-subgraph.https.any.js gemm default + softmax, coreml
- Failed to dispatch graph: coreml runtime failed: prediction failed: Feature conv2dInput is required but not specified.
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    inputA: f32[3, 4];
-    inputB: f32[4, 5];
-  }
-
-  nodes {
-    [operand_2] = gemm(inputA, inputB, aTranspose=false, alpha=1.0, bTranspose=false, beta=1.0, c=null, label="");
-    [output] = softmax(operand_2, label="");
-  }
-
-  outputs { output; }
-}
+(
+    "subgraph.https.any.js",
+    "gemm default + softmax",
+    "coreml",
+    "PASS",
+)

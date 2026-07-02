@@ -1,20 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-concat.https.any.js concat two float32 1D constant tensors of same shape along axis 0, coreml
- Failed to dispatch graph: coreml runtime failed: prediction failed: Feature concatInput2 is required but not specified.
-
---- built graph ---
-webnn_graph "graph" v2 {
-  consts {
-    operand_0: f32[12] @bytes([55, 244, 201, 190, 227, 170, 92, 63, 216, 13, 173, 62, 147, 154, 125, 191, 58, 168, 19, 63, 83, 65, 165, 62, 23, 11, 229, 190, 204, 219, 225, 61, 228, 49, 24, 191, 40, 66, 206, 190, 166, 2, 116, 191, 34, 85, 44, 191]);
-    operand_1: f32[12] @bytes([45, 218, 251, 62, 208, 114, 34, 190, 12, 11, 175, 190, 207, 114, 106, 191, 10, 122, 56, 191, 255, 161, 76, 191, 88, 86, 42, 63, 18, 44, 31, 61, 30, 169, 4, 63, 175, 203, 95, 191, 91, 66, 245, 190, 124, 47, 248, 61]);
-  }
-
-  nodes {
-    [concatOutput] = concat(operand_0, operand_1, label="");
-  }
-
-  outputs { concatOutput; }
-}
+(
+    "concat.https.any.js",
+    "concat two float32 1D constant tensors of same shape along axis 0",
+    "coreml",
+    "PASS",
+)

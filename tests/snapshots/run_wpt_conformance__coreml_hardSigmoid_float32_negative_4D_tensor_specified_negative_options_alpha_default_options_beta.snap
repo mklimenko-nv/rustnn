@@ -1,26 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-hard_sigmoid.https.any.js hardSigmoid float32 negative 4D tensor specified negative options.alpha default options.beta, coreml
- hard_sigmoid :: hardSigmoid float32 negative 4D tensor specified negative options.alpha default options.beta: index 0: actual=0.45360452 expected=0.5463955 ulp=2335161 tolerance=4
-  inputs: hardSigmoidInput: [-0.05907066911458969, -0.7076089382171631, -0.5228404998779297, -0.4231015741825104, -0.6643692851066589, -0.950294017791748, -0.10918906331062316, -0.0129771139472723, -0.4755297303199768, -0.5322551727294922, -0.684307873249054, -0.4662107527256012, -0.3048996329307556, -0.8025872707366943, -0.2485964000225067, -0.663689911365509, -0.5547611713409424, -0.554258406162262, -0.7311381697654724, -0.4880960285663605, -0.7766845226287842, -0.8455570340156555, -0.555302083492279, -0.5603444576263428]
-  expected hardSigmoidOutput: [0.5463955, 1, 0.9106511, 0.83231384, 1, 1, 0.58575964, 0.5101925, 0.8734921, 0.9180456 ...] (len=24)
-  actual hardSigmoidOutput: [0.45360452, 0, 0.0893489, 0.16768618, 0, 0, 0.41424036, 0.4898075, 0.12650788, 0.0819544 ...] (len=24)
-  expected hardSigmoidOutput full nd:
-[0.5463955, 1, 0.9106511, 0.83231384, 1, 1, 0.58575964, 0.5101925, 0.8734921, 0.9180456, ...] (len=24, shape=[1, 2, 3, 4])
-  actual hardSigmoidOutput full nd:
-[0.45360452, 0, 0.0893489, 0.16768618, 0, 0, 0.41424036, 0.4898075, 0.12650788, 0.0819544, ...] (len=24, shape=[1, 2, 3, 4])
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    hardSigmoidInput: f32[1, 2, 3, 4];
-  }
-
-  nodes {
-    [hardSigmoidOutput] = hardSigmoid(hardSigmoidInput, alpha=-0.7854232544278235, beta=0.5, label="");
-  }
-
-  outputs { hardSigmoidOutput; }
-}
+(
+    "hard_sigmoid.https.any.js",
+    "hardSigmoid float32 negative 4D tensor specified negative options.alpha default options.beta",
+    "coreml",
+    "PASS",
+)

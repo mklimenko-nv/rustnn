@@ -17,4 +17,3 @@ webnn_graph "graph" v2 {
 
   outputs { reduceMinOutput; }
 }
-Unable to bind buffer to network. @ BindBuffersPort bindings cannot be changed while operation is in use in an execution stream. @ BindMemoryObject

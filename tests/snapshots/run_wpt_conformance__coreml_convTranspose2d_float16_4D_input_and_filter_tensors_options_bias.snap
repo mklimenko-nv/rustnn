@@ -3,7 +3,7 @@ source: tests/run_wpt_conformance.rs
 expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
 ---
 conv_transpose2d.https.any.js convTranspose2d float16 4D input and filter tensors options.bias, coreml
- Failed to build graph: coreml runtime failed: MLModel load failed: Failed to build the model execution plan using a model architecture file '/private/var/folders/fv/xdj1sjg16zndg0hpptw8n1_c0000gn/T/rustnn_coreml_1782983272308_0.mlmodelc/model.mil' with error code: -5.
+ Failed to build graph: coreml runtime failed: MLModel load failed: Failed to build the model execution plan using a model architecture file '<coreml-temp-model>' with error code: -5.
 
 --- built graph ---
 webnn_graph "graph" v2 {
@@ -22,6 +22,3 @@ webnn_graph "graph" v2 {
 
   outputs { convTranspose2dOutput; }
 }
-Error(s) occurred compiling MIL to BNNS graph:
-[CreateBnnsGraphProgramFromMIL]: BNNS failed to compile due to an exception: Storage Reader expects file format version 2. at location 
- @ CreateBnnsGraphProgramFromMIL

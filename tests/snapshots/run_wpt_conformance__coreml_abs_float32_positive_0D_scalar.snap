@@ -1,19 +1,10 @@
 ---
 source: tests/run_wpt_conformance.rs
-expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
 ---
-abs.https.any.js abs float32 positive 0D scalar, coreml
- Failed to dispatch graph: coreml runtime failed: input dtype mismatch: model expects 2-byte elements (code 65552), but input is Float32 (4-byte); type conversion is not supported for this input
-
---- built graph ---
-webnn_graph "graph" v2 {
-  inputs {
-    absInput: f32[];
-  }
-
-  nodes {
-    [absOutput] = abs(absInput, label="");
-  }
-
-  outputs { absOutput; }
-}
+(
+    "abs.https.any.js",
+    "abs float32 positive 0D scalar",
+    "coreml",
+    "PASS",
+)
