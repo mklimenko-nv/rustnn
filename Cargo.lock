@@ -2698,6 +2698,7 @@ dependencies = [
  "base64 0.22.1",
  "bytemuck",
  "bytes",
+ "cc",
  "clap",
  "cudarc 0.19.8",
  "dirs 6.0.0",

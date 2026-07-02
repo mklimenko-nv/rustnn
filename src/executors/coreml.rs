@@ -25,6 +25,35 @@ unsafe extern "C" {}
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {}
 
+// Objective-C++ exception firewall (src/executors/coreml_shim.mm)
+unsafe extern "C" {
+    fn rustnn_coreml_compile(
+        model_url: *mut Object,
+        out_url: *mut *mut Object,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> i32;
+    fn rustnn_coreml_load(
+        compiled_url: *mut Object,
+        config: *mut Object,
+        out_model: *mut *mut Object,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> i32;
+    fn rustnn_coreml_predict(
+        model: *mut Object,
+        features: *mut Object,
+        out_provider: *mut *mut Object,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> i32;
+}
+
+fn shim_err_to_string(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
 #[derive(Debug, Clone)]
 pub struct CoremlInput {
     pub name: String,
@@ -212,13 +241,21 @@ pub(crate) fn compile_model(
         for (code, name) in candidates {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
-                last_error = ns_error_to_string(error, "MLModel load failed");
+            let mut model: *mut Object = ptr::null_mut();
+            let mut err_buf = [0u8; 1024];
+            let status = rustnn_coreml_load(
+                compiled_url,
+                config,
+                &mut model,
+                err_buf.as_mut_ptr() as *mut c_char,
+                err_buf.len(),
+            );
+            if status != 0 || model.is_null() {
+                last_error = format!("MLModel load failed: {}", shim_err_to_string(&err_buf));
                 continue;
             }
-            // Retain the model so it outlives this autoreleasepool.
+            // The shim returns a borrowed (autoreleased) model; retain so it
+            // outlives this autoreleasepool.
             let _: *mut Object = msg_send![model, retain];
             return Ok(CompiledCoremlModel {
                 model,
@@ -289,12 +326,18 @@ pub(crate) fn run_coreml_bytes(
             });
         }
 
-        let mut predict_error: *mut Object = ptr::null_mut();
-        let output_provider: *mut Object =
-            msg_send![model.model, predictionFromFeatures: provider error: &mut predict_error];
-        if output_provider.is_null() {
+        let mut output_provider: *mut Object = ptr::null_mut();
+        let mut err_buf = [0u8; 1024];
+        let status = rustnn_coreml_predict(
+            model.model,
+            provider,
+            &mut output_provider,
+            err_buf.as_mut_ptr() as *mut c_char,
+            err_buf.len(),
+        );
+        if status != 0 || output_provider.is_null() {
             return Err(GraphError::CoremlRuntimeFailed {
-                reason: ns_error_to_string(predict_error, "prediction failed"),
+                reason: format!("prediction failed: {}", shim_err_to_string(&err_buf)),
             });
         }
 
@@ -484,12 +527,22 @@ fn run_impl_zeroed_with_weights(
         for (code, name) in targets {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
+            let mut model: *mut Object = ptr::null_mut();
+            let mut load_err = [0u8; 1024];
+            let load_status = rustnn_coreml_load(
+                compiled_url,
+                config,
+                &mut model,
+                load_err.as_mut_ptr() as *mut c_char,
+                load_err.len(),
+            );
+            if load_status != 0 || model.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(error, "MLModel load failed")),
+                    result: Err(format!(
+                        "MLModel load failed: {}",
+                        shim_err_to_string(&load_err)
+                    )),
                 });
                 continue;
             }
@@ -561,13 +614,22 @@ fn run_impl_zeroed_with_weights(
                 continue;
             }
 
-            let mut predict_error: *mut Object = ptr::null_mut();
-            let output_provider: *mut Object =
-                msg_send![model, predictionFromFeatures: provider error: &mut predict_error];
-            if output_provider.is_null() {
+            let mut output_provider: *mut Object = ptr::null_mut();
+            let mut predict_err = [0u8; 1024];
+            let predict_status = rustnn_coreml_predict(
+                model,
+                provider,
+                &mut output_provider,
+                predict_err.as_mut_ptr() as *mut c_char,
+                predict_err.len(),
+            );
+            if predict_status != 0 || output_provider.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(predict_error, "prediction failed")),
+                    result: Err(format!(
+                        "prediction failed: {}",
+                        shim_err_to_string(&predict_err)
+                    )),
                 });
                 continue;
             }
@@ -640,12 +702,22 @@ fn run_impl_with_inputs_with_weights(
         for (code, name) in targets {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
+            let mut model: *mut Object = ptr::null_mut();
+            let mut load_err = [0u8; 1024];
+            let load_status = rustnn_coreml_load(
+                compiled_url,
+                config,
+                &mut model,
+                load_err.as_mut_ptr() as *mut c_char,
+                load_err.len(),
+            );
+            if load_status != 0 || model.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(error, "MLModel load failed")),
+                    result: Err(format!(
+                        "MLModel load failed: {}",
+                        shim_err_to_string(&load_err)
+                    )),
                 });
                 continue;
             }
@@ -724,13 +796,22 @@ fn run_impl_with_inputs_with_weights(
                 continue;
             }
 
-            let mut predict_error: *mut Object = ptr::null_mut();
-            let output_provider: *mut Object =
-                msg_send![model, predictionFromFeatures: provider error: &mut predict_error];
-            if output_provider.is_null() {
+            let mut output_provider: *mut Object = ptr::null_mut();
+            let mut predict_err = [0u8; 1024];
+            let predict_status = rustnn_coreml_predict(
+                model,
+                provider,
+                &mut output_provider,
+                predict_err.as_mut_ptr() as *mut c_char,
+                predict_err.len(),
+            );
+            if predict_status != 0 || output_provider.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(predict_error, "prediction failed")),
+                    result: Err(format!(
+                        "prediction failed: {}",
+                        shim_err_to_string(&predict_err)
+                    )),
                 });
                 continue;
             }
@@ -914,12 +995,19 @@ pub unsafe fn prepare_compiled_model_with_weights(
 ) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
     let temp_mlmodel = write_temp_model_with_weights(model_bytes, weights_data)?;
     let url = unsafe { nsurl_from_path(&temp_mlmodel)? };
-    let mut compile_error: *mut Object = ptr::null_mut();
-    let compiled_url: *mut Object =
-        msg_send![class!(MLModel), compileModelAtURL: url error: &mut compile_error];
-    if compiled_url.is_null() {
+    let mut compiled_url: *mut Object = ptr::null_mut();
+    let mut err_buf = [0u8; 1024];
+    let status = unsafe {
+        rustnn_coreml_compile(
+            url,
+            &mut compiled_url,
+            err_buf.as_mut_ptr() as *mut c_char,
+            err_buf.len(),
+        )
+    };
+    if status != 0 || compiled_url.is_null() {
         return Err(GraphError::CoremlRuntimeFailed {
-            reason: unsafe { ns_error_to_string(compile_error, "MLModel compile failed") },
+            reason: format!("MLModel compile failed: {}", shim_err_to_string(&err_buf)),
         });
     }
 
