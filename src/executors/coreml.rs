@@ -55,8 +55,9 @@ unsafe extern "C" {
 /// - Sort the allowed-type set CoreML lists in `Expected { ... }` clauses, which
 ///   it otherwise enumerates in a nondeterministic (hash) order.
 fn sanitize_coreml_error(msg: &str) -> String {
-    static TEMP_PATH_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r#"[^\s'"]*rustnn_coreml_[^\s'"]*"#).unwrap());
+    static TEMP_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[^\s'"]*rustnn_coreml_[^\s'"]*"#).unwrap()
+    });
     static EXPECTED_SET_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"Expected \{ ([^}]*?) \}").unwrap());
 
