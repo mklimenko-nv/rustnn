@@ -39,6 +39,23 @@ struct IsolatedJob {
     case: WptTestCase,
 }
 
+fn sanitize_failure_message(msg: &str) -> String {
+    use std::sync::LazyLock;
+    static TEMP_PATH_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"[^\s'"]*rustnn_coreml_[^\s'"]*"#).unwrap());
+    static EXPECTED_SET_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"Expected \{ ([^}]*?) \}").unwrap());
+
+    let scrubbed = TEMP_PATH_RE.replace_all(msg, "<coreml-temp-model>");
+    EXPECTED_SET_RE
+        .replace_all(&scrubbed, |caps: &regex::Captures| {
+            let mut items: Vec<&str> = caps[1].split(", ").collect();
+            items.sort_unstable();
+            format!("Expected {{ {} }}", items.join(", "))
+        })
+        .into_owned()
+}
+
 fn run_trial(
     backend: &WptBackend,
     operation: &str,
@@ -220,7 +237,7 @@ fn push_backend_trials(
                     report.record_skip(&file_name, &test_name, &backend_prefix, reason, duration);
                 }
                 Err(err) => {
-                    let msg = err.message().unwrap_or("test failed").to_string();
+                    let msg = sanitize_failure_message(err.message().unwrap_or("test failed"));
                     insta::assert_snapshot!(
                         snapshot_name,
                         format!("{file_name} {test_name}, {backend_prefix}\n {msg}")

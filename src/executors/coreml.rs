@@ -49,31 +49,9 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// Make a CoreML error message deterministic so it doesn't churn snapshots:
-/// - Replace the temp-model path CoreML embeds in some errors (e.g. the `-14`
-///   execution-plan failure); it carries a timestamp/UUID.
-/// - Sort the allowed-type set CoreML lists in `Expected { ... }` clauses, which
-///   it otherwise enumerates in a nondeterministic (hash) order.
-fn sanitize_coreml_error(msg: &str) -> String {
-    static TEMP_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"[^\s'"]*rustnn_coreml_[^\s'"]*"#).unwrap()
-    });
-    static EXPECTED_SET_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"Expected \{ ([^}]*?) \}").unwrap());
-
-    let scrubbed = TEMP_PATH_RE.replace_all(msg, "<coreml-temp-model>");
-    EXPECTED_SET_RE
-        .replace_all(&scrubbed, |caps: &regex::Captures| {
-            let mut items: Vec<&str> = caps[1].split(", ").collect();
-            items.sort_unstable();
-            format!("Expected {{ {} }}", items.join(", "))
-        })
-        .into_owned()
-}
-
 fn shim_err_to_string(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    sanitize_coreml_error(&String::from_utf8_lossy(&buf[..end]))
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 #[derive(Debug, Clone)]
@@ -1435,7 +1413,7 @@ unsafe fn ns_error_to_string(error: *mut Object, default: &str) -> String {
     if desc.is_null() {
         return default.to_string();
     }
-    sanitize_coreml_error(&unsafe { nsstring_to_string(desc) })
+    unsafe { nsstring_to_string(desc) }
 }
 
 fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
