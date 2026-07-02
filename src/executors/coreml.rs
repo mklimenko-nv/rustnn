@@ -1078,10 +1078,10 @@ fn map_dtype(data_type: DataType) -> Result<i32, GraphError> {
 /// legacy bare codes still used by [`map_dtype`].
 fn ml_dtype_code_element_size(code: i32) -> Option<usize> {
     match code {
-        65600 | 4 => Some(8),          // Double / Int64
+        65600 | 4 => Some(8),               // Double / Int64
         65568 | 131104 | 32 | 3 => Some(4), // Float32 / Int32
-        65552 | 16 => Some(2),         // Float16
-        1 => Some(1),                  // Int8
+        65552 | 16 => Some(2),              // Float16
+        1 => Some(1),                       // Int8
         _ => None,
     }
 }
