@@ -109,8 +109,16 @@ jobs:
           python3 -m unittest scripts/test_generate_backend_operator_report.py
 
   wpt-conformance:
-    name: WPT Conformance
-    runs-on: ubuntu-latest
+    name: WPT Conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            wpt_command: make test-wpt
+          - os: macos-latest
+            wpt_command: make test-wpt-coreml
     steps:
       - uses: actions/checkout@v4
 
@@ -122,10 +130,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.96.0
 
-      - name: Install protobuf compiler
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
 
       - name: Cache WPT checkout
         uses: actions/cache@v4
@@ -149,13 +162,13 @@ jobs:
           WPT_REPORT_JSON: reports/wpt-conformance.json
           RUSTNN_GIT_SHA: ${{ github.sha }}
           RUSTNN_GIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-        run: make test-wpt
+        run: ${{ matrix.wpt_command }}
 
       - name: Upload WPT conformance report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wpt-conformance-report
+          name: wpt-conformance-report-${{ matrix.os }}
           path: |
             reports/wpt-conformance.json
             reports/wpt-conformance.html

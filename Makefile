@@ -99,6 +99,11 @@ test-wpt: onnxruntime-download
 test-wpt-trtx:
 	$(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
 
+# WPT conformance via CoreML (macOS). CoreML trials auto-isolate per process so a
+# native crash is a recorded failure, not an aborted run.
+test-wpt-coreml:
+	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+
 test-wpt-op: onnxruntime-download
 	@test -n "$(OP)" || (echo "Usage: make test-wpt-op OP=add" && exit 1)
 	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- $(OP) --test-threads 1
@@ -264,6 +269,7 @@ help:
 	@echo "  test-wpt-op OP=... - Run filtered WPT trials"
 	@echo "  test-wpt-report    - Run full WPT suite and write JSON/HTML reports (ignores trial failures)"
 	@echo "  test-wpt-trtx      - Run WPT suite via TensorRT (skips when GPU unavailable)"
+	@echo "  test-wpt-coreml    - Run WPT suite via CoreML (macOS)"
 	@echo ""
 	@echo "CoreML Conversion:"
 	@echo "  coreml             - Convert graph to CoreML format"
