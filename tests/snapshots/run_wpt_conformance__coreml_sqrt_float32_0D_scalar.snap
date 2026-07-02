@@ -1,0 +1,22 @@
+---
+source: tests/run_wpt_conformance.rs
+expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+---
+sqrt.https.any.js sqrt float32 0D scalar, coreml
+ sqrt :: sqrt float32 0D scalar: index 0: actual=2.6936975 expected=2.0011156 ulp=2904899 tolerance=2
+  inputs: sqrtInput: [4.0044636726379395]
+  expected sqrtOutput: [2.0011156]
+  actual sqrtOutput: [2.6936975]
+
+--- built graph ---
+webnn_graph "graph" v2 {
+  inputs {
+    sqrtInput: f32[];
+  }
+
+  nodes {
+    [sqrtOutput] = sqrt(sqrtInput, label="");
+  }
+
+  outputs { sqrtOutput; }
+}

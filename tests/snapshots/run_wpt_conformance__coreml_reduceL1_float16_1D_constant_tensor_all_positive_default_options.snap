@@ -1,0 +1,20 @@
+---
+source: tests/run_wpt_conformance.rs
+expression: "format!(\"{file_name} {test_name}, {backend_prefix}\\n {msg}\")"
+---
+reduce_l1.https.any.js reduceL1 float16 1D constant tensor all positive default options, coreml
+ Failed to build graph: coreml runtime failed: MLModel load failed: Failed to build the model execution plan using a model architecture file '/private/var/folders/fv/xdj1sjg16zndg0hpptw8n1_c0000gn/T/rustnn_coreml_1782983311200_0.mlmodelc/model.mil' with error code: -14.
+
+--- built graph ---
+webnn_graph "graph" v2 {
+  consts {
+    operand_0: f16[24] @bytes([130, 69, 84, 82, 182, 62, 67, 85, 213, 75, 157, 82, 144, 72, 60, 79, 73, 74, 179, 73, 111, 85, 8, 84, 117, 84, 198, 84, 49, 81, 25, 86, 243, 79, 23, 70, 183, 83, 92, 84, 221, 80, 137, 82, 148, 77, 49, 86]);
+  }
+
+  nodes {
+    [reduceL1Output] = reduceL1(operand_0, axes=null, keepDimensions=false, label="");
+  }
+
+  outputs { reduceL1Output; }
+}
+E5RT encountered an STL exception. msg = Espresso exception: "Network translation error": MIL->EIR translation error at /private/var/folders/fv/xdj1sjg16zndg0hpptw8n1_c0000gn/T/rustnn_coreml_1782983311200_0.mlmodelc/model.mil:6:12: Storage Reader expects file format version 2..
