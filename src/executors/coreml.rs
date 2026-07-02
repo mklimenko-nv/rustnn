@@ -983,6 +983,36 @@ fn write_temp_model_with_weights(
         std::fs::write(&weights_path, weights)
             .map_err(|err| GraphError::export(&weights_path, err))?;
 
+        // Write the package Manifest.json. CoreML refuses to load an .mlpackage
+        // ("A valid manifest does not exist") without this root-level file
+        // pointing at the model spec inside Data/.
+        let manifest_path = package_path.join("Manifest.json");
+        let model_id = "00000000-0000-0000-0000-0000000000AA";
+        let weights_id = "00000000-0000-0000-0000-0000000000BB";
+        let manifest = format!(
+            r#"{{
+  "fileFormatVersion": "1.0.0",
+  "itemInfoEntries": {{
+    "{model_id}": {{
+      "author": "com.apple.CoreML",
+      "description": "CoreML Model Specification",
+      "name": "model.mlmodel",
+      "path": "com.apple.CoreML/model.mlmodel"
+    }},
+    "{weights_id}": {{
+      "author": "com.apple.CoreML",
+      "description": "CoreML Model Weights",
+      "name": "weights",
+      "path": "com.apple.CoreML/weights"
+    }}
+  }},
+  "rootModelIdentifier": "{model_id}"
+}}
+"#
+        );
+        std::fs::write(&manifest_path, manifest)
+            .map_err(|err| GraphError::export(&manifest_path, err))?;
+
         Ok(package_path)
     } else {
         // No weights: write single .mlmodel file as before
