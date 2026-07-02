@@ -44,6 +44,14 @@ impl WptBackend {
                 MLContextOptions::new(MLPowerPreference::HighPerformance, true)
                     .with_rustnn_backend_hint(Backend::Trtx),
             ),
+            // CoreML (macOS only). Filtered out by `is_available` unless the binary is built
+            // with `coreml-runtime` on macOS, so this is a no-op on other platforms/builds.
+            // `accelerated = false` picks CoreML's CPU device for deterministic snapshots.
+            Self::new(
+                "coreml",
+                MLContextOptions::new(MLPowerPreference::Default, false)
+                    .with_rustnn_backend_hint(Backend::Coreml),
+            ),
         ]
     }
 
@@ -59,6 +67,7 @@ impl WptBackend {
             .or_else(|| match s.trim().to_ascii_lowercase().as_str() {
                 "ort" | "cpu" | "onnx-cpu" | "ort-cpu" => Self::all().into_iter().next(),
                 "tensorrt" | "trt" => Self::all().into_iter().find(|b| b.prefix == "trtx"),
+                "core-ml" | "mlprogram" => Self::all().into_iter().find(|b| b.prefix == "coreml"),
                 _ => None,
             })
     }
@@ -71,7 +80,7 @@ impl WptBackend {
                 Some(backend) => vec![backend],
                 None => {
                     eprintln!(
-                        "[WPT] warning: invalid WPT_BACKEND={raw} (expected onnx or trtx); using all backends"
+                        "[WPT] warning: invalid WPT_BACKEND={raw} (expected onnx, trtx, or coreml); using all backends"
                     );
                     Self::all()
                 }

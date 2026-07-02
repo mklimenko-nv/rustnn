@@ -177,7 +177,7 @@ onnx-validate: onnx
 	$(ORT_ENV_VARS) $(CARGO) run --features onnx-runtime -- $(GRAPH_FILE) --convert onnx --convert-output $(ONNX_PATH) --run-onnx
 
 coreml:
-	$(CARGO) run -- $(GRAPH_FILE) --convert coreml --convert-output $(COREML_PATH)
+	$(CARGO) run --features coreml-runtime -- $(GRAPH_FILE) --convert coreml --convert-output $(COREML_PATH)
 	@echo "CoreML graph written to $(COREML_PATH)"
 
 coreml-validate: coreml
