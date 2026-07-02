@@ -3,7 +3,6 @@
 //! using CoreML's Objective-C API.
 
 #![cfg(all(target_os = "macos", feature = "coreml-runtime"))]
-#![allow(unexpected_cfgs)]
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
