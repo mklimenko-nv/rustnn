@@ -220,7 +220,7 @@ mod tests {
             .product();
 
         // Allocate device buffers
-        let input_size = input_a.len() * std::mem::size_of::<f32>();
+        let input_size = std::mem::size_of_val(input_a);
         let output_size = output_element_count * std::mem::size_of::<f32>();
 
         let mut input_a_buffer = DeviceBuffer::new(input_size)?;
@@ -231,7 +231,7 @@ mod tests {
         let input_a_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_a.as_ptr() as *const u8,
-                input_a.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_a),
             )
         };
         input_a_buffer.copy_from_host(input_a_bytes)?;
@@ -239,7 +239,7 @@ mod tests {
         let input_b_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_b.as_ptr() as *const u8,
-                input_b.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_b),
             )
         };
         input_b_buffer.copy_from_host(input_b_bytes)?;
@@ -303,7 +303,7 @@ mod tests {
             .product();
 
         // Allocate device buffers
-        let input_size = input_data.len() * std::mem::size_of::<f32>();
+        let input_size = std::mem::size_of_val(input_data);
         let output_size = output_element_count * std::mem::size_of::<f32>();
 
         let mut input_buffer = DeviceBuffer::new(input_size)?;
@@ -313,7 +313,7 @@ mod tests {
         let input_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_data.as_ptr() as *const u8,
-                input_data.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_data),
             )
         };
         input_buffer.copy_from_host(input_bytes)?;
@@ -480,6 +480,86 @@ mod tests {
         Ok(output_data)
     }
 
+    /// Helper to verify int32 output (e.g. argMax/argMin indices).
+    fn verify_i32_output(actual: &[i32], expected: &[i32]) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "Output length mismatch: {} vs {}",
+            actual.len(),
+            expected.len()
+        );
+
+        for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a, e,
+                "Value mismatch at index {}: actual={}, expected={}",
+                i, a, e
+            );
+        }
+    }
+
+    /// Execute a graph whose sole output is int32 (argMax/argMin indices).
+    fn execute_graph_int32_output(
+        graph: &GraphInfo,
+        input_data: &[f32],
+    ) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        let converter = TrtxConverter::new();
+        let converted = converter.convert(graph)?;
+
+        let logger = Logger::stderr()?;
+        let mut runtime = Runtime::new(&logger)?;
+        let mut engine = runtime.deserialize_cuda_engine(&converted.data)?;
+        let mut context = engine.create_execution_context()?;
+
+        let input_name = engine.io_tensor_name(0)?;
+        let output_name = engine.io_tensor_name(1)?;
+
+        let output_operand_id = graph.output_operands[0];
+        let output_operand = &graph.operands[output_operand_id as usize];
+        let output_element_count: usize = output_operand
+            .descriptor
+            .shape
+            .iter()
+            .map(|d| get_static_or_max_size(d) as usize)
+            .product();
+
+        let input_size = std::mem::size_of_val(input_data);
+        let output_size = output_element_count * std::mem::size_of::<i32>();
+
+        let mut input_buffer = DeviceBuffer::new(input_size)?;
+        let output_buffer = DeviceBuffer::new(output_size)?;
+
+        let input_bytes = unsafe {
+            std::slice::from_raw_parts(
+                input_data.as_ptr() as *const u8,
+                std::mem::size_of_val(input_data),
+            )
+        };
+        input_buffer.copy_from_host(input_bytes)?;
+
+        unsafe {
+            context.set_tensor_address(&input_name, input_buffer.as_ptr())?;
+            context.set_tensor_address(&output_name, output_buffer.as_ptr())?;
+        }
+
+        unsafe {
+            context.enqueue_v3(trtx::cuda::default_stream())?;
+        }
+        trtx::cuda::synchronize()?;
+
+        let mut output_data = vec![0i32; output_element_count];
+        let output_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                output_data.as_mut_ptr() as *mut u8,
+                output_data.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        output_buffer.copy_to_host(output_bytes)?;
+
+        Ok(output_data)
+    }
+
     /// Helper to verify output within tolerance
     fn verify_output(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(
@@ -586,7 +666,7 @@ mod tests {
     fn test_exp_execution() {
         let graph = create_unary_graph("exp", vec![4], DataType::Float32);
         let input = vec![0.0, 1.0, 2.0, -1.0];
-        let expected = vec![1.0, 2.718281828, 7.389056099, 0.367879441];
+        let expected = vec![1.0, 2.718_281_7, 7.389_056, 0.367_879_45];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -595,7 +675,7 @@ mod tests {
     #[test]
     fn test_log_execution() {
         let graph = create_unary_graph("log", vec![4], DataType::Float32);
-        let input = vec![1.0, 2.718281828, 7.389056099, 0.367879441];
+        let input = vec![1.0, 2.718_281_7, 7.389_056, 0.367_879_45];
         let expected = vec![0.0, 1.0, 2.0, -1.0];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
@@ -665,7 +745,7 @@ mod tests {
     fn test_erf_execution() {
         let graph = create_unary_graph("erf", vec![5], DataType::Float32);
         let input = vec![0.0, 0.5, 1.0, -0.5, -1.0];
-        let expected = vec![0.0, 0.520499878, 0.842700793, -0.520499878, -0.842700793];
+        let expected = vec![0.0, 0.520_499_9, 0.842_700_8, -0.520_499_9, -0.842_700_8];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -689,7 +769,7 @@ mod tests {
     fn test_sigmoid_execution() {
         let graph = create_unary_graph("sigmoid", vec![5], DataType::Float32);
         let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
-        let expected = vec![0.119202922, 0.268941421, 0.5, 0.731058579, 0.880797078];
+        let expected = vec![0.119_202_92, 0.268_941_43, 0.5, 0.731_058_6, 0.880_797_1];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -699,7 +779,7 @@ mod tests {
     fn test_tanh_execution() {
         let graph = create_unary_graph("tanh", vec![5], DataType::Float32);
         let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
-        let expected = vec![-0.96402758, -0.76159416, 0.0, 0.76159416, 0.96402758];
+        let expected = vec![-0.964_027_6, -0.761_594_2, 0.0, 0.761_594_2, 0.964_027_6];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -710,7 +790,7 @@ mod tests {
         let graph = create_unary_graph("elu", vec![5], DataType::Float32);
         let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         // ELU with alpha=1.0: x if x > 0, else alpha * (exp(x) - 1)
-        let expected = vec![-0.864664717, -0.632120559, 0.0, 1.0, 2.0];
+        let expected = vec![-0.864_664_73, -0.632_120_55, 0.0, 1.0, 2.0];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -721,7 +801,7 @@ mod tests {
         let graph = create_unary_graph("softsign", vec![5], DataType::Float32);
         let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         // softsign: x / (1 + |x|)
-        let expected = vec![-0.666666667, -0.5, 0.0, 0.5, 0.666666667];
+        let expected = vec![-0.666_666_7, -0.5, 0.0, 0.5, 0.666_666_7];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -733,11 +813,11 @@ mod tests {
         let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         // softplus: ln(1 + exp(x))
         let expected = vec![
-            0.126928011,
-            0.313261688,
-            0.693147181,
-            1.313261688,
-            2.126928011,
+            0.126_928_02,
+            0.313_261_7,
+            std::f32::consts::LN_2,
+            1.313_261_7,
+            2.126_928,
         ];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
@@ -749,7 +829,7 @@ mod tests {
         let graph = create_unary_graph("gelu", vec![5], DataType::Float32);
         let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         // GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
-        let expected = vec![-0.045500263, -0.158655254, 0.0, 0.841344746, 1.954499737];
+        let expected = vec![-0.045500263, -0.158_655_26, 0.0, 0.841_344_8, 1.954_499_7];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-4); // Slightly larger tolerance for GELU
@@ -784,7 +864,7 @@ mod tests {
         // 4D tensor: 1×1×2×2 (batch × channels × height × width)
         let graph = create_unary_graph("exp", vec![1, 1, 2, 2], DataType::Float32);
         let input = vec![0.0, 1.0, 2.0, -1.0];
-        let expected = vec![1.0, 2.718281828, 7.389056099, 0.367879441];
+        let expected = vec![1.0, 2.718_281_7, 7.389_056, 0.367_879_45];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -806,7 +886,7 @@ mod tests {
         // 4D tensor: 1×1×2×2
         let graph = create_unary_graph("sigmoid", vec![1, 1, 2, 2], DataType::Float32);
         let input = vec![-1.0, 0.0, 1.0, 2.0];
-        let expected = vec![0.268941421, 0.5, 0.731058579, 0.880797078];
+        let expected = vec![0.268_941_43, 0.5, 0.731_058_6, 0.880_797_1];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
         verify_output(&output, &expected, 1e-5);
@@ -817,12 +897,12 @@ mod tests {
         let graph = create_unary_graph("tanh", vec![2, 3], DataType::Float32);
         let input = vec![-1.0, 0.0, 1.0, -2.0, 0.5, 2.0];
         let expected = vec![
-            -0.76159416,
+            -0.761_594_2,
             0.0,
-            0.76159416,
-            -0.96402758,
+            0.761_594_2,
+            -0.964_027_6,
             0.46211716,
-            0.96402758,
+            0.964_027_6,
         ];
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
@@ -919,8 +999,8 @@ mod tests {
         let output_name = engine.io_tensor_name(2)?;
 
         // Allocate device buffers
-        let input_a_size = input_a.len() * std::mem::size_of::<f32>();
-        let input_b_size = input_b.len() * std::mem::size_of::<f32>();
+        let input_a_size = std::mem::size_of_val(input_a);
+        let input_b_size = std::mem::size_of_val(input_b);
 
         // Calculate output size based on operation
         let output_size = if graph.operations[0].op_type() == "matmul" {
@@ -945,7 +1025,7 @@ mod tests {
         let input_a_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_a.as_ptr() as *const u8,
-                input_a.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_a),
             )
         };
         input_a_buffer.copy_from_host(input_a_bytes)?;
@@ -953,7 +1033,7 @@ mod tests {
         let input_b_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_b.as_ptr() as *const u8,
-                input_b.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_b),
             )
         };
         input_b_buffer.copy_from_host(input_b_bytes)?;
@@ -1038,6 +1118,7 @@ mod tests {
     // ============================================================================
 
     /// Helper to create a GEMM graph (alpha * A * B + beta * C)
+    #[allow(clippy::too_many_arguments)]
     fn create_gemm_graph(
         a_shape: Vec<u32>,
         b_shape: Vec<u32>,
@@ -1140,9 +1221,9 @@ mod tests {
         let output_name = engine.io_tensor_name(3)?;
 
         // Allocate device buffers
-        let input_a_size = input_a.len() * std::mem::size_of::<f32>();
-        let input_b_size = input_b.len() * std::mem::size_of::<f32>();
-        let input_c_size = input_c.len() * std::mem::size_of::<f32>();
+        let input_a_size = std::mem::size_of_val(input_a);
+        let input_b_size = std::mem::size_of_val(input_b);
+        let input_c_size = std::mem::size_of_val(input_c);
         let output_size = input_c_size; // Output has same size as C
 
         let mut input_a_buffer = DeviceBuffer::new(input_a_size)?;
@@ -1154,7 +1235,7 @@ mod tests {
         let input_a_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_a.as_ptr() as *const u8,
-                input_a.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_a),
             )
         };
         input_a_buffer.copy_from_host(input_a_bytes)?;
@@ -1162,7 +1243,7 @@ mod tests {
         let input_b_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_b.as_ptr() as *const u8,
-                input_b.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_b),
             )
         };
         input_b_buffer.copy_from_host(input_b_bytes)?;
@@ -1170,7 +1251,7 @@ mod tests {
         let input_c_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_c.as_ptr() as *const u8,
-                input_c.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(input_c),
             )
         };
         input_c_buffer.copy_from_host(input_c_bytes)?;
@@ -1512,7 +1593,7 @@ mod tests {
             pending_permutation: Vec::new(),
         };
 
-        let slope_data = vec![0.25f32];
+        let slope_data = [0.25f32];
         let slope_bytes: Vec<u8> = slope_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
 
         let mut constants = HashMap::new();
@@ -1602,7 +1683,7 @@ mod tests {
     fn test_identity_execution() {
         // Identity: output = input (no transformation)
         let graph = create_unary_graph("identity", vec![4], DataType::Float32);
-        let input = vec![-1.5, 0.0, 1.5, 3.14];
+        let input = vec![-1.5, 0.0, 1.5, 3.15];
         let expected = input.clone();
 
         let output = execute_graph(&graph, &input).expect("Execution failed");
@@ -2989,10 +3070,10 @@ mod tests {
         let input = vec![1.0, 3.0, 2.0, 4.0, 2.0, 5.0];
 
         // Expected: [1, 2] (index of max in each row)
-        let expected = vec![1.0, 2.0]; // Will be int32 indices
+        let expected = vec![1i32, 2i32];
 
-        let output = execute_graph(&graph, &input).expect("Execution failed");
-        verify_output(&output, &expected, 1e-4);
+        let output = execute_graph_int32_output(&graph, &input).expect("Execution failed");
+        verify_i32_output(&output, &expected);
     }
 
     #[test]
@@ -3006,10 +3087,10 @@ mod tests {
         let input = vec![3.0, 1.0, 2.0, 4.0, 5.0, 2.0];
 
         // Expected: [1, 2] (index of min in each row)
-        let expected = vec![1.0, 2.0]; // Will be int32 indices
+        let expected = vec![1i32, 2i32];
 
-        let output = execute_graph(&graph, &input).expect("Execution failed");
-        verify_output(&output, &expected, 1e-4);
+        let output = execute_graph_int32_output(&graph, &input).expect("Execution failed");
+        verify_i32_output(&output, &expected);
     }
 
     // ============================================================================
@@ -3662,8 +3743,8 @@ mod tests {
         // Test convTranspose2d operation (deconvolution)
         // Input: 1x1x2x2, Kernel: 1x1x2x2, Output: 1x1x3x3
 
-        let kernel_data = vec![1.0, 0.0, 0.0, 1.0]; // 2x2 identity-like kernel
-        let bias_data = vec![0.0];
+        let kernel_data = [1.0, 0.0, 0.0, 1.0]; // 2x2 identity-like kernel
+        let bias_data = [0.0];
 
         // Convert to bytes using flat_map (no base64 encoding needed)
         let kernel_bytes: Vec<u8> = kernel_data
@@ -4523,7 +4604,7 @@ mod tests {
 
     // NOTE: RNN operation tests removed
     // IRNNv2Layer is deprecated in TensorRT and autocxx cannot generate bindings for it
-    // RNN operations (lstm, lstmCell, gru, gruCell) remain deferred
+    // GRU and LSTM recurrent ops implemented via trtx_gru / trtx_lstm for TRTX
 
     // ============================================================================
     // Conv2D Padding Tests (2026-01-30)
