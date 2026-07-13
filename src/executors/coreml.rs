@@ -607,6 +607,9 @@ unsafe fn fill_multiarray_from_bytes(
 ///
 /// Handles non-contiguous layouts (e.g. 64-byte aligned outputs from the Apple
 /// Neural Engine) by gathering elements according to the array's strides.
+/// Also handles dtype mismatches: CoreML may return a different dtype than requested
+/// (e.g. float32 for a uint8-declared output from a comparison op). In that case the
+/// data is converted element-by-element to the expected dtype.
 unsafe fn extract_multiarray_bytes(
     array: *mut Object,
     descriptor: &OperandDescriptor,
@@ -615,7 +618,13 @@ unsafe fn extract_multiarray_bytes(
     let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
         reason: format!("invalid element count: {count_obj}"),
     })?;
-    let elem = descriptor.data_type.bytes_per_element();
+
+    // Query the actual data type code from the MLMultiArray — CoreML may promote
+    // the dtype (e.g. uint8 cast result returned as float32).
+    let actual_dtype_code: i64 = msg_send![array, dataType];
+    let actual_elem = ml_dtype_code_element_size(actual_dtype_code as i32).unwrap_or(4);
+    let expected_elem = descriptor.data_type.bytes_per_element();
+
     let ptr: *const u8 = {
         let p: *mut c_void = msg_send![array, dataPointer];
         if p.is_null() {
@@ -634,13 +643,139 @@ unsafe fn extract_multiarray_bytes(
     let strides_nsarray: *mut Object = msg_send![array, strides];
     let strides = unsafe { nsarray_to_i64_vec(strides_nsarray)? };
 
-    if is_contiguous(&shape, &strides) {
-        let total = count.saturating_mul(elem);
+    // Read raw bytes using the ACTUAL element size from the MLMultiArray.
+    let actual_bytes = if is_contiguous(&shape, &strides) {
+        let total = count.saturating_mul(actual_elem);
         let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
-        return Ok(slice.to_vec());
+        slice.to_vec()
+    } else {
+        unsafe { gather_strided_bytes(ptr, &shape, &strides, actual_elem) }
+    };
+
+    if actual_elem == expected_elem {
+        return Ok(actual_bytes);
     }
 
-    Ok(unsafe { gather_strided_bytes(ptr, &shape, &strides, elem) })
+    // Dtype mismatch: convert from the actual dtype to the expected dtype.
+    Ok(convert_multiarray_bytes(
+        actual_bytes,
+        actual_dtype_code as i32,
+        descriptor.data_type,
+    ))
+}
+
+/// Normalize non-standard MLMultiArrayDataType codes to canonical ones.
+/// CoreML sometimes returns vendor-specific codes (e.g. 65568 for Float32).
+fn normalize_dtype_code(code: i32) -> i32 {
+    match code {
+        65600 | 4 => 4,           // Int64 / Double → treat as Int64
+        65568 | 131104 | 32 => 32, // Float32 variants
+        65552 | 16 => 16,          // Float16 variants
+        3 => 3,                    // Int32
+        1 => 1,                    // Int8
+        _ => code,
+    }
+}
+
+/// Convert a byte buffer from `actual_code` dtype to the `target` dtype.
+/// Used when CoreML promotes an output dtype (e.g. uint8 boolean result → float32).
+fn convert_multiarray_bytes(actual_bytes: Vec<u8>, actual_code: i32, target: DataType) -> Vec<u8> {
+    let canonical_code = normalize_dtype_code(actual_code);
+    let actual_elem = ml_dtype_code_element_size(canonical_code).unwrap_or(4);
+    let count = if actual_elem > 0 {
+        actual_bytes.len() / actual_elem
+    } else {
+        0
+    };
+
+    match canonical_code {
+        32 => {
+            // Source: Float32
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const f32, count) };
+            match target {
+                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
+                DataType::Int32 | DataType::Uint32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Float16 => {
+                    let mut out = Vec::with_capacity(count * 2);
+                    for &v in src {
+                        out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+                    }
+                    out
+                }
+                _ => actual_bytes,
+            }
+        }
+        16 => {
+            // Source: Float16
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const u16, count) };
+            match target {
+                DataType::Uint8 | DataType::Int8 => src
+                    .iter()
+                    .map(|&bits| half::f16::from_bits(bits).to_f32() as u8)
+                    .collect(),
+                DataType::Float32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &bits in src {
+                        out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
+                    }
+                    out
+                }
+                _ => actual_bytes,
+            }
+        }
+        3 => {
+            // Source: Int32
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const i32, count) };
+            match target {
+                DataType::Float32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as f32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
+                _ => actual_bytes,
+            }
+        }
+        1 => {
+            // Source: Int8 — compatible byte layout with Uint8
+            actual_bytes
+        }
+        4 => {
+            // Source: Int64
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const i64, count) };
+            match target {
+                DataType::Int32 | DataType::Uint32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Float32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as f32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
+                _ => actual_bytes,
+            }
+        }
+        _ => actual_bytes,
+    }
 }
 
 /// Whether `strides` (in elements) describe a C-contiguous layout for `shape`.
