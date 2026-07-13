@@ -629,8 +629,7 @@ fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count:
         }
         (DataType::Float32, 16) => {
             // float32 → float16
-            let src_f32 =
-                unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, count) };
+            let src_f32 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, count) };
             let mut out = Vec::with_capacity(count * 2);
             for &v in src_f32 {
                 out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
@@ -639,8 +638,7 @@ fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count:
         }
         (DataType::Float16, 32) => {
             // float16 → float32
-            let src_f16 =
-                unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, count) };
+            let src_f16 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, count) };
             let mut out = Vec::with_capacity(count * 4);
             for &bits in src_f16 {
                 out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
@@ -649,8 +647,7 @@ fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count:
         }
         (DataType::Int64, 32) => {
             // int64 → float32: used for int64 inputs promoted to float32 by CoreML
-            let src_i64 =
-                unsafe { std::slice::from_raw_parts(src.as_ptr() as *const i64, count) };
+            let src_i64 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const i64, count) };
             let mut out = Vec::with_capacity(count * 4);
             for &v in src_i64 {
                 out.extend_from_slice(&(v as f32).to_le_bytes());
@@ -729,7 +726,7 @@ unsafe fn extract_multiarray_bytes(
 /// CoreML sometimes returns vendor-specific codes (e.g. 65568 for Float32).
 fn normalize_dtype_code(code: i32) -> i32 {
     match code {
-        65600 | 4 => 4,           // Int64 / Double → treat as Int64
+        65600 | 4 => 4,            // Int64 / Double → treat as Int64
         65568 | 131104 | 32 => 32, // Float32 variants
         65552 | 16 => 16,          // Float16 variants
         3 => 3,                    // Int32
