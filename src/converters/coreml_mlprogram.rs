@@ -1672,9 +1672,14 @@ impl CoremlMlProgramConverter {
                     inputs.insert("weight".to_string(), Self::create_argument(&input_names[1]));
                 }
 
-                // Add optional bias if present (third input)
-                if input_names.len() >= 3 {
-                    inputs.insert("bias".to_string(), Self::create_argument(&input_names[2]));
+                // Add optional bias if present (from options, not input_names)
+                if let Some(opts) = options {
+                    if let Some(bias_id) = opts.bias {
+                        inputs.insert(
+                            "bias".to_string(),
+                            Self::create_argument(&operand_name(graph, bias_id)),
+                        );
+                    }
                 }
 
                 // CoreML requires pad_type parameter (defaults to "custom" for explicit padding)
@@ -1876,73 +1881,46 @@ impl CoremlMlProgramConverter {
 
             // Layer normalization (different from batch/instance normalization)
             Operation::LayerNormalization { options, .. } => {
-                // Check if axes is empty - CoreML doesn't support empty axes
-                // Following Chromium (graph_builder_coreml.cc:4000-4019):
-                // When axes is empty, mean equals input, so output = bias + (scale * 0)
-                let axes_vec: Vec<i32> = options
+                // Build sorted axes vector (CoreML requires sorted axes; empty axes are handled
+                // as a special case in the main convert loop before reaching here).
+                let mut axes_vec: Vec<i32> = options
                     .as_ref()
                     .and_then(|o| o.axes.as_ref())
                     .map(|ax| ax.iter().map(|&u| u as i32).collect())
                     .unwrap_or_default();
+                axes_vec.sort_unstable();
 
-                if axes_vec.is_empty() {
-                    // Empty axes case: use sub operation (input - input = 0)
-                    // CoreML doesn't support empty axes, so we emulate it
-                    // Note: This will be handled by inserting a sub operation in convert_operation
-                    // For now, return error as this needs special multi-operation handling
-                    return Err(GraphError::ConversionFailed {
-                        format: "coreml_mlprogram".to_string(),
-                        reason: "CoreML layer_norm with empty axes requires special handling (not yet implemented)".to_string(),
-                    });
-                }
-
-                // Add input operand (only x)
+                // Add input operand (only x; scale/bias come from options, not input_operands)
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
 
-                // Scale (gamma) is optional (2nd input)
-                // CoreML requires scale/bias to be constant tensors (not graph inputs)
-                // Following Chromium: TODO(crbug.com/338529226) - these params must be constant
-                if input_names.len() >= 2 && op.input_operands().len() >= 2 {
-                    let scale_operand_id = op.input_operands()[1];
-                    if let Some(scale_operand) = graph.operand(scale_operand_id)
-                        && scale_operand.kind != crate::graph::OperandKind::Constant
-                    {
-                        return Err(GraphError::ConversionFailed {
-                                format: "coreml_mlprogram".to_string(),
-                                reason: "CoreML layer_norm requires scale (gamma) parameter to be a constant tensor, not a graph input".to_string(),
-                            });
-                    }
-                    inputs.insert("gamma".to_string(), Self::create_argument(&input_names[1]));
-                }
-
-                // Bias (beta) is optional (3rd input)
-                if input_names.len() >= 3 && op.input_operands().len() >= 3 {
-                    let bias_operand_id = op.input_operands()[2];
-                    if let Some(bias_operand) = graph.operand(bias_operand_id)
-                        && bias_operand.kind != crate::graph::OperandKind::Constant
-                    {
-                        return Err(GraphError::ConversionFailed {
-                                format: "coreml_mlprogram".to_string(),
-                                reason: "CoreML layer_norm requires bias (beta) parameter to be a constant tensor, not a graph input".to_string(),
-                            });
-                    }
-                    inputs.insert("beta".to_string(), Self::create_argument(&input_names[2]));
-                }
-
-                // Add axes parameter (REQUIRED by CoreML, must not be empty)
-                inputs.insert(
-                    "axes".to_string(),
-                    Self::create_int_array_argument(axes_vec),
-                );
-
+                // Scale (gamma) and bias (beta) are stored in options, not in input_operands.
                 if let Some(opts) = options {
+                    if let Some(scale_id) = opts.scale {
+                        inputs.insert(
+                            "gamma".to_string(),
+                            Self::create_argument(&operand_name(graph, scale_id)),
+                        );
+                    }
+                    if let Some(bias_id) = opts.bias {
+                        inputs.insert(
+                            "beta".to_string(),
+                            Self::create_argument(&operand_name(graph, bias_id)),
+                        );
+                    }
                     inputs.insert(
                         "epsilon".to_string(),
                         Self::create_immediate_float(opts.epsilon as f32),
                     );
                 }
+
+                // Add axes parameter (REQUIRED by CoreML, must not be empty;
+                // empty axes are caught before this point).
+                inputs.insert(
+                    "axes".to_string(),
+                    Self::create_int_array_argument(axes_vec),
+                );
             }
 
             // Batch/instance normalization (have mean, variance inputs)
@@ -2010,46 +1988,19 @@ impl CoremlMlProgramConverter {
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                if input_names.len() >= 2 && op.input_operands().len() >= 2 {
-                    let mean_operand_id = op.input_operands()[1];
-                    if let Some(mean_operand) = graph.operand(mean_operand_id)
-                        && mean_operand.kind != crate::graph::OperandKind::Constant
-                    {
-                        return Err(GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: format!(
-                                "CoreML {} requires mean parameter to be a constant tensor, not a graph input",
-                                op.op_type()
-                            ),
-                        });
-                    }
-                    inputs.insert("mean".to_string(), Self::create_argument(&input_names[1]));
-                }
-                if input_names.len() >= 3 && op.input_operands().len() >= 3 {
-                    let variance_operand_id = op.input_operands()[2];
-                    if let Some(variance_operand) = graph.operand(variance_operand_id)
-                        && variance_operand.kind != crate::graph::OperandKind::Constant
-                    {
-                        return Err(GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: format!(
-                                "CoreML {} requires variance parameter to be a constant tensor, not a graph input",
-                                op.op_type()
-                            ),
-                        });
-                    }
-                    inputs.insert(
-                        "variance".to_string(),
-                        Self::create_argument(&input_names[2]),
-                    );
-                }
-                if input_names.len() >= 4 {
-                    inputs.insert("gamma".to_string(), Self::create_argument(&input_names[3]));
-                }
-                if input_names.len() >= 5 {
-                    inputs.insert("beta".to_string(), Self::create_argument(&input_names[4]));
-                }
                 if let Some(opts) = options {
+                    if let Some(scale_id) = opts.scale {
+                        inputs.insert(
+                            "gamma".to_string(),
+                            Self::create_argument(&operand_name(graph, scale_id)),
+                        );
+                    }
+                    if let Some(bias_id) = opts.bias {
+                        inputs.insert(
+                            "beta".to_string(),
+                            Self::create_argument(&operand_name(graph, bias_id)),
+                        );
+                    }
                     inputs.insert(
                         "epsilon".to_string(),
                         Self::create_immediate_float(opts.epsilon as f32),
@@ -2515,6 +2466,23 @@ impl CoremlMlProgramConverter {
                 );
             }
 
+            Operation::ReduceLogSumExp { options, .. } => {
+                if !input_names.is_empty() {
+                    inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
+                }
+                if let Some(opts) = options {
+                    if let Some(axes) = opts.axes.as_ref()
+                        && !axes.is_empty()
+                    {
+                        inputs.insert("axes".to_string(), Self::create_immediate_int_array(axes));
+                    }
+                    inputs.insert(
+                        "keep_dims".to_string(),
+                        Self::create_immediate_bool(opts.keep_dimensions),
+                    );
+                }
+            }
+
             // Reduction operations: reduceSum, reduceMean, reduceMax, etc.
             Operation::ReduceSum { options, .. }
             | Operation::ReduceMean { options, .. }
@@ -2524,7 +2492,6 @@ impl CoremlMlProgramConverter {
             | Operation::ReduceL1 { options, .. }
             | Operation::ReduceL2 { options, .. }
             | Operation::ReduceLogSum { options, .. }
-            | Operation::ReduceLogSumExp { options, .. }
             | Operation::ReduceSumSquare { options, .. } => {
                 // All reduce operations: x, axes, keep_dims
                 if !input_names.is_empty() {
@@ -3516,7 +3483,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     _ => (1.0, 1.0),
                 };
 
-                let has_bias = op.input_operands().len() >= 3;
+                let c_operand_id_opt = match &op {
+                    Operation::Gemm { options, .. } => options.as_ref().and_then(|o| o.c),
+                    _ => None,
+                };
+                let has_bias = c_operand_id_opt.is_some();
                 let needs_alpha_mul = (alpha - 1.0).abs() > f32::EPSILON;
                 let needs_beta_mul = has_bias && (beta - 1.0).abs() > f32::EPSILON;
 
@@ -3607,7 +3578,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
 
                 if has_bias {
-                    let c_operand_id = op.input_operands()[2];
+                    let c_operand_id = c_operand_id_opt.unwrap();
                     let (c_name, c_type) = Self::create_value(graph_info, c_operand_id)?;
                     let scaled_c_name = if needs_beta_mul {
                         format!("{}_gemm_bias", output_name)
@@ -3881,6 +3852,217 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                 // Skip normal operation conversion for neg
                 continue;
+            }
+
+            // Special handling for layerNormalization with empty axes.
+            // When axes is empty (or not provided), the mean equals the input, so variance is 0
+            // and the normalized output is 0 for every element. Following Chromium:
+            //   out = sub(x, x)           -> zeros shaped like input
+            //   out = add(zeros, bias)    -> if bias is present
+            if op_type_lower == "layernormalization" {
+                let axes_empty = match &op {
+                    Operation::LayerNormalization { options, .. } => {
+                        let axes_vec: Vec<i32> = options
+                            .as_ref()
+                            .and_then(|o| o.axes.as_ref())
+                            .map(|ax| ax.iter().map(|&u| u as i32).collect())
+                            .unwrap_or_default();
+                        axes_vec.is_empty()
+                    }
+                    _ => false,
+                };
+
+                if axes_empty {
+                    if op.input_operands().is_empty() || op.output_operand().is_none() {
+                        return Err(GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: "layerNormalization requires input and output operand"
+                                .to_string(),
+                        });
+                    }
+
+                    let input_id = op.input_operands()[0];
+                    let input_operand = graph_info.operand(input_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("Input operand {} not found", input_id),
+                        }
+                    })?;
+                    let output_id = op.output_operand().unwrap();
+                    let (output_name, output_type) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        input_id,
+                        &operand_name_overrides,
+                    );
+                    let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
+                    let dimensions = Self::mil_dimensions_from_graph_shape(
+                        &input_operand.descriptor.shape,
+                        false,
+                    );
+                    let zeros_value_type = ValueType {
+                        r#type: Some(
+                            crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                TensorType {
+                                    rank: dimensions.len() as i64,
+                                    data_type: dtype,
+                                    dimensions,
+                                    attributes: HashMap::new(),
+                                },
+                            ),
+                        ),
+                    };
+
+                    let bias_id_opt = match &op {
+                        Operation::LayerNormalization { options, .. } => {
+                            options.as_ref().and_then(|o| o.bias)
+                        }
+                        _ => None,
+                    };
+
+                    let zeros_name = if bias_id_opt.is_some() {
+                        format!("{}_ln_zeros", output_name)
+                    } else {
+                        output_name.clone()
+                    };
+
+                    // zeros = x - x
+                    let mut sub_inputs: HashMap<String, Argument> = HashMap::new();
+                    sub_inputs.insert(
+                        "x".to_string(),
+                        Self::create_name_argument(input_name.clone()),
+                    );
+                    sub_inputs.insert("y".to_string(), Self::create_name_argument(input_name));
+                    main_block.operations.push(Self::create_mil_operation(
+                        "sub",
+                        sub_inputs,
+                        vec![NamedValueType {
+                            name: zeros_name.clone(),
+                            r#type: Some(zeros_value_type),
+                        }],
+                    ));
+
+                    if let Some(bias_id) = bias_id_opt {
+                        let bias_name = operand_name(graph_info, bias_id);
+                        let mut add_inputs: HashMap<String, Argument> = HashMap::new();
+                        add_inputs.insert("x".to_string(), Self::create_name_argument(zeros_name));
+                        add_inputs.insert("y".to_string(), Self::create_name_argument(bias_name));
+                        main_block.operations.push(Self::create_mil_operation(
+                            "add",
+                            add_inputs,
+                            vec![output_type],
+                        ));
+                    }
+
+                    continue;
+                }
+            }
+
+            // Special handling for triangular with non-zero diagonal k.
+            // CoreML band_part(x, lower, upper) keeps the band -lower <= row-col <= upper.
+            // For upper=true, k>0: the result is input minus the band up to diagonal k-1.
+            //   result = input - band_part(input, -1, k-1)
+            // For upper=false, k<0: the result is input minus the band from diagonal -(|k|-1).
+            //   result = input - band_part(input, |k|-1, -1)
+            if op_type_lower == "triangular" {
+                let (is_upper, diagonal) = match &op {
+                    Operation::Triangular { options, .. } => (
+                        options.as_ref().and_then(|o| o.upper).unwrap_or(true),
+                        options.as_ref().map(|o| o.diagonal as i64).unwrap_or(0),
+                    ),
+                    _ => (true, 0),
+                };
+
+                let needs_decompose = (is_upper && diagonal > 0) || (!is_upper && diagonal < 0);
+
+                if needs_decompose {
+                    if op.input_operands().is_empty() || op.output_operand().is_none() {
+                        return Err(GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: "triangular requires input and output operand".to_string(),
+                        });
+                    }
+
+                    let input_id = op.input_operands()[0];
+                    let input_operand = graph_info.operand(input_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("Input operand {} not found", input_id),
+                        }
+                    })?;
+                    let output_id = op.output_operand().unwrap();
+                    let (output_name, output_type) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        input_id,
+                        &operand_name_overrides,
+                    );
+                    let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
+                    let dimensions = Self::mil_dimensions_from_graph_shape(
+                        &input_operand.descriptor.shape,
+                        false,
+                    );
+                    let band_value_type = ValueType {
+                        r#type: Some(
+                            crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                TensorType {
+                                    rank: dimensions.len() as i64,
+                                    data_type: dtype,
+                                    dimensions,
+                                    attributes: HashMap::new(),
+                                },
+                            ),
+                        ),
+                    };
+                    let band_name = format!("{}_triangular_band", output_name);
+
+                    // Compute band_part bounds for the subtracted region.
+                    // upper=true, k>0: subtract band_part(input, -1, k-1)
+                    // upper=false, k<0: subtract band_part(input, |k|-1, -1)
+                    let (band_lower, band_upper): (i64, i64) = if is_upper {
+                        (-1, diagonal - 1)
+                    } else {
+                        ((-diagonal) - 1, -1)
+                    };
+
+                    let mut band_inputs: HashMap<String, Argument> = HashMap::new();
+                    band_inputs.insert(
+                        "x".to_string(),
+                        Self::create_name_argument(input_name.clone()),
+                    );
+                    band_inputs.insert(
+                        "lower".to_string(),
+                        Self::create_immediate_int(band_lower as i32 as u32),
+                    );
+                    band_inputs.insert(
+                        "upper".to_string(),
+                        Self::create_immediate_int(band_upper as i32 as u32),
+                    );
+                    main_block.operations.push(Self::create_mil_operation(
+                        "band_part",
+                        band_inputs,
+                        vec![NamedValueType {
+                            name: band_name.clone(),
+                            r#type: Some(band_value_type),
+                        }],
+                    ));
+
+                    // result = input - band
+                    let mut sub_inputs: HashMap<String, Argument> = HashMap::new();
+                    sub_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                    sub_inputs.insert("y".to_string(), Self::create_name_argument(band_name));
+                    main_block.operations.push(Self::create_mil_operation(
+                        "sub",
+                        sub_inputs,
+                        vec![output_type],
+                    ));
+
+                    continue;
+                }
             }
 
             // `where` (MIL: select) — CoreML requires the condition to be bool,
