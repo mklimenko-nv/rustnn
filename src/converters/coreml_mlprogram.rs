@@ -1815,15 +1815,24 @@ impl CoremlMlProgramConverter {
                             Self::create_immediate_string("custom"),
                         );
                     } else {
+                        // CoreML avg_pool/max_pool requires explicit pad even when zero.
+                        inputs.insert(
+                            "pad".to_string(),
+                            Self::create_immediate_int_array(&[0u32; 0]),
+                        );
                         inputs.insert(
                             "pad_type".to_string(),
-                            Self::create_immediate_string("same"),
+                            Self::create_immediate_string("valid"),
                         );
                     }
                 } else {
                     inputs.insert(
+                        "pad".to_string(),
+                        Self::create_immediate_int_array(&[0u32; 0]),
+                    );
+                    inputs.insert(
                         "pad_type".to_string(),
-                        Self::create_immediate_string("same"),
+                        Self::create_immediate_string("valid"),
                     );
                 }
             }
@@ -2193,29 +2202,45 @@ impl CoremlMlProgramConverter {
                 ..
             } => {
                 // pad: x, pad, mode, constant_val
+                // All four params are required by CoreML (even when using defaults).
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                if let Some(opts) = options {
-                    // CoreML expects pad as [begin_0, end_0, begin_1, end_1, ...]
-                    let pad: Vec<u32> = beginning_padding
-                        .iter()
-                        .zip(ending_padding.iter())
-                        .flat_map(|(a, b)| [*a, *b])
-                        .collect();
-                    if !pad.is_empty() {
-                        inputs.insert("pad".to_string(), Self::create_immediate_int_array(&pad));
-                    }
-                    if let Some(v) = Self::parse_mlnumber_f64(opts.value.as_ref()) {
-                        inputs.insert(
-                            "constant_val".to_string(),
-                            Self::create_immediate_float(v as f32),
-                        );
-                    }
-                }
-                // Add mode parameter (defaults to "constant")
-                // CoreML pad modes: "constant", "reflect", "replicate"
-                // WebNN modes: "constant", "edge", "reflection", "symmetric"
+
+                // CoreML expects pad as [begin_0, end_0, begin_1, end_1, ...]
+                let pad: Vec<u32> = beginning_padding
+                    .iter()
+                    .zip(ending_padding.iter())
+                    .flat_map(|(a, b)| [*a, *b])
+                    .collect();
+                inputs.insert("pad".to_string(), Self::create_immediate_int_array(&pad));
+
+                // Mode: WebNN → CoreML mapping
+                // WebNN: "constant", "edge", "reflection", "symmetric"
+                // CoreML: "constant", "replicate", "reflect"
+                let webnn_mode = options
+                    .as_ref()
+                    .map(|o| o.mode.as_str())
+                    .unwrap_or("constant");
+                let coreml_mode = match webnn_mode {
+                    "edge" => "replicate",
+                    "reflection" | "symmetric" => "reflect",
+                    _ => "constant",
+                };
+                inputs.insert(
+                    "mode".to_string(),
+                    Self::create_immediate_string(coreml_mode),
+                );
+
+                // constant_val: always emit (required even for non-constant modes)
+                let constant_val = options
+                    .as_ref()
+                    .and_then(|o| Self::parse_mlnumber_f64(o.value.as_ref()))
+                    .unwrap_or(0.0);
+                inputs.insert(
+                    "constant_val".to_string(),
+                    Self::create_immediate_float(constant_val as f32),
+                );
             }
 
             Operation::Gelu { .. } => {
@@ -2307,7 +2332,8 @@ impl CoremlMlProgramConverter {
             }
 
             Operation::ScatterElements { options, .. } => {
-                // scatter: data, indices, updates, axis
+                // scatter: data, indices, updates, axis, mode
+                // mode is required by CoreML (default "update").
                 if input_names.len() >= 3 {
                     inputs.insert("data".to_string(), Self::create_argument(&input_names[0]));
                     inputs.insert(
@@ -2323,6 +2349,9 @@ impl CoremlMlProgramConverter {
                 if let Some(opts) = options {
                     inputs.insert("axis".to_string(), Self::create_immediate_int(opts.axis));
                 }
+
+                // CoreML requires explicit mode even though "update" is the only supported value.
+                inputs.insert("mode".to_string(), Self::create_immediate_string("update"));
             }
 
             Operation::ScatterND { .. }
@@ -3664,6 +3693,48 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                 // Skip normal operation conversion for neg
                 continue;
+            }
+
+            // `where` (MIL: select) — CoreML requires the condition to be bool,
+            // but WebNN encodes booleans as uint8. Insert a cast when needed.
+            if op_type_lower == "where" {
+                if let Operation::Where { condition, .. } = op {
+                    let cond_id = *condition;
+                    let cond_operand =
+                        graph_info
+                            .operand(cond_id)
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("where condition operand {cond_id} not found"),
+                            })?;
+                    if cond_operand.descriptor.data_type == DataType::Uint8 {
+                        let cond_name = Self::output_name_for_operand(
+                            graph_info,
+                            cond_id,
+                            &operand_name_overrides,
+                        );
+                        let bool_cond_name = format!("{cond_name}_bool");
+                        let bool_cond_type = Self::create_value_with_mil_type(
+                            graph_info,
+                            cond_id,
+                            bool_cond_name.clone(),
+                            crate::protos::coreml::mil_spec::DataType::Bool as i32,
+                        )?;
+                        main_block
+                            .operations
+                            .push(Self::create_cast_operation(cond_name, bool_cond_type, "bool"));
+
+                        let mut overrides = operand_name_overrides.clone();
+                        overrides.insert(cond_id, bool_cond_name);
+                        let mil_op = self.convert_operation_with_overrides(
+                            graph_info,
+                            op,
+                            &overrides,
+                        )?;
+                        main_block.operations.push(mil_op);
+                        continue;
+                    }
+                }
             }
 
             let mil_op =
