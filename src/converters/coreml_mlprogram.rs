@@ -561,6 +561,13 @@ impl CoremlMlProgramConverter {
                     values: constant_data.data.clone().into(),
                 })),
             },
+            crate::graph::DataType::Uint32
+            | crate::graph::DataType::Int64
+            | crate::graph::DataType::Uint64 => TensorValue {
+                value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
+                    values: constant_data.data.clone().into(),
+                })),
+            },
             _ => {
                 return Err(GraphError::ConversionFailed {
                     format: "coreml_mlprogram".to_string(),
@@ -1454,15 +1461,34 @@ impl CoremlMlProgramConverter {
                 );
             }
 
-            // Quantization operations: input, scale, zero_point
-            Operation::DequantizeLinear { .. } | Operation::QuantizeLinear { .. }
-                if input_names.len() >= 3 => {
+            // Quantization operations: input, scale, zero_point[, axis for per-channel]
+            Operation::DequantizeLinear { input: inp_id, scale: scale_id, .. }
+            | Operation::QuantizeLinear { input: inp_id, scale: scale_id, .. }
+                if input_names.len() >= 2 => {
                     inputs.insert("input".to_string(), Self::create_argument(&input_names[0]));
                     inputs.insert("scale".to_string(), Self::create_argument(&input_names[1]));
-                    inputs.insert(
-                        "zero_point".to_string(),
-                        Self::create_argument(&input_names[2]),
-                    );
+                    if input_names.len() >= 3 {
+                        inputs.insert(
+                            "zero_point".to_string(),
+                            Self::create_argument(&input_names[2]),
+                        );
+                    }
+                    // When scale is rank-1 (per-channel), CoreML requires an explicit axis.
+                    // Find which dimension of the input tensor the scale elements correspond to.
+                    if let Some(scale_op) = graph.operand(*scale_id) {
+                        if scale_op.descriptor.shape.len() == 1 {
+                            let scale_len = scale_op.descriptor.static_or_max_shape().first().copied().unwrap_or(0);
+                            let axis = graph.operand(*inp_id)
+                                .and_then(|inp| {
+                                    inp.descriptor.static_or_max_shape()
+                                        .iter()
+                                        .position(|&d| d == scale_len)
+                                        .map(|i| i as u32)
+                                })
+                                .unwrap_or(1);
+                            inputs.insert("axis".to_string(), Self::create_immediate_int(axis));
+                        }
+                    }
                 }
 
             // Specialized activation: prelu - x, slope (two inputs)
@@ -1831,12 +1857,15 @@ impl CoremlMlProgramConverter {
                             Self::create_immediate_int_array(window_dimensions),
                         );
                     }
-                    if !opts.strides.is_empty() {
-                        inputs.insert(
-                            "strides".to_string(),
-                            Self::create_immediate_int_array(&opts.strides),
-                        );
-                    }
+                    let strides = if opts.strides.is_empty() {
+                        vec![1u32, 1]
+                    } else {
+                        opts.strides.clone()
+                    };
+                    inputs.insert(
+                        "strides".to_string(),
+                        Self::create_immediate_int_array(&strides),
+                    );
                     if !opts.dilations.is_empty() && opts.dilations.iter().any(|&d| d != 1) {
                         return Err(GraphError::ConversionFailed {
                             format: "coreml_mlprogram".to_string(),
@@ -1876,6 +1905,10 @@ impl CoremlMlProgramConverter {
                         "pad_type".to_string(),
                         Self::create_immediate_string("valid"),
                     );
+                    inputs.insert(
+                        "strides".to_string(),
+                        Self::create_immediate_int_array(&[1u32, 1]),
+                    );
                 }
             }
 
@@ -1909,10 +1942,18 @@ impl CoremlMlProgramConverter {
                             Self::create_argument(&operand_name(graph, bias_id)),
                         );
                     }
-                    inputs.insert(
-                        "epsilon".to_string(),
-                        Self::create_immediate_float(opts.epsilon as f32),
-                    );
+                    let use_f16 = op
+                        .input_operands()
+                        .first()
+                        .and_then(|&id| graph.operand(id))
+                        .map(|o| o.descriptor.data_type == DataType::Float16)
+                        .unwrap_or(false);
+                    let eps_arg = if use_f16 {
+                        Self::create_immediate_float16(opts.epsilon as f32)
+                    } else {
+                        Self::create_immediate_float(opts.epsilon as f32)
+                    };
+                    inputs.insert("epsilon".to_string(), eps_arg);
                 }
 
                 // Add axes parameter (REQUIRED by CoreML, must not be empty;
@@ -1978,10 +2019,18 @@ impl CoremlMlProgramConverter {
                     } else if input_names.len() >= 5 {
                         inputs.insert("beta".to_string(), Self::create_argument(&input_names[4]));
                     }
-                    inputs.insert(
-                        "epsilon".to_string(),
-                        Self::create_immediate_float(opts.epsilon as f32),
-                    );
+                    let use_f16_bn = op
+                        .input_operands()
+                        .first()
+                        .and_then(|&id| graph.operand(id))
+                        .map(|o| o.descriptor.data_type == DataType::Float16)
+                        .unwrap_or(false);
+                    let eps_bn = if use_f16_bn {
+                        Self::create_immediate_float16(opts.epsilon as f32)
+                    } else {
+                        Self::create_immediate_float(opts.epsilon as f32)
+                    };
+                    inputs.insert("epsilon".to_string(), eps_bn);
                 }
             }
             Operation::InstanceNormalization { options, .. } => {
@@ -2001,10 +2050,18 @@ impl CoremlMlProgramConverter {
                             Self::create_argument(&operand_name(graph, bias_id)),
                         );
                     }
-                    inputs.insert(
-                        "epsilon".to_string(),
-                        Self::create_immediate_float(opts.epsilon as f32),
-                    );
+                    let use_f16_in = op
+                        .input_operands()
+                        .first()
+                        .and_then(|&id| graph.operand(id))
+                        .map(|o| o.descriptor.data_type == DataType::Float16)
+                        .unwrap_or(false);
+                    let eps_in = if use_f16_in {
+                        Self::create_immediate_float16(opts.epsilon as f32)
+                    } else {
+                        Self::create_immediate_float(opts.epsilon as f32)
+                    };
+                    inputs.insert("epsilon".to_string(), eps_in);
                 }
             }
 
@@ -2220,15 +2277,27 @@ impl CoremlMlProgramConverter {
                     Self::create_immediate_string(coreml_mode),
                 );
 
-                // constant_val: always emit (required even for non-constant modes)
+                // constant_val must match the dtype of the input tensor.
                 let constant_val = options
                     .as_ref()
                     .and_then(|o| Self::parse_mlnumber_f64(o.value.as_ref()))
                     .unwrap_or(0.0);
-                inputs.insert(
-                    "constant_val".to_string(),
-                    Self::create_immediate_float(constant_val as f32),
-                );
+                let input_dtype = op
+                    .input_operands()
+                    .first()
+                    .and_then(|&id| graph.operand(id))
+                    .map(|o| &o.descriptor.data_type)
+                    .cloned()
+                    .unwrap_or(DataType::Float32);
+                let cval_arg = match input_dtype {
+                    DataType::Float16 => Self::create_immediate_float16(constant_val as f32),
+                    DataType::Int32 => Self::create_immediate_int(constant_val as u32),
+                    DataType::Int8 | DataType::Uint8 => {
+                        Self::create_immediate_int(constant_val as u32)
+                    }
+                    _ => Self::create_immediate_float(constant_val as f32),
+                };
+                inputs.insert("constant_val".to_string(), cval_arg);
             }
 
             Operation::Gelu { .. } => {
@@ -2302,9 +2371,14 @@ impl CoremlMlProgramConverter {
                     MLOperandDataType::Int32 => "int32",
                     MLOperandDataType::Uint32 => "uint32",
                     MLOperandDataType::Int8 => "int8",
-                    MLOperandDataType::Uint8 => "int8",
+                    MLOperandDataType::Uint8 => "uint8",
                     MLOperandDataType::Int64 => "int64",
-                    MLOperandDataType::Uint64 => "uint64",
+                    MLOperandDataType::Uint64 => {
+                        return Err(GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: "Unsupported graph cast dtype Uint64".to_string(),
+                        });
+                    }
                     MLOperandDataType::Int4 | MLOperandDataType::Uint4 => {
                         return Err(GraphError::ConversionFailed {
                             format: "coreml_mlprogram".to_string(),
@@ -2338,12 +2412,16 @@ impl CoremlMlProgramConverter {
                     inputs.insert("axis".to_string(), Self::create_immediate_int(opts.axis));
                 }
 
-                // CoreML requires explicit mode even though "update" is the only supported value.
+                // CoreML requires explicit mode and validate_indices.
                 inputs.insert("mode".to_string(), Self::create_immediate_string("update"));
+                inputs.insert(
+                    "validate_indices".to_string(),
+                    Self::create_immediate_bool(false),
+                );
             }
 
             Operation::ScatterND { .. }
-                // scatter_nd: data, indices, updates
+                // scatter_nd: data, indices, updates, mode (required by CoreML)
                 if input_names.len() >= 3 => {
                     inputs.insert("data".to_string(), Self::create_argument(&input_names[0]));
                     inputs.insert(
@@ -2354,6 +2432,7 @@ impl CoremlMlProgramConverter {
                         "updates".to_string(),
                         Self::create_argument(&input_names[2]),
                     );
+                    inputs.insert("mode".to_string(), Self::create_immediate_string("update"));
                 }
 
             Operation::Tile { repetitions, .. } => {
@@ -2362,12 +2441,11 @@ impl CoremlMlProgramConverter {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
 
-                if !repetitions.is_empty() {
-                    inputs.insert(
-                        "reps".to_string(),
-                        Self::create_immediate_int_array(repetitions),
-                    );
-                }
+                // reps is required by CoreML even when all values are 1
+                inputs.insert(
+                    "reps".to_string(),
+                    Self::create_immediate_int_array(repetitions),
+                );
             }
 
             Operation::CumulativeSum { axis, options, .. } => {
