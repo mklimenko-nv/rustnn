@@ -1,3 +1,4 @@
+use crate::backend_selection::Backend;
 use std::path::PathBuf;
 
 use crate::{
@@ -166,7 +167,28 @@ pub enum GraphBuilderError {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("No backend is available for context creation")]
-    NoBackendAvailable,
+    NoBackendAvailable {
+        want_trtx: bool,
+        have_trtx: bool,
+        want_onnx: bool,
+        have_onnx: bool,
+        want_coreml: bool,
+        have_coreml: bool,
+        want_litert: bool,
+        have_litert: bool,
+    },
+    #[error("No backend is available for backend hint: {backend_hint:?}.")]
+    NoBackendAvailableForBackendHint {
+        backend_hint: Backend,
+        want_trtx: bool,
+        have_trtx: bool,
+        want_onnx: bool,
+        have_onnx: bool,
+        want_coreml: bool,
+        have_coreml: bool,
+        want_litert: bool,
+        have_litert: bool,
+    },
 
     #[error("No device of selected type available")]
     NoDeviceAvailable,
@@ -325,6 +347,11 @@ pub enum GraphError {
     DuplicateOutputName { name: String },
     #[error("operand {operand} uses unsupported IO data type {data_type:?}")]
     UnsupportedIoDataType { operand: u32, data_type: DataType },
+    #[error("Backend {backend:?} does not support data type {data_type:?}")]
+    UnsupportedDataType {
+        data_type: DataType,
+        backend: Backend,
+    },
     #[error("constant operand {operand} does not have data associated with it")]
     MissingConstantData { operand: u32 },
     #[error("constant operand {operand} byte mismatch (expected {expected}, got {actual})")]

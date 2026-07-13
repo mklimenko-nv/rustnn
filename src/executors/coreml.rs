@@ -2,18 +2,19 @@
 //! Loads a `.mlmodel`, compiles it if needed, and runs a zeroed inference
 //! using CoreML's Objective-C API.
 
-#![cfg(all(target_os = "macos", feature = "coreml-runtime"))]
-#![allow(unexpected_cfgs)]
+#![cfg(feature = "coreml-runtime")]
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use block::ConcreteBlock;
 use objc::rc::autoreleasepool;
-use objc::runtime::Object;
+use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
 use crate::error::GraphError;
@@ -21,10 +22,45 @@ use crate::graph::{DataType, Dimension, OperandDescriptor, get_static_or_max_siz
 use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_length};
 
 // Link against the system frameworks we use.
+#[cfg(target_os = "macos")]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
+#[cfg(target_os = "macos")]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {}
+
+// Objective-C++ exception firewall (src/executors/coreml_shim.mm).
+// Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
+unsafe extern "C" {
+    fn rustnn_coreml_compile(
+        model_url: *mut Object,
+        out_url: *mut *mut Object,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+    fn rustnn_coreml_load(
+        compiled_url: *mut Object,
+        configuration: *mut Object,
+        out_model: *mut *mut Object,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+    fn rustnn_coreml_predict(
+        model: *mut Object,
+        features: *mut Object,
+        out_provider: *mut *mut Object,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+}
+
+fn shim_error_to_string(buffer: &[u8]) -> String {
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
 
 #[derive(Debug, Clone)]
 pub struct CoremlInput {
@@ -134,7 +170,7 @@ pub fn run_coreml_with_inputs_checked(
 
 /// A CoreML model that has been compiled and loaded once, ready for repeated dispatch.
 ///
-/// Owns a retained `MLModel` plus the on-disk artifacts backing it; both are
+/// Owns a retained `MLModel` and the in-memory CoreML asset backing it. All are
 /// released when the value is dropped. This type is intentionally not `Send`/`Sync`:
 /// `MLGraph`/`MLContext` are single-threaded, matching CoreML's usage model.
 pub(crate) struct CompiledCoremlModel {
@@ -142,17 +178,28 @@ pub(crate) struct CompiledCoremlModel {
     model: *mut Object,
     /// Compute unit the model was successfully loaded with (diagnostic only).
     compute_unit: &'static str,
-    /// Compiled `.mlmodelc` directory to clean up on drop.
-    compiled_dir: PathBuf,
-    /// Temporary `.mlmodel`/`.mlpackage` source to clean up on drop.
-    temp_model: Option<PathBuf>,
+    backing: CoremlModelBacking,
+}
+
+enum CoremlModelBacking {
+    InMemory {
+        /// Retained `MLModelAsset`. CoreML may refer to it after loading.
+        asset: *mut Object,
+        /// Retained model specification data backing `asset`.
+        specification_data: *mut Object,
+        /// Retained external weights data backing `asset`, if any.
+        weights_data: Option<*mut Object>,
+    },
+    OnDisk {
+        compiled_dir: PathBuf,
+        temp_model: Option<PathBuf>,
+    },
 }
 
 impl std::fmt::Debug for CompiledCoremlModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledCoremlModel")
             .field("compute_unit", &self.compute_unit)
-            .field("compiled_dir", &self.compiled_dir)
             .finish()
     }
 }
@@ -164,11 +211,28 @@ impl Drop for CompiledCoremlModel {
                 let _: () = msg_send![self.model, release];
             }
         }
-        let _ = std::fs::remove_dir_all(&self.compiled_dir);
-        if let Some(path) = &self.temp_model {
-            // .mlmodel is a file, .mlpackage is a directory; try both.
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_dir_all(path);
+        match &self.backing {
+            CoremlModelBacking::InMemory {
+                asset,
+                specification_data,
+                weights_data,
+            } => unsafe {
+                let _: () = msg_send![*asset, release];
+                let _: () = msg_send![*specification_data, release];
+                if let Some(weights_data) = weights_data {
+                    let _: () = msg_send![*weights_data, release];
+                }
+            },
+            CoremlModelBacking::OnDisk {
+                compiled_dir,
+                temp_model,
+            } => {
+                let _ = std::fs::remove_dir_all(compiled_dir);
+                if let Some(path) = temp_model {
+                    let _ = std::fs::remove_file(path);
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
         }
     }
 }
@@ -192,16 +256,20 @@ fn compute_unit_for_device(
     }
 }
 
-/// Compile a CoreML model from protobuf bytes and load it once with the preferred
-/// compute units, falling back to CPU-only if the preferred load fails.
+/// Load a CoreML model directly from protobuf bytes and retain it for repeated
+/// dispatch, falling back to CPU-only if the preferred compute units fail.
 pub(crate) fn compile_model(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
     device_type: crate::backend_selection::DeviceType,
+    use_in_memory_asset: bool,
 ) -> Result<CompiledCoremlModel, GraphError> {
-    autoreleasepool(|| unsafe {
-        let (compiled_url, compiled_dir, temp_model) =
-            prepare_compiled_model_with_weights(model_bytes, weights_data, None)?;
+    if !use_in_memory_asset {
+        return compile_model_from_url(model_bytes, weights_data, device_type);
+    }
+    let memory_result = autoreleasepool(|| unsafe {
+        let (asset, specification_data, retained_weights_data) =
+            create_in_memory_model_asset(model_bytes, weights_data)?;
 
         let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
         let mut candidates: Vec<(i64, &'static str)> = vec![(preferred_code, preferred_name)];
@@ -213,23 +281,83 @@ pub(crate) fn compile_model(
         for (code, name) in candidates {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
-                last_error = ns_error_to_string(error, "MLModel load failed");
+            match load_model_asset(asset, config) {
+                Ok(model) => {
+                    return Ok(CompiledCoremlModel {
+                        model,
+                        compute_unit: name,
+                        backing: CoremlModelBacking::InMemory {
+                            asset,
+                            specification_data,
+                            weights_data: retained_weights_data,
+                        },
+                    });
+                }
+                Err(reason) => last_error = reason,
+            }
+        }
+
+        let _: () = msg_send![asset, release];
+        let _: () = msg_send![specification_data, release];
+        if let Some(weights_data) = retained_weights_data {
+            let _: () = msg_send![weights_data, release];
+        }
+        Err(GraphError::CoremlRuntimeFailed { reason: last_error })
+    });
+    memory_result.or_else(|memory_error| {
+        compile_model_from_url(model_bytes, weights_data, device_type).map_err(|url_error| {
+            GraphError::CoremlRuntimeFailed {
+                reason: format!(
+                    "in-memory model load failed ({memory_error}); URL fallback failed ({url_error})"
+                ),
+            }
+        })
+    })
+}
+
+fn compile_model_from_url(
+    model_bytes: &[u8],
+    weights_data: Option<&[u8]>,
+    device_type: crate::backend_selection::DeviceType,
+) -> Result<CompiledCoremlModel, GraphError> {
+    autoreleasepool(|| unsafe {
+        let (compiled_url, compiled_dir, temp_model) =
+            prepare_compiled_model_with_weights(model_bytes, weights_data, None)?;
+        let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
+        let mut candidates = vec![(preferred_code, preferred_name)];
+        if preferred_code != 0 {
+            candidates.push((0, "CPU_ONLY"));
+        }
+
+        let mut last_error = String::from("MLModel load failed");
+        for (code, name) in candidates {
+            let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let () = msg_send![config, setComputeUnits: code];
+            let mut model: *mut Object = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = rustnn_coreml_load(
+                compiled_url,
+                config,
+                &mut model,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            if status != 0 || model.is_null() {
+                last_error = format!("MLModel load failed: {}", shim_error_to_string(&error));
                 continue;
             }
-            // Retain the model so it outlives this autoreleasepool.
+            // The shim returns a borrowed model. Retain it beyond this pool.
             let _: *mut Object = msg_send![model, retain];
             return Ok(CompiledCoremlModel {
                 model,
                 compute_unit: name,
-                compiled_dir,
-                temp_model,
+                backing: CoremlModelBacking::OnDisk {
+                    compiled_dir,
+                    temp_model,
+                },
             });
         }
 
-        // No compute unit could load the model: clean up the on-disk artifacts.
         let _ = std::fs::remove_dir_all(&compiled_dir);
         if let Some(path) = &temp_model {
             let _ = std::fs::remove_file(path);
@@ -237,6 +365,105 @@ pub(crate) fn compile_model(
         }
         Err(GraphError::CoremlRuntimeFailed { reason: last_error })
     })
+}
+
+/// Create an `MLModelAsset` whose specification and optional external weight blob
+/// are entirely memory-backed. The returned Objective-C objects are retained and
+/// must remain alive for at least as long as the loaded `MLModel`.
+unsafe fn create_in_memory_model_asset(
+    model_bytes: &[u8],
+    weights: Option<&[u8]>,
+) -> Result<(*mut Object, *mut Object, Option<*mut Object>), GraphError> {
+    let Some(asset_class) = Class::get("MLModelAsset") else {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: "in-memory CoreML model loading requires macOS 15 or newer".to_string(),
+        });
+    };
+
+    let specification_data: *mut Object =
+        msg_send![class!(NSData), dataWithBytes: model_bytes.as_ptr() length: model_bytes.len()];
+    if specification_data.is_null() {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: "failed to create NSData for CoreML model specification".to_string(),
+        });
+    }
+    let _: *mut Object = msg_send![specification_data, retain];
+
+    let mut error: *mut Object = ptr::null_mut();
+    let (asset, weights_data): (*mut Object, Option<*mut Object>) = match weights {
+        Some(weights) => {
+            let weights_data: *mut Object =
+                msg_send![class!(NSData), dataWithBytes: weights.as_ptr() length: weights.len()];
+            if weights_data.is_null() {
+                let _: () = msg_send![specification_data, release];
+                return Err(GraphError::CoremlRuntimeFailed {
+                    reason: "failed to create NSData for CoreML model weights".to_string(),
+                });
+            }
+            let _: *mut Object = msg_send![weights_data, retain];
+
+            // BlobFileValue stores `@model_path/weights/weights.bin`. For an
+            // in-memory asset CoreML expects the path relative to `@model_path`.
+            let relative_path = unsafe { nsstring_from_str("weights/weights.bin")? };
+            let blob_url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: relative_path];
+            let mapping: *mut Object = msg_send![class!(NSDictionary),
+                dictionaryWithObject: weights_data forKey: blob_url];
+            let asset: *mut Object = msg_send![asset_class,
+                modelAssetWithSpecificationData: specification_data
+                blobMapping: mapping
+                error: &mut error];
+            (asset, Some(weights_data))
+        }
+        None => {
+            let asset: *mut Object = msg_send![asset_class,
+                modelAssetWithSpecificationData: specification_data
+                error: &mut error];
+            (asset, None)
+        }
+    };
+
+    if asset.is_null() {
+        let reason = unsafe { ns_error_to_string(error, "MLModelAsset creation failed") };
+        let _: () = msg_send![specification_data, release];
+        if let Some(weights_data) = weights_data {
+            let _: () = msg_send![weights_data, release];
+        }
+        return Err(GraphError::CoremlRuntimeFailed { reason });
+    }
+    let _: *mut Object = msg_send![asset, retain];
+    Ok((asset, specification_data, weights_data))
+}
+
+/// Bridge CoreML's completion-handler API to this backend's synchronous graph
+/// compilation contract. The callback retains the model before its autorelease
+/// scope ends and transfers that ownership to the caller.
+unsafe fn load_model_asset(
+    asset: *mut Object,
+    configuration: *mut Object,
+) -> Result<*mut Object, String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let completion = ConcreteBlock::new(move |model: *mut Object, error: *mut Object| {
+        let result = if model.is_null() {
+            Err(unsafe { ns_error_to_string(error, "MLModelAsset load failed") })
+        } else {
+            unsafe {
+                let _: *mut Object = msg_send![model, retain];
+            }
+            Ok(model as usize)
+        };
+        let _ = sender.send(result);
+    })
+    .copy();
+
+    let (): () = msg_send![class!(MLModel),
+        loadModelAsset: asset
+        configuration: configuration
+        completionHandler: &*completion];
+
+    receiver
+        .recv()
+        .map_err(|_| "MLModelAsset load callback was dropped".to_string())?
+        .map(|model| model as *mut Object)
 }
 
 /// Run a compiled CoreML model with raw-byte inputs, returning raw-byte outputs by name.
@@ -247,6 +474,14 @@ pub(crate) fn run_coreml_bytes(
 ) -> Result<HashMap<String, Vec<u8>>, GraphError> {
     autoreleasepool(|| unsafe {
         let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
+
+        // Query the model's declared input types so the MLMultiArray we build matches
+        // exactly what CoreML expects. Using our own dtype codes here is unsafe: an
+        // array created with a code CoreML does not recognize (e.g. a bare `16` for
+        // Float16) is treated as Float32, so CoreML reads past our 2-bytes-per-element
+        // buffer -- garbage for small tensors, an out-of-bounds crash for large ones.
+        let model_description: *mut Object = msg_send![model.model, modelDescription];
+        let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
         for (name, input) in inputs {
             let key = nsstring_from_str(name)?;
@@ -260,9 +495,13 @@ pub(crate) fn run_coreml_bytes(
                 // Scalars are represented as a single-element 1-D array.
                 shape_i64.push(1);
             }
-            let code = map_dtype(input.descriptor.data_type)?;
+
+            // Prefer the model's own data type code; fall back to our mapping only when
+            // the model exposes no constraint for this input.
+            let code = model_input_dtype_code(input_descs, key)
+                .map_or_else(|| map_dtype(input.descriptor.data_type), Ok)?;
             let array = create_multi_array(&shape_i64, code)?;
-            fill_multiarray_from_bytes(array, input.data, input.descriptor.data_type)?;
+            fill_multiarray_from_bytes(array, input.data, input.descriptor.data_type, code)?;
             let feature_value: *mut Object =
                 msg_send![class!(MLFeatureValue), featureValueWithMultiArray: array];
             let () = msg_send![dict, setObject: feature_value forKey: key];
@@ -278,12 +517,18 @@ pub(crate) fn run_coreml_bytes(
             });
         }
 
-        let mut predict_error: *mut Object = ptr::null_mut();
-        let output_provider: *mut Object =
-            msg_send![model.model, predictionFromFeatures: provider error: &mut predict_error];
-        if output_provider.is_null() {
+        let mut output_provider: *mut Object = ptr::null_mut();
+        let mut error = [0u8; 1024];
+        let status = rustnn_coreml_predict(
+            model.model,
+            provider,
+            &mut output_provider,
+            error.as_mut_ptr().cast(),
+            error.len(),
+        );
+        if status != 0 || output_provider.is_null() {
             return Err(GraphError::CoremlRuntimeFailed {
-                reason: ns_error_to_string(predict_error, "prediction failed"),
+                reason: format!("prediction failed: {}", shim_error_to_string(&error)),
             });
         }
 
@@ -315,6 +560,7 @@ unsafe fn fill_multiarray_from_bytes(
     array: *mut Object,
     src: &[u8],
     dtype: DataType,
+    array_code: i32,
 ) -> Result<(), GraphError> {
     let count_obj: isize = msg_send![array, count];
     let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
@@ -327,6 +573,20 @@ unsafe fn fill_multiarray_from_bytes(
             reason: format!(
                 "input byte length mismatch: expected {expected} bytes ({count} elements), got {}",
                 src.len()
+            ),
+        });
+    }
+    // A raw byte copy is only valid when our source layout matches the array CoreML
+    // allocated. When the model boundary promotes the type (e.g. a WebNN int64 input
+    // exposed as Float32), the element sizes differ and copying `src` verbatim would
+    // overrun the array buffer -- fail cleanly instead of corrupting memory.
+    if let Some(array_elem) = ml_dtype_code_element_size(array_code)
+        && array_elem != elem
+    {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: format!(
+                "input dtype mismatch: model expects {array_elem}-byte elements (code {array_code}), \
+                 but input is {dtype:?} ({elem}-byte); type conversion is not supported for this input"
             ),
         });
     }
@@ -458,16 +718,25 @@ fn run_impl_zeroed_with_weights(
         for (code, name) in targets {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
+            let mut model: *mut Object = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = rustnn_coreml_load(
+                compiled_url,
+                config,
+                &mut model,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            if status != 0 || model.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(error, "MLModel load failed")),
+                    result: Err(format!(
+                        "MLModel load failed: {}",
+                        shim_error_to_string(&error)
+                    )),
                 });
                 continue;
             }
-
             let model_description: *mut Object = msg_send![model, modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
@@ -535,13 +804,22 @@ fn run_impl_zeroed_with_weights(
                 continue;
             }
 
-            let mut predict_error: *mut Object = ptr::null_mut();
-            let output_provider: *mut Object =
-                msg_send![model, predictionFromFeatures: provider error: &mut predict_error];
-            if output_provider.is_null() {
+            let mut output_provider: *mut Object = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = rustnn_coreml_predict(
+                model,
+                provider,
+                &mut output_provider,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            if status != 0 || output_provider.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(predict_error, "prediction failed")),
+                    result: Err(format!(
+                        "prediction failed: {}",
+                        shim_error_to_string(&error)
+                    )),
                 });
                 continue;
             }
@@ -614,12 +892,22 @@ fn run_impl_with_inputs_with_weights(
         for (code, name) in targets {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
+            let mut model: *mut Object = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = rustnn_coreml_load(
+                compiled_url,
+                config,
+                &mut model,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            if status != 0 || model.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(error, "MLModel load failed")),
+                    result: Err(format!(
+                        "MLModel load failed: {}",
+                        shim_error_to_string(&error)
+                    )),
                 });
                 continue;
             }
@@ -698,13 +986,22 @@ fn run_impl_with_inputs_with_weights(
                 continue;
             }
 
-            let mut predict_error: *mut Object = ptr::null_mut();
-            let output_provider: *mut Object =
-                msg_send![model, predictionFromFeatures: provider error: &mut predict_error];
-            if output_provider.is_null() {
+            let mut output_provider: *mut Object = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = rustnn_coreml_predict(
+                model,
+                provider,
+                &mut output_provider,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            if status != 0 || output_provider.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
-                    result: Err(ns_error_to_string(predict_error, "prediction failed")),
+                    result: Err(format!(
+                        "prediction failed: {}",
+                        shim_error_to_string(&error)
+                    )),
                 });
                 continue;
             }
@@ -888,12 +1185,19 @@ pub unsafe fn prepare_compiled_model_with_weights(
 ) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
     let temp_mlmodel = write_temp_model_with_weights(model_bytes, weights_data)?;
     let url = unsafe { nsurl_from_path(&temp_mlmodel)? };
-    let mut compile_error: *mut Object = ptr::null_mut();
-    let compiled_url: *mut Object =
-        msg_send![class!(MLModel), compileModelAtURL: url error: &mut compile_error];
-    if compiled_url.is_null() {
+    let mut compiled_url: *mut Object = ptr::null_mut();
+    let mut error = [0u8; 1024];
+    let status = unsafe {
+        rustnn_coreml_compile(
+            url,
+            &mut compiled_url,
+            error.as_mut_ptr().cast(),
+            error.len(),
+        )
+    };
+    if status != 0 || compiled_url.is_null() {
         return Err(GraphError::CoremlRuntimeFailed {
-            reason: unsafe { ns_error_to_string(compile_error, "MLModel compile failed") },
+            reason: format!("MLModel compile failed: {}", shim_error_to_string(&error)),
         });
     }
 
@@ -956,6 +1260,36 @@ fn write_temp_model_with_weights(
         std::fs::write(&weights_path, weights)
             .map_err(|err| GraphError::export(&weights_path, err))?;
 
+        // Write the package Manifest.json. CoreML refuses to load an .mlpackage
+        // ("A valid manifest does not exist") without this root-level file
+        // pointing at the model spec inside Data/.
+        let manifest_path = package_path.join("Manifest.json");
+        let model_id = "00000000-0000-0000-0000-0000000000AA";
+        let weights_id = "00000000-0000-0000-0000-0000000000BB";
+        let manifest = format!(
+            r#"{{
+  "fileFormatVersion": "1.0.0",
+  "itemInfoEntries": {{
+    "{model_id}": {{
+      "author": "com.apple.CoreML",
+      "description": "CoreML Model Specification",
+      "name": "model.mlmodel",
+      "path": "com.apple.CoreML/model.mlmodel"
+    }},
+    "{weights_id}": {{
+      "author": "com.apple.CoreML",
+      "description": "CoreML Model Weights",
+      "name": "weights",
+      "path": "com.apple.CoreML/weights"
+    }}
+  }},
+  "rootModelIdentifier": "{model_id}"
+}}
+"#
+        );
+        std::fs::write(&manifest_path, manifest)
+            .map_err(|err| GraphError::export(&manifest_path, err))?;
+
         Ok(package_path)
     } else {
         // No weights: write single .mlmodel file as before
@@ -1013,6 +1347,38 @@ fn map_dtype(data_type: DataType) -> Result<i32, GraphError> {
         DataType::Uint64 => 4,   // closest available signed int type
     };
     Ok(code)
+}
+
+/// Element size in bytes for an `MLMultiArrayDataType` raw code, if known.
+///
+/// Covers Apple's canonical `0x1_0000`/`0x2_0000`-flagged values as well as the
+/// legacy bare codes still used by [`map_dtype`].
+fn ml_dtype_code_element_size(code: i32) -> Option<usize> {
+    match code {
+        65600 | 4 => Some(8),               // Double / Int64
+        65568 | 131104 | 32 | 3 => Some(4), // Float32 / Int32
+        65552 | 16 => Some(2),              // Float16
+        1 => Some(1),                       // Int8
+        _ => None,
+    }
+}
+
+/// Query the model's declared `MLMultiArrayDataType` code for the input named `key`.
+/// Returns `None` when the model exposes no multi-array constraint for that input.
+unsafe fn model_input_dtype_code(input_descs: *mut Object, key: *mut Object) -> Option<i32> {
+    if input_descs.is_null() {
+        return None;
+    }
+    let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
+    if desc_obj.is_null() {
+        return None;
+    }
+    let constraint_obj: *mut Object = msg_send![desc_obj, multiArrayConstraint];
+    if constraint_obj.is_null() {
+        return None;
+    }
+    let ml_data_type: i64 = msg_send![constraint_obj, dataType];
+    Some(ml_data_type as i32)
 }
 
 fn data_type_from_code(code: i32) -> Option<DataType> {

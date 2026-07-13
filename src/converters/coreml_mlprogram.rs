@@ -420,7 +420,12 @@ impl CoremlMlProgramConverter {
     ) -> Result<MilOperation, GraphError> {
         use crate::protos::coreml::mil_spec::{TensorValue, Value, tensor_value, value};
 
-        let (_name, output_type) = Self::create_value(graph, operand_id)?;
+        let name = operand_name(graph, operand_id);
+        let dtype = Self::mil_data_type(&operand.descriptor.data_type)?;
+        // Keep WebNN scalar constants at rank 0. Promoting them to [1] breaks
+        // MIL ops such as `quantize` that distinguish scalars from vectors.
+        let output_type =
+            Self::create_named_value_type(name, dtype, &operand.descriptor.shape, false);
 
         // Create tensor value from constant data
         let tensor_value = match operand.descriptor.data_type {
@@ -514,6 +519,11 @@ impl CoremlMlProgramConverter {
                     })),
                 }
             }
+            crate::graph::DataType::Int8 | crate::graph::DataType::Uint8 => TensorValue {
+                value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
+                    values: constant_data.data.clone().into(),
+                })),
+            },
             _ => {
                 return Err(GraphError::ConversionFailed {
                     format: "coreml_mlprogram".to_string(),
@@ -1013,7 +1023,21 @@ impl CoremlMlProgramConverter {
         outputs: Vec<NamedValueType>,
         mil_op_type: &str,
     ) -> Result<MilOperation, GraphError> {
-        let inputs = self.create_operation_inputs(graph, op, input_names)?;
+        let mut inputs = self.create_operation_inputs(graph, op, input_names)?;
+
+        // MIL `quantize` declares `output_dtype` as a required const string input.
+        if matches!(op, Operation::QuantizeLinear { .. })
+            && let Some(output_id) = op.output_operand()
+            && let Some(output_operand) = graph.operand(output_id)
+        {
+            let dtype_str =
+                Self::cast_dtype_string_for_graph_type(&output_operand.descriptor.data_type)?;
+            inputs.insert(
+                "output_dtype".to_string(),
+                Self::create_immediate_string(dtype_str),
+            );
+        }
+
         Ok(Self::create_mil_operation(mil_op_type, inputs, outputs))
     }
 
@@ -1236,7 +1260,7 @@ impl CoremlMlProgramConverter {
     /// Create inputs map for MIL operation
     fn create_operation_inputs(
         &self,
-        _graph: &GraphInfo,
+        graph: &GraphInfo,
         op: &Operation,
         input_names: &[String],
     ) -> Result<HashMap<String, Argument>, GraphError> {
@@ -1474,7 +1498,7 @@ impl CoremlMlProgramConverter {
                 // Alpha and beta must match input type (CoreML requirement)
                 // Check first input operand type and use appropriate immediate value method
                 let use_float16 = if !op.input_operands().is_empty() {
-                    if let Some(input_operand) = _graph.operand(op.input_operands()[0]) {
+                    if let Some(input_operand) = graph.operand(op.input_operands()[0]) {
                         input_operand.descriptor.data_type == DataType::Float16
                     } else {
                         false
@@ -1514,7 +1538,7 @@ impl CoremlMlProgramConverter {
                         Self::create_immediate_int_array(&opts.permutation),
                     );
                 } else if !op.input_operands().is_empty()
-                    && let Some(input_operand) = _graph.operand(op.input_operands()[0])
+                    && let Some(input_operand) = graph.operand(op.input_operands()[0])
                 {
                     let rank = input_operand.descriptor.shape.len();
                     let default_perm: Vec<u32> = (0..rank).rev().map(|i| i as u32).collect();
@@ -1660,14 +1684,31 @@ impl CoremlMlProgramConverter {
                     Self::create_immediate_int_array(&padding),
                 );
                 inputs.insert("groups".to_string(), Self::create_immediate_int(groups));
-                // Handle outputSizes (explicit output spatial dimensions [H, W])
-                // Following Chromium: For conv_transpose, CoreML requires output_shape
-                // to be the full output tensor dimensions [N, C, H, W] (from output operand),
-                // NOT just the spatial dimensions from outputSizes attribute.
-                // See: graph_builder_coreml.cc lines 2328-2334
-                // When explicit outputSizes is provided, we need to compute full output shape.
-                // For now, skip adding output_shape when using padding (custom pad_type).
-                // TODO: Compute full output shape from outputSizes + input shape + channels
+
+                // MIL conv_transpose takes the complete output tensor shape,
+                // not only WebNN's two spatial outputSizes values. Chromium
+                // supplies this for every transposed convolution as well.
+                if let Some(output_id) = op.output_operand()
+                    && let Some(output) = graph.operand(output_id)
+                {
+                    let mut output_shape = output.descriptor.static_or_max_shape();
+                    let input_layout = options
+                        .as_ref()
+                        .map(|o| o.input_layout.as_str())
+                        .unwrap_or("");
+                    if input_layout.eq_ignore_ascii_case("nhwc") && output_shape.len() == 4 {
+                        output_shape = vec![
+                            output_shape[0],
+                            output_shape[3],
+                            output_shape[1],
+                            output_shape[2],
+                        ];
+                    }
+                    inputs.insert(
+                        "output_shape".to_string(),
+                        Self::create_immediate_int_array(&output_shape),
+                    );
+                }
             }
 
             // Pooling operations: input + parameters
@@ -1819,7 +1860,7 @@ impl CoremlMlProgramConverter {
                 // Following Chromium: TODO(crbug.com/338529226) - these params must be constant
                 if input_names.len() >= 2 && op.input_operands().len() >= 2 {
                     let scale_operand_id = op.input_operands()[1];
-                    if let Some(scale_operand) = _graph.operand(scale_operand_id)
+                    if let Some(scale_operand) = graph.operand(scale_operand_id)
                         && scale_operand.kind != crate::graph::OperandKind::Constant
                     {
                         return Err(GraphError::ConversionFailed {
@@ -1833,7 +1874,7 @@ impl CoremlMlProgramConverter {
                 // Bias (beta) is optional (3rd input)
                 if input_names.len() >= 3 && op.input_operands().len() >= 3 {
                     let bias_operand_id = op.input_operands()[2];
-                    if let Some(bias_operand) = _graph.operand(bias_operand_id)
+                    if let Some(bias_operand) = graph.operand(bias_operand_id)
                         && bias_operand.kind != crate::graph::OperandKind::Constant
                     {
                         return Err(GraphError::ConversionFailed {
@@ -1865,7 +1906,7 @@ impl CoremlMlProgramConverter {
                 }
                 if input_names.len() >= 2 && op.input_operands().len() >= 2 {
                     let mean_operand_id = op.input_operands()[1];
-                    if let Some(mean_operand) = _graph.operand(mean_operand_id)
+                    if let Some(mean_operand) = graph.operand(mean_operand_id)
                         && mean_operand.kind != crate::graph::OperandKind::Constant
                     {
                         return Err(GraphError::ConversionFailed {
@@ -1880,7 +1921,7 @@ impl CoremlMlProgramConverter {
                 }
                 if input_names.len() >= 3 && op.input_operands().len() >= 3 {
                     let variance_operand_id = op.input_operands()[2];
-                    if let Some(variance_operand) = _graph.operand(variance_operand_id)
+                    if let Some(variance_operand) = graph.operand(variance_operand_id)
                         && variance_operand.kind != crate::graph::OperandKind::Constant
                     {
                         return Err(GraphError::ConversionFailed {
@@ -1900,7 +1941,7 @@ impl CoremlMlProgramConverter {
                     if let Some(sid) = opts.scale {
                         inputs.insert(
                             "gamma".to_string(),
-                            Self::create_argument(&operand_name(_graph, sid)),
+                            Self::create_argument(&operand_name(graph, sid)),
                         );
                     } else if input_names.len() >= 4 {
                         inputs.insert("gamma".to_string(), Self::create_argument(&input_names[3]));
@@ -1908,7 +1949,7 @@ impl CoremlMlProgramConverter {
                     if let Some(bid) = opts.bias {
                         inputs.insert(
                             "beta".to_string(),
-                            Self::create_argument(&operand_name(_graph, bid)),
+                            Self::create_argument(&operand_name(graph, bid)),
                         );
                     } else if input_names.len() >= 5 {
                         inputs.insert("beta".to_string(), Self::create_argument(&input_names[4]));
@@ -1925,7 +1966,7 @@ impl CoremlMlProgramConverter {
                 }
                 if input_names.len() >= 2 && op.input_operands().len() >= 2 {
                     let mean_operand_id = op.input_operands()[1];
-                    if let Some(mean_operand) = _graph.operand(mean_operand_id)
+                    if let Some(mean_operand) = graph.operand(mean_operand_id)
                         && mean_operand.kind != crate::graph::OperandKind::Constant
                     {
                         return Err(GraphError::ConversionFailed {
@@ -1940,7 +1981,7 @@ impl CoremlMlProgramConverter {
                 }
                 if input_names.len() >= 3 && op.input_operands().len() >= 3 {
                     let variance_operand_id = op.input_operands()[2];
-                    if let Some(variance_operand) = _graph.operand(variance_operand_id)
+                    if let Some(variance_operand) = graph.operand(variance_operand_id)
                         && variance_operand.kind != crate::graph::OperandKind::Constant
                     {
                         return Err(GraphError::ConversionFailed {
@@ -2026,7 +2067,7 @@ impl CoremlMlProgramConverter {
                 }) {
                     // Get input operand shape
                     if !op.input_operands().is_empty()
-                        && let Some(input_operand) = _graph.operand(op.input_operands()[0])
+                        && let Some(input_operand) = graph.operand(op.input_operands()[0])
                     {
                         let input_shape = input_operand.descriptor.static_or_max_shape();
                         let input_rank = input_shape.len();
@@ -2343,7 +2384,7 @@ impl CoremlMlProgramConverter {
                         Some(axes) => axes.clone(),
                         None => {
                             if let Some(input_id) = op.input_operands().first() {
-                                if let Some(input_operand) = _graph.operand(*input_id) {
+                                if let Some(input_operand) = graph.operand(*input_id) {
                                     (0..input_operand.descriptor.shape.len())
                                         .map(|axis| axis as u32)
                                         .collect()
@@ -2357,7 +2398,7 @@ impl CoremlMlProgramConverter {
                     },
                     None => {
                         if let Some(input_id) = op.input_operands().first() {
-                            if let Some(input_operand) = _graph.operand(*input_id) {
+                            if let Some(input_operand) = graph.operand(*input_id) {
                                 (0..input_operand.descriptor.shape.len())
                                     .map(|axis| axis as u32)
                                     .collect()
@@ -3675,21 +3716,17 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             ..Default::default()
         };
 
-        // Create ModelDescription with function descriptions
-        use crate::protos::coreml::specification::{
-            FeatureDescription, FunctionDescription, ModelDescription,
-        };
+        // Create ModelDescription with model-level input/output feature descriptions.
+        // Single-function MLProgram models must use model-level I/O (not the
+        // `functions` field), otherwise CoreML rejects them with
+        // "multi-function description syntax" at load time.
+        use crate::protos::coreml::specification::{FeatureDescription, ModelDescription};
 
-        let mut function_desc = FunctionDescription {
-            name: "main".to_string(),
-            ..Default::default()
-        };
-
-        // Add input descriptions
+        let mut input_descriptions = Vec::new();
         for &input_id in &graph_info.input_operands {
             if let Some(operand) = graph_info.operand(input_id) {
                 let input_name = operand_name(graph_info, input_id);
-                function_desc.input.push(FeatureDescription {
+                input_descriptions.push(FeatureDescription {
                     name: input_name,
                     r#type: Some(Self::create_feature_type(&operand.descriptor)?),
                     ..Default::default()
@@ -3697,11 +3734,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
-        // Add output descriptions
+        let mut output_descriptions = Vec::new();
         for &output_id in &graph_info.output_operands {
             if let Some(operand) = graph_info.operand(output_id) {
                 let output_name = operand_name(graph_info, output_id);
-                function_desc.output.push(FeatureDescription {
+                output_descriptions.push(FeatureDescription {
                     name: output_name,
                     r#type: Some(Self::create_feature_type(&operand.descriptor)?),
                     ..Default::default()
@@ -3710,8 +3747,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         }
 
         model.description = Some(ModelDescription {
-            functions: vec![function_desc],
-            default_function_name: "main".to_string(),
+            input: input_descriptions,
+            output: output_descriptions,
             ..Default::default()
         });
 

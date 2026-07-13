@@ -18,12 +18,20 @@ jobs:
             report_file: reports/wpt-conformance-onnx.json
             html_file: reports/wpt-conformance-onnx.html
             continue_on_error: false
+            os: ubuntu-latest
           - id: litert
             label: LiteRT
             report_file: reports/wpt-conformance-litert.json
             html_file: reports/wpt-conformance-litert.html
             continue_on_error: true
-    runs-on: ubuntu-latest
+            os: ubuntu-latest
+          - id: coreml
+            label: CoreML
+            report_file: reports/wpt-conformance-litert.json
+            html_file: reports/wpt-conformance-litert.html
+            continue_on_error: false
+            os: macos-latest
+    runs-on: ${{ matrix.backend.os }}
     continue-on-error: ${{ matrix.backend.continue_on_error }}
     steps:
       - uses: actions/checkout@v4
@@ -37,10 +45,18 @@ jobs:
         uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Install protobuf compiler
+        if: runner.os == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
           protoc --version
+
+      - name: Install protobuf/flatbuffer compiler
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf flatbuffers
+          protoc --version
+
 
       - name: Install flatc
         if: matrix.backend.id == 'litert'
@@ -78,7 +94,7 @@ jobs:
         env:
           RUSTNN_GIT_SHA: ${{ github.sha }}
           RUSTNN_GIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-        run: make test-wpt-report BACKEND=${{ matrix.backend.id }}
+        run: make test-wpt-report WPT_BACKEND=${{ matrix.backend.id }}
 
       - name: Upload WPT conformance report
         if: always()
