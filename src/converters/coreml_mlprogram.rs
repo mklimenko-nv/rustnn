@@ -27,7 +27,7 @@
 /// This replaces the legacy NeuralNetwork format.
 use crate::converters::operand_name;
 use crate::error::GraphError;
-use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo};
+use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo, OperandKind};
 use crate::operator_enums::MLOperandDataType;
 use crate::operator_options::MLDimension;
 use crate::operators::Operation;
@@ -38,6 +38,43 @@ use crate::protos::coreml::mil_spec::{
 use crate::protos::coreml::specification::Model;
 use prost::Message;
 use std::collections::HashMap;
+
+/// Convert zero_point byte data from a source dtype to a target dtype.
+/// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
+/// Values are clamped to the target range to avoid silent corruption.
+fn convert_zp_bytes(src: &[u8], src_dtype: &DataType, tgt_dtype: &DataType) -> Vec<u8> {
+    match (src_dtype, tgt_dtype) {
+        (DataType::Int32, DataType::Uint8) => {
+            let count = src.len() / 4;
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let v = i32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                out.push(v.clamp(0, 255) as u8);
+            }
+            out
+        }
+        (DataType::Int32, DataType::Int8) => {
+            let count = src.len() / 4;
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let v = i32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                out.push(v.clamp(-128, 127) as i8 as u8);
+            }
+            out
+        }
+        _ => src.to_vec(),
+    }
+}
 
 /// MIL operation type names (matching Chromium's implementation)
 mod mil_ops {
@@ -2660,6 +2697,50 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
+        // MIL `quantize` / `dequantize` require:
+        //  • `scale` (and `zero_point`) to be rank 0 (scalar) or rank 1 constants.
+        //  • `zero_point` type to match the quantized tensor type (int8 or uint8).
+        //    Some WebNN graphs store zero_point as Int32, which CoreML rejects.
+        // Pre-scan all quantize/dequantize operations to collect:
+        //   scale_ids_to_squeeze  — scale/zp operand IDs with rank > 1 (need shape squeezing)
+        //   zp_id_to_dtype        — zero_point operand IDs mapped to their required data type
+        let mut scale_ids_to_squeeze: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        let mut zp_id_to_dtype: HashMap<u32, DataType> = HashMap::new();
+        for op in &graph_info.operations {
+            let op_lower = op.op_type().to_lowercase();
+            if matches!(op_lower.as_str(), "quantizelinear" | "dequantizelinear") {
+                let input_ids = op.input_operands();
+                // Squeeze shape for both scale (index 1) and zero_point (index 2).
+                for &param_idx in &[1usize, 2usize] {
+                    if let Some(&param_id) = input_ids.get(param_idx) {
+                        if let Some(param_operand) = graph_info.operand(param_id) {
+                            if param_operand.descriptor.shape.len() > 1 {
+                                scale_ids_to_squeeze.insert(param_id);
+                            }
+                        }
+                    }
+                }
+                // Determine the expected zero_point data type.
+                // For quantize: zp type = output type.
+                // For dequantize: zp type = input type.
+                let zp_expected_type = if op_lower == "quantizelinear" {
+                    op.output_operand()
+                        .and_then(|id| graph_info.operand(id))
+                        .map(|o| o.descriptor.data_type.clone())
+                } else {
+                    // dequantize: first input is the quantized tensor
+                    input_ids
+                        .first()
+                        .and_then(|&id| graph_info.operand(id))
+                        .map(|o| o.descriptor.data_type.clone())
+                };
+                if let (Some(&zp_id), Some(expected_dt)) = (input_ids.get(2), zp_expected_type) {
+                    zp_id_to_dtype.insert(zp_id, expected_dt);
+                }
+            }
+        }
+
         // Add constant operands as const operations
         for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
             let operand =
@@ -2670,15 +2751,92 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         reason: format!("Constant operand {} not found", operand_id),
                     })?;
 
-            let const_op = Self::create_const_operation(
-                graph_info,
-                *operand_id,
-                operand,
-                constant_data,
-                &mut weight_builder,
-            )?;
-            main_block.operations.push(const_op);
+            // For quantize/dequantize scale and zero_point params, we may need to:
+            //  (a) squeeze the shape to rank ≤ 1 (both scale and zp)
+            //  (b) coerce the dtype to match the quantized tensor (zp only, e.g. Int32 → Uint8)
+            // Both may apply simultaneously; apply them together here.
+            let needs_squeeze = scale_ids_to_squeeze.contains(operand_id);
+            let needs_type_coerce = zp_id_to_dtype
+                .get(operand_id)
+                .filter(|expected| **expected != operand.descriptor.data_type)
+                .cloned();
+
+            if needs_squeeze || needs_type_coerce.is_some() {
+                use crate::graph::OperandDescriptor;
+
+                // Compute the squeezed shape (or keep original if no squeezing needed).
+                let final_shape: Vec<GraphDimension> = if needs_squeeze {
+                    let squeezed: Vec<u32> = operand
+                        .descriptor
+                        .shape
+                        .iter()
+                        .filter_map(|d| match d {
+                            GraphDimension::Static(v) if *v != 1 => Some(*v),
+                            _ => None,
+                        })
+                        .collect();
+                    squeezed
+                        .iter()
+                        .map(|&v| GraphDimension::Static(v))
+                        .collect()
+                } else {
+                    operand.descriptor.shape.clone()
+                };
+
+                // Compute the final dtype (and convert bytes if needed).
+                let (final_dtype, final_data_ref, _coerced_storage);
+                if let Some(expected_dtype) = needs_type_coerce {
+                    let converted = convert_zp_bytes(
+                        &constant_data.data,
+                        &operand.descriptor.data_type,
+                        &expected_dtype,
+                    );
+                    _coerced_storage = crate::graph::ConstantData {
+                        data: converted,
+                        label: None,
+                    };
+                    final_data_ref = &_coerced_storage;
+                    final_dtype = expected_dtype;
+                } else {
+                    _coerced_storage = crate::graph::ConstantData {
+                        data: vec![],
+                        label: None,
+                    };
+                    final_data_ref = constant_data;
+                    final_dtype = operand.descriptor.data_type.clone();
+                };
+
+                let mut modified_operand = operand.clone();
+                modified_operand.descriptor = OperandDescriptor {
+                    data_type: final_dtype,
+                    shape: final_shape,
+                    pending_permutation: Vec::new(),
+                };
+                let const_op = Self::create_const_operation(
+                    graph_info,
+                    *operand_id,
+                    &modified_operand,
+                    final_data_ref,
+                    &mut weight_builder,
+                )?;
+                main_block.operations.push(const_op);
+            } else {
+                let const_op = Self::create_const_operation(
+                    graph_info,
+                    *operand_id,
+                    operand,
+                    constant_data,
+                    &mut weight_builder,
+                )?;
+                main_block.operations.push(const_op);
+            }
         }
+
+        // Operations that must be inserted right after the op that produces their input operand.
+        // Keyed by the source operand_id.  Value = (transpose ops, transposed_name).
+        // We intentionally do NOT set operand_name_overrides[id] until the deferred ops are
+        // emitted, so that the operation that *produces* the id still writes the original name.
+        let mut deferred_transposes: HashMap<u32, (Vec<MilOperation>, String)> = HashMap::new();
 
         // First pass: Handle filter layout transformations for conv operations
 
@@ -2729,10 +2887,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             let filter_name = operand_name(graph_info, filter_operand_id);
                             let transposed_filter_name = format!("{}_transposed", filter_name);
 
-                            // Store the override mapping
-                            operand_name_overrides
-                                .insert(filter_operand_id, transposed_filter_name.clone());
-
                             let mut transpose_inputs: HashMap<String, Argument> = HashMap::new();
                             transpose_inputs
                                 .insert("x".to_string(), Self::create_name_argument(filter_name));
@@ -2772,7 +2926,29 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 vec![transpose_output_type],
                             );
 
-                            main_block.operations.push(transpose_op);
+                            // If the filter operand is a constant or graph input it has already
+                            // been emitted, so the transpose and the name override can go here.
+                            // If it is an intermediate (e.g. output of dequantizeLinear in a QDQ
+                            // graph) the producing operation hasn't been emitted yet — defer the
+                            // transpose until right after that operation, and defer the override
+                            // too (so the producing op writes the *original* name, not the
+                            // transposed name).
+                            if matches!(
+                                filter_operand.kind,
+                                OperandKind::Constant | OperandKind::Input
+                            ) {
+                                // Override can be set now; the filter has already been emitted.
+                                operand_name_overrides
+                                    .insert(filter_operand_id, transposed_filter_name.clone());
+                                main_block.operations.push(transpose_op);
+                            } else {
+                                // Do NOT set the override yet; set it after the deferred op fires.
+                                deferred_transposes
+                                    .entry(filter_operand_id)
+                                    .or_insert_with(|| (Vec::new(), transposed_filter_name.clone()))
+                                    .0
+                                    .push(transpose_op);
+                            }
                         }
                     }
                 }
@@ -2801,10 +2977,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         // Create transpose operation for input
                         let input_name = operand_name(graph_info, input_operand_id);
                         let transposed_input_name = format!("{}_nchw", input_name);
-
-                        // Store the override mapping
-                        operand_name_overrides
-                            .insert(input_operand_id, transposed_input_name.clone());
 
                         let mut transpose_inputs: HashMap<String, Argument> = HashMap::new();
                         transpose_inputs
@@ -2845,7 +3017,23 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             vec![transpose_output_type],
                         );
 
-                        main_block.operations.push(transpose_op);
+                        // Same defer logic as for the filter: for constants/inputs the
+                        // source has already been emitted so the override and transpose go now.
+                        // For intermediates, defer both until the producing op is emitted.
+                        if matches!(
+                            input_operand.kind,
+                            OperandKind::Constant | OperandKind::Input
+                        ) {
+                            operand_name_overrides
+                                .insert(input_operand_id, transposed_input_name.clone());
+                            main_block.operations.push(transpose_op);
+                        } else {
+                            deferred_transposes
+                                .entry(input_operand_id)
+                                .or_insert_with(|| (Vec::new(), transposed_input_name.clone()))
+                                .0
+                                .push(transpose_op);
+                        }
                     }
                 }
             }
@@ -3700,13 +3888,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             if op_type_lower == "where" {
                 if let Operation::Where { condition, .. } = op {
                     let cond_id = *condition;
-                    let cond_operand =
-                        graph_info
-                            .operand(cond_id)
-                            .ok_or_else(|| GraphError::ConversionFailed {
-                                format: "coreml_mlprogram".to_string(),
-                                reason: format!("where condition operand {cond_id} not found"),
-                            })?;
+                    let cond_operand = graph_info.operand(cond_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("where condition operand {cond_id} not found"),
+                        }
+                    })?;
                     if cond_operand.descriptor.data_type == DataType::Uint8 {
                         let cond_name = Self::output_name_for_operand(
                             graph_info,
@@ -3720,17 +3907,16 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             bool_cond_name.clone(),
                             crate::protos::coreml::mil_spec::DataType::Bool as i32,
                         )?;
-                        main_block
-                            .operations
-                            .push(Self::create_cast_operation(cond_name, bool_cond_type, "bool"));
+                        main_block.operations.push(Self::create_cast_operation(
+                            cond_name,
+                            bool_cond_type,
+                            "bool",
+                        ));
 
                         let mut overrides = operand_name_overrides.clone();
                         overrides.insert(cond_id, bool_cond_name);
-                        let mil_op = self.convert_operation_with_overrides(
-                            graph_info,
-                            op,
-                            &overrides,
-                        )?;
+                        let mil_op =
+                            self.convert_operation_with_overrides(graph_info, op, &overrides)?;
                         main_block.operations.push(mil_op);
                         continue;
                     }
@@ -3740,6 +3926,17 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             let mil_op =
                 self.convert_operation_with_overrides(graph_info, op, &operand_name_overrides)?;
             main_block.operations.push(mil_op);
+
+            // Flush any transpose ops that were waiting for this operation's output, and
+            // activate the corresponding operand-name override so that later operations
+            // that consume this operand use the transposed name.
+            if let Some(output_id) = op.output_operand() {
+                if let Some((pending_ops, transposed_name)) = deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
+            }
         }
 
         // Add block outputs (output operand names)
