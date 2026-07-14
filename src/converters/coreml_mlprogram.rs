@@ -1634,6 +1634,276 @@ impl CoremlMlProgramConverter {
         out_name
     }
 
+    /// Emit `reshape(x, shape)`. Returns `out_name`.
+    fn rnn_reshape(
+        block: &mut Block,
+        x: &str,
+        shape: &[u32],
+        out_name: String,
+        dtype: i32,
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
+        inputs.insert("shape".to_string(), Self::create_immediate_int_array(shape));
+        let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
+        block
+            .operations
+            .push(Self::create_mil_operation("reshape", inputs, vec![ty]));
+        out_name
+    }
+
+    /// Emit `concat(values, axis)`. Returns `out_name`.
+    fn rnn_concat(
+        block: &mut Block,
+        names: &[String],
+        axis: u32,
+        out_name: String,
+        dtype: i32,
+        out_shape: &[u32],
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("values".to_string(), Self::create_argument_tuple(names));
+        inputs.insert("axis".to_string(), Self::create_immediate_int(axis));
+        inputs.insert("interleave".to_string(), Self::create_immediate_bool(false));
+        let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, out_shape);
+        block.operations.push(Self::create_mil_operation(
+            mil_ops::CONCAT,
+            inputs,
+            vec![ty],
+        ));
+        out_name
+    }
+
+    /// Emit a constant zero tensor of the given shape/dtype. Returns `out_name`.
+    fn rnn_zeros(block: &mut Block, shape: &[u32], out_name: String, dtype: i32) -> String {
+        use crate::protos::coreml::mil_spec::{TensorValue, Value, tensor_value, value};
+        let count: usize = shape.iter().map(|&d| d as usize).product();
+        let f32_dtype = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
+        let f32_name = if dtype == f32_dtype {
+            out_name.clone()
+        } else {
+            format!("{}_zf32", out_name)
+        };
+        let const_type = Self::value_type_for_static_shape(f32_name.clone(), f32_dtype, shape);
+        let tensor_value = TensorValue {
+            value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
+                values: vec![0.0f32; count],
+            })),
+        };
+        let immediate = Value {
+            doc_string: String::new(),
+            r#type: const_type.r#type.clone(),
+            value: Some(value::Value::ImmediateValue(value::ImmediateValue {
+                value: Some(value::immediate_value::Value::Tensor(tensor_value)),
+            })),
+        };
+        let mut attributes = HashMap::new();
+        attributes.insert("val".to_string(), immediate);
+        block.operations.push(MilOperation {
+            r#type: "const".to_string(),
+            inputs: HashMap::new(),
+            outputs: vec![const_type],
+            attributes,
+            ..Default::default()
+        });
+        if dtype == f32_dtype {
+            return out_name;
+        }
+        let casted = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
+        block.operations.push(Self::create_cast_operation(
+            f32_name,
+            casted,
+            Self::cast_dtype_string_for_mil_type(dtype).unwrap_or("fp16"),
+        ));
+        out_name
+    }
+
+    /// Emit one GRU time step and return the new hidden-state tensor name (shape [b, h]).
+    /// Same gate math as `emit_gru_cell_decomposition`, parameterized on tensor names so
+    /// the sequence `gru` can unroll it over time steps and directions.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_gru_step(
+        block: &mut Block,
+        x_name: &str,
+        w_name: &str,
+        r_name: &str,
+        bias_name: Option<&str>,
+        rbias_name: Option<&str>,
+        hid_name: &str,
+        b: u32,
+        i: u32,
+        h: u32,
+        layout: &str,
+        act0: &str,
+        act1: &str,
+        reset_after: bool,
+        prefix: &str,
+        dtype: i32,
+    ) -> String {
+        let bh = [b, h];
+        let (z_off, r_off, n_off) = match layout {
+            "rzn" => (h, 0, 2 * h),
+            _ => (0, h, 2 * h),
+        };
+        let p = |s: &str| format!("{}_{}", prefix, s);
+        let mut gate = |block: &mut Block, off: u32, act: &str, tag: &str| -> String {
+            let wg = Self::rnn_slice(
+                block,
+                w_name,
+                &[off, 0],
+                &[h, i],
+                p(&format!("w{tag}")),
+                dtype,
+            );
+            let mut xw =
+                Self::rnn_matmul_ty(block, x_name, &wg, p(&format!("xw{tag}")), dtype, &bh);
+            if let Some(bn) = bias_name {
+                let bg = Self::rnn_slice(block, bn, &[off], &[h], p(&format!("b{tag}")), dtype);
+                xw = Self::rnn_binary(block, "add", &xw, &bg, p(&format!("xwb{tag}")), dtype, &bh);
+            }
+            let rg = Self::rnn_slice(
+                block,
+                r_name,
+                &[off, 0],
+                &[h, h],
+                p(&format!("r{tag}")),
+                dtype,
+            );
+            let mut hr =
+                Self::rnn_matmul_ty(block, hid_name, &rg, p(&format!("hr{tag}")), dtype, &bh);
+            if let Some(rbn) = rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[off], &[h], p(&format!("rb{tag}")), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p(&format!("hrb{tag}")), dtype, &bh);
+            }
+            let pre = Self::rnn_binary(block, "add", &xw, &hr, p(&format!("pre{tag}")), dtype, &bh);
+            Self::rnn_unary(block, act, &pre, p(&format!("g{tag}")), dtype, &bh)
+        };
+        let z = gate(block, z_off, act0, "z");
+        let r = gate(block, r_off, act0, "r");
+
+        let wn = Self::rnn_slice(block, w_name, &[n_off, 0], &[h, i], p("wn"), dtype);
+        let mut xwn = Self::rnn_matmul_ty(block, x_name, &wn, p("xwn"), dtype, &bh);
+        if let Some(bn) = bias_name {
+            let bg = Self::rnn_slice(block, bn, &[n_off], &[h], p("bn"), dtype);
+            xwn = Self::rnn_binary(block, "add", &xwn, &bg, p("xwbn"), dtype, &bh);
+        }
+        let rn = Self::rnn_slice(block, r_name, &[n_off, 0], &[h, h], p("rn"), dtype);
+        let hrn = if reset_after {
+            let mut hr = Self::rnn_matmul_ty(block, hid_name, &rn, p("hrn"), dtype, &bh);
+            if let Some(rbn) = rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[n_off], &[h], p("rbn"), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p("hrbn"), dtype, &bh);
+            }
+            Self::rnn_binary(block, "mul", &r, &hr, p("rhn"), dtype, &bh)
+        } else {
+            let rh = Self::rnn_binary(block, "mul", &r, hid_name, p("rh"), dtype, &bh);
+            let mut hr = Self::rnn_matmul_ty(block, &rh, &rn, p("hrn"), dtype, &bh);
+            if let Some(rbn) = rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[n_off], &[h], p("rbn"), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p("hrbn"), dtype, &bh);
+            }
+            hr
+        };
+        let npre = Self::rnn_binary(block, "add", &xwn, &hrn, p("npre"), dtype, &bh);
+        let n = Self::rnn_unary(block, act1, &npre, p("n"), dtype, &bh);
+        let hsubn = Self::rnn_binary(block, "sub", hid_name, &n, p("hsubn"), dtype, &bh);
+        let zmul = Self::rnn_binary(block, "mul", &z, &hsubn, p("zmul"), dtype, &bh);
+        Self::rnn_binary(block, "add", &n, &zmul, p("h"), dtype, &bh)
+    }
+
+    /// Emit one LSTM time step; returns the new (hidden, cell) tensor names (shape [b, h]).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_lstm_step(
+        block: &mut Block,
+        x_name: &str,
+        w_name: &str,
+        r_name: &str,
+        bias_name: Option<&str>,
+        rbias_name: Option<&str>,
+        peephole_name: Option<&str>,
+        hid_name: &str,
+        cell_name: &str,
+        b: u32,
+        i: u32,
+        h: u32,
+        layout: &str,
+        f0: &str,
+        f1: &str,
+        f2: &str,
+        prefix: &str,
+        dtype: i32,
+    ) -> (String, String) {
+        let bh = [b, h];
+        let (i_off, o_off, f_off, g_off) = match layout {
+            "ifgo" => (0, 3 * h, h, 2 * h),
+            _ => (0, h, 2 * h, 3 * h),
+        };
+        let (pi_off, po_off, pf_off) = (0u32, h, 2 * h);
+        let p = |s: &str| format!("{}_{}", prefix, s);
+        let mut gate = |block: &mut Block,
+                        off: u32,
+                        act: &str,
+                        tag: &str,
+                        peep: Option<(u32, &str)>|
+         -> String {
+            let wg = Self::rnn_slice(
+                block,
+                w_name,
+                &[off, 0],
+                &[h, i],
+                p(&format!("w{tag}")),
+                dtype,
+            );
+            let mut xw =
+                Self::rnn_matmul_ty(block, x_name, &wg, p(&format!("xw{tag}")), dtype, &bh);
+            if let Some(bn) = bias_name {
+                let bg = Self::rnn_slice(block, bn, &[off], &[h], p(&format!("b{tag}")), dtype);
+                xw = Self::rnn_binary(block, "add", &xw, &bg, p(&format!("xwb{tag}")), dtype, &bh);
+            }
+            let rg = Self::rnn_slice(
+                block,
+                r_name,
+                &[off, 0],
+                &[h, h],
+                p(&format!("r{tag}")),
+                dtype,
+            );
+            let mut hr =
+                Self::rnn_matmul_ty(block, hid_name, &rg, p(&format!("hr{tag}")), dtype, &bh);
+            if let Some(rbn) = rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[off], &[h], p(&format!("rb{tag}")), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p(&format!("hrb{tag}")), dtype, &bh);
+            }
+            let mut pre =
+                Self::rnn_binary(block, "add", &xw, &hr, p(&format!("pre{tag}")), dtype, &bh);
+            if let (Some((poff, cname)), Some(pw)) = (peep, peephole_name) {
+                let pg = Self::rnn_slice(block, pw, &[poff], &[h], p(&format!("p{tag}")), dtype);
+                let pc =
+                    Self::rnn_binary(block, "mul", &pg, cname, p(&format!("pc{tag}")), dtype, &bh);
+                pre = Self::rnn_binary(
+                    block,
+                    "add",
+                    &pre,
+                    &pc,
+                    p(&format!("pre2{tag}")),
+                    dtype,
+                    &bh,
+                );
+            }
+            Self::rnn_unary(block, act, &pre, p(&format!("g{tag}")), dtype, &bh)
+        };
+        let gi = gate(block, i_off, f0, "i", Some((pi_off, cell_name)));
+        let gf = gate(block, f_off, f0, "f", Some((pf_off, cell_name)));
+        let gg = gate(block, g_off, f1, "g", None);
+        let fc = Self::rnn_binary(block, "mul", &gf, cell_name, p("fc"), dtype, &bh);
+        let ig = Self::rnn_binary(block, "mul", &gi, &gg, p("ig"), dtype, &bh);
+        let cnew = Self::rnn_binary(block, "add", &fc, &ig, p("c"), dtype, &bh);
+        let go = gate(block, o_off, f0, "o", Some((po_off, &cnew)));
+        let tanh_c = Self::rnn_unary(block, f2, &cnew, p("tanhc"), dtype, &bh);
+        let hnew = Self::rnn_binary(block, "mul", &go, &tanh_c, p("h"), dtype, &bh);
+        (hnew, cnew)
+    }
+
     /// Compute reshape targets that make a block-wise quantization scale broadcast against
     /// the tensor. Each axis `i` where `1 < scale[i] < input[i]` is split into
     /// `[scale[i], input[i]/scale[i]]` for the tensor and `[scale[i], 1]` for the scale;
@@ -2436,6 +2706,477 @@ impl CoremlMlProgramConverter {
         block
             .operations
             .push(Self::create_mil_operation("mul", h_inputs, vec![h_type]));
+        Ok(())
+    }
+
+    /// Stack per-direction final states [b,h] into the WebNN output[0] shape
+    /// [num_dir, b, h], writing it to `out_name`.
+    fn rnn_pack_final(
+        block: &mut Block,
+        per_dir: &[String],
+        b: u32,
+        h: u32,
+        base: &str,
+        out_name: String,
+        dtype: i32,
+    ) {
+        let nd = per_dir.len() as u32;
+        if nd == 1 {
+            Self::rnn_reshape(block, &per_dir[0], &[1, b, h], out_name, dtype);
+            return;
+        }
+        let parts: Vec<String> = per_dir
+            .iter()
+            .enumerate()
+            .map(|(d, name)| {
+                Self::rnn_reshape(block, name, &[1, b, h], format!("{base}_f3d{d}"), dtype)
+            })
+            .collect();
+        Self::rnn_concat(block, &parts, 0, out_name, dtype, &[nd, b, h]);
+    }
+
+    /// Stack per-direction, per-time states into the WebNN sequence output shape
+    /// [steps, num_dir, b, h], writing it to `out_name`. `seq[d][t]` is the [b,h] hidden.
+    fn rnn_pack_sequence(
+        block: &mut Block,
+        seq: &[Vec<String>],
+        steps: u32,
+        b: u32,
+        h: u32,
+        base: &str,
+        out_name: String,
+        dtype: i32,
+    ) {
+        let nd = seq.len() as u32;
+        // For each time step build a [1, nd, b, h] slab.
+        let mut time_slabs: Vec<String> = Vec::with_capacity(steps as usize);
+        for t in 0..steps {
+            let dir_parts: Vec<String> = (0..nd as usize)
+                .map(|d| {
+                    Self::rnn_reshape(
+                        block,
+                        &seq[d][t as usize],
+                        &[1, 1, b, h],
+                        format!("{base}_s{t}_d{d}"),
+                        dtype,
+                    )
+                })
+                .collect();
+            let slab = if nd == 1 {
+                dir_parts.into_iter().next().unwrap()
+            } else {
+                Self::rnn_concat(
+                    block,
+                    &dir_parts,
+                    1,
+                    format!("{base}_s{t}"),
+                    dtype,
+                    &[1, nd, b, h],
+                )
+            };
+            time_slabs.push(slab);
+        }
+        if steps == 1 {
+            // Rename the single slab to the output by an identity reshape.
+            Self::rnn_reshape(block, &time_slabs[0], &[1, nd, b, h], out_name, dtype);
+            return;
+        }
+        Self::rnn_concat(block, &time_slabs, 0, out_name, dtype, &[steps, nd, b, h]);
+    }
+
+    /// Lower a WebNN sequence `gru` by unrolling `emit_gru_step` over time steps and
+    /// directions (forward/backward/bidirectional), assembling output[0] = last hidden
+    /// [num_dir, b, h] and, when requested, output[1] = all steps [steps, num_dir, b, h].
+    fn emit_gru_decomposition(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let (input_id, weight_id, rec_id, steps, hidden_size, opts) = match op {
+            Operation::Gru {
+                input,
+                weight,
+                recurrence,
+                steps,
+                hidden_size,
+                options,
+                ..
+            } => (
+                *input,
+                *weight,
+                *recurrence,
+                *steps,
+                *hidden_size,
+                options.as_ref(),
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "emit_gru_decomposition called on non-gru op".to_string(),
+                });
+            }
+        };
+        let out_ids = op.output_operands().to_vec();
+        let input_op = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "gru input operand not found".to_string(),
+            })?;
+        let dtype = Self::mil_data_type(&input_op.descriptor.data_type)?;
+        let in_shape = input_op.descriptor.static_or_max_shape();
+        let batch = in_shape[1];
+        let i = in_shape[2];
+        let h = hidden_size;
+
+        let direction = opts.map(|o| o.direction.as_str()).unwrap_or("forward");
+        let nd: u32 = if direction.eq_ignore_ascii_case("both") {
+            2
+        } else {
+            1
+        };
+        let reset_after = opts.map(|o| o.reset_after).unwrap_or(false);
+        let layout = opts
+            .map(|o| o.layout.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("zrn");
+        let acts: Vec<String> = opts
+            .and_then(|o| o.activations.clone())
+            .unwrap_or_else(|| vec!["sigmoid".to_string(), "tanh".to_string()]);
+        let act0 = Self::rnn_activation_op(&acts[0])?;
+        let act1 = Self::rnn_activation_op(acts.get(1).map(|s| s.as_str()).unwrap_or("tanh"))?;
+
+        let input_name = Self::output_name_for_operand(graph, input_id, overrides);
+        let weight_name = Self::output_name_for_operand(graph, weight_id, overrides);
+        let rec_name = Self::output_name_for_operand(graph, rec_id, overrides);
+        let bias_name = opts
+            .and_then(|o| o.bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let rbias_name = opts
+            .and_then(|o| o.recurrent_bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let init_name = opts
+            .and_then(|o| o.initial_hidden_state)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let base = operand_name(graph, out_ids[0]);
+
+        let mut per_dir_final: Vec<String> = Vec::with_capacity(nd as usize);
+        let mut per_dir_seq: Vec<Vec<String>> = Vec::with_capacity(nd as usize);
+        for d in 0..nd {
+            let backward = direction.eq_ignore_ascii_case("backward")
+                || (direction.eq_ignore_ascii_case("both") && d == 1);
+            let dp = format!("{base}_d{d}");
+            let wsl = Self::rnn_slice(
+                block,
+                &weight_name,
+                &[d, 0, 0],
+                &[1, 3 * h, i],
+                format!("{dp}_wsl"),
+                dtype,
+            );
+            let wd = Self::rnn_reshape(block, &wsl, &[3 * h, i], format!("{dp}_w"), dtype);
+            let rsl = Self::rnn_slice(
+                block,
+                &rec_name,
+                &[d, 0, 0],
+                &[1, 3 * h, h],
+                format!("{dp}_rsl"),
+                dtype,
+            );
+            let rd = Self::rnn_reshape(block, &rsl, &[3 * h, h], format!("{dp}_r"), dtype);
+            let bd = bias_name.as_ref().map(|bn| {
+                let s =
+                    Self::rnn_slice(block, bn, &[d, 0], &[1, 3 * h], format!("{dp}_bsl"), dtype);
+                Self::rnn_reshape(block, &s, &[3 * h], format!("{dp}_b"), dtype)
+            });
+            let rbd = rbias_name.as_ref().map(|bn| {
+                let s =
+                    Self::rnn_slice(block, bn, &[d, 0], &[1, 3 * h], format!("{dp}_rbsl"), dtype);
+                Self::rnn_reshape(block, &s, &[3 * h], format!("{dp}_rb"), dtype)
+            });
+            let mut hid = if let Some(inm) = &init_name {
+                let s = Self::rnn_slice(
+                    block,
+                    inm,
+                    &[d, 0, 0],
+                    &[1, batch, h],
+                    format!("{dp}_h0sl"),
+                    dtype,
+                );
+                Self::rnn_reshape(block, &s, &[batch, h], format!("{dp}_h0"), dtype)
+            } else {
+                Self::rnn_zeros(block, &[batch, h], format!("{dp}_h0"), dtype)
+            };
+            let mut seq_by_time: Vec<String> = vec![String::new(); steps as usize];
+            let order: Vec<u32> = if backward {
+                (0..steps).rev().collect()
+            } else {
+                (0..steps).collect()
+            };
+            for t in order {
+                let xsl = Self::rnn_slice(
+                    block,
+                    &input_name,
+                    &[t, 0, 0],
+                    &[1, batch, i],
+                    format!("{dp}_x{t}sl"),
+                    dtype,
+                );
+                let xt = Self::rnn_reshape(block, &xsl, &[batch, i], format!("{dp}_x{t}"), dtype);
+                hid = Self::emit_gru_step(
+                    block,
+                    &xt,
+                    &wd,
+                    &rd,
+                    bd.as_deref(),
+                    rbd.as_deref(),
+                    &hid,
+                    batch,
+                    i,
+                    h,
+                    layout,
+                    act0,
+                    act1,
+                    reset_after,
+                    &format!("{dp}_t{t}"),
+                    dtype,
+                );
+                seq_by_time[t as usize] = hid.clone();
+            }
+            per_dir_final.push(hid);
+            per_dir_seq.push(seq_by_time);
+        }
+
+        let out0 = operand_name(graph, out_ids[0]);
+        Self::rnn_pack_final(block, &per_dir_final, batch, h, &base, out0, dtype);
+        if out_ids.len() > 1 {
+            let out1 = operand_name(graph, out_ids[1]);
+            Self::rnn_pack_sequence(block, &per_dir_seq, steps, batch, h, &base, out1, dtype);
+        }
+        Ok(())
+    }
+
+    /// Lower a WebNN sequence `lstm` by unrolling `emit_lstm_step` over time steps and
+    /// directions. Outputs: [0] last hidden [num_dir, b, h], [1] last cell [num_dir, b, h],
+    /// and (when requested) [2] all hidden steps [steps, num_dir, b, h].
+    fn emit_lstm_decomposition(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let (input_id, weight_id, rec_id, steps, hidden_size, opts) = match op {
+            Operation::Lstm {
+                input,
+                weight,
+                recurrence,
+                steps,
+                hidden_size,
+                options,
+                ..
+            } => (
+                *input,
+                *weight,
+                *recurrence,
+                *steps,
+                *hidden_size,
+                options.as_ref(),
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "emit_lstm_decomposition called on non-lstm op".to_string(),
+                });
+            }
+        };
+        let out_ids = op.output_operands().to_vec();
+        if out_ids.len() < 2 {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "lstm requires hidden and cell outputs".to_string(),
+            });
+        }
+        let input_op = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "lstm input operand not found".to_string(),
+            })?;
+        let dtype = Self::mil_data_type(&input_op.descriptor.data_type)?;
+        let in_shape = input_op.descriptor.static_or_max_shape();
+        let batch = in_shape[1];
+        let i = in_shape[2];
+        let h = hidden_size;
+
+        let direction = opts.map(|o| o.direction.as_str()).unwrap_or("forward");
+        let nd: u32 = if direction.eq_ignore_ascii_case("both") {
+            2
+        } else {
+            1
+        };
+        let layout = opts
+            .map(|o| o.layout.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("iofg");
+        let acts: Vec<String> = opts.and_then(|o| o.activations.clone()).unwrap_or_else(|| {
+            vec![
+                "sigmoid".to_string(),
+                "tanh".to_string(),
+                "tanh".to_string(),
+            ]
+        });
+        let f0 = Self::rnn_activation_op(&acts[0])?;
+        let f1 = Self::rnn_activation_op(acts.get(1).map(|s| s.as_str()).unwrap_or("tanh"))?;
+        let f2 = Self::rnn_activation_op(acts.get(2).map(|s| s.as_str()).unwrap_or("tanh"))?;
+
+        let input_name = Self::output_name_for_operand(graph, input_id, overrides);
+        let weight_name = Self::output_name_for_operand(graph, weight_id, overrides);
+        let rec_name = Self::output_name_for_operand(graph, rec_id, overrides);
+        let bias_name = opts
+            .and_then(|o| o.bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let rbias_name = opts
+            .and_then(|o| o.recurrent_bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let peephole_name = opts
+            .and_then(|o| o.peephole_weight)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let init_h_name = opts
+            .and_then(|o| o.initial_hidden_state)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let init_c_name = opts
+            .and_then(|o| o.initial_cell_state)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let base = operand_name(graph, out_ids[0]);
+
+        let mut per_dir_h: Vec<String> = Vec::with_capacity(nd as usize);
+        let mut per_dir_c: Vec<String> = Vec::with_capacity(nd as usize);
+        let mut per_dir_seq: Vec<Vec<String>> = Vec::with_capacity(nd as usize);
+        for d in 0..nd {
+            let backward = direction.eq_ignore_ascii_case("backward")
+                || (direction.eq_ignore_ascii_case("both") && d == 1);
+            let dp = format!("{base}_d{d}");
+            let wsl = Self::rnn_slice(
+                block,
+                &weight_name,
+                &[d, 0, 0],
+                &[1, 4 * h, i],
+                format!("{dp}_wsl"),
+                dtype,
+            );
+            let wd = Self::rnn_reshape(block, &wsl, &[4 * h, i], format!("{dp}_w"), dtype);
+            let rsl = Self::rnn_slice(
+                block,
+                &rec_name,
+                &[d, 0, 0],
+                &[1, 4 * h, h],
+                format!("{dp}_rsl"),
+                dtype,
+            );
+            let rd = Self::rnn_reshape(block, &rsl, &[4 * h, h], format!("{dp}_r"), dtype);
+            let bd = bias_name.as_ref().map(|bn| {
+                let s =
+                    Self::rnn_slice(block, bn, &[d, 0], &[1, 4 * h], format!("{dp}_bsl"), dtype);
+                Self::rnn_reshape(block, &s, &[4 * h], format!("{dp}_b"), dtype)
+            });
+            let rbd = rbias_name.as_ref().map(|bn| {
+                let s =
+                    Self::rnn_slice(block, bn, &[d, 0], &[1, 4 * h], format!("{dp}_rbsl"), dtype);
+                Self::rnn_reshape(block, &s, &[4 * h], format!("{dp}_rb"), dtype)
+            });
+            let pd = peephole_name.as_ref().map(|pn| {
+                let s =
+                    Self::rnn_slice(block, pn, &[d, 0], &[1, 3 * h], format!("{dp}_psl"), dtype);
+                Self::rnn_reshape(block, &s, &[3 * h], format!("{dp}_p"), dtype)
+            });
+            let mut hid = if let Some(inm) = &init_h_name {
+                let s = Self::rnn_slice(
+                    block,
+                    inm,
+                    &[d, 0, 0],
+                    &[1, batch, h],
+                    format!("{dp}_h0sl"),
+                    dtype,
+                );
+                Self::rnn_reshape(block, &s, &[batch, h], format!("{dp}_h0"), dtype)
+            } else {
+                Self::rnn_zeros(block, &[batch, h], format!("{dp}_h0"), dtype)
+            };
+            let mut cell = if let Some(inm) = &init_c_name {
+                let s = Self::rnn_slice(
+                    block,
+                    inm,
+                    &[d, 0, 0],
+                    &[1, batch, h],
+                    format!("{dp}_c0sl"),
+                    dtype,
+                );
+                Self::rnn_reshape(block, &s, &[batch, h], format!("{dp}_c0"), dtype)
+            } else {
+                Self::rnn_zeros(block, &[batch, h], format!("{dp}_c0"), dtype)
+            };
+            let mut seq_by_time: Vec<String> = vec![String::new(); steps as usize];
+            let order: Vec<u32> = if backward {
+                (0..steps).rev().collect()
+            } else {
+                (0..steps).collect()
+            };
+            for t in order {
+                let xsl = Self::rnn_slice(
+                    block,
+                    &input_name,
+                    &[t, 0, 0],
+                    &[1, batch, i],
+                    format!("{dp}_x{t}sl"),
+                    dtype,
+                );
+                let xt = Self::rnn_reshape(block, &xsl, &[batch, i], format!("{dp}_x{t}"), dtype);
+                let (nh, nc) = Self::emit_lstm_step(
+                    block,
+                    &xt,
+                    &wd,
+                    &rd,
+                    bd.as_deref(),
+                    rbd.as_deref(),
+                    pd.as_deref(),
+                    &hid,
+                    &cell,
+                    batch,
+                    i,
+                    h,
+                    layout,
+                    f0,
+                    f1,
+                    f2,
+                    &format!("{dp}_t{t}"),
+                    dtype,
+                );
+                hid = nh;
+                cell = nc;
+                seq_by_time[t as usize] = hid.clone();
+            }
+            per_dir_h.push(hid);
+            per_dir_c.push(cell);
+            per_dir_seq.push(seq_by_time);
+        }
+
+        let out_h = operand_name(graph, out_ids[0]);
+        Self::rnn_pack_final(block, &per_dir_h, batch, h, &base, out_h, dtype);
+        let out_c = operand_name(graph, out_ids[1]);
+        Self::rnn_pack_final(
+            block,
+            &per_dir_c,
+            batch,
+            h,
+            &format!("{base}_c"),
+            out_c,
+            dtype,
+        );
+        if out_ids.len() > 2 {
+            let out_seq = operand_name(graph, out_ids[2]);
+            Self::rnn_pack_sequence(block, &per_dir_seq, steps, batch, h, &base, out_seq, dtype);
+        }
         Ok(())
     }
 
@@ -6266,6 +7007,24 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
             if op_type_lower == "lstmcell" {
                 Self::emit_lstm_cell_decomposition(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                continue;
+            }
+            if op_type_lower == "gru" {
+                Self::emit_gru_decomposition(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                continue;
+            }
+            if op_type_lower == "lstm" {
+                Self::emit_lstm_decomposition(
                     graph_info,
                     op,
                     &operand_name_overrides,
