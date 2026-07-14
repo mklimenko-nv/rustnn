@@ -1425,6 +1425,59 @@ impl CoremlMlProgramConverter {
         Ok(mil_type)
     }
 
+    /// Compute the effective (possibly asymmetric) end-padding for a 2D pooling op.
+    ///
+    /// WebNN's `outputShapeRounding="ceil"` and explicit `outputSizes` both grow the
+    /// output beyond what floor rounding of the base padding yields. CoreML forbids
+    /// asymmetric padding under `ceil_mode` and does not take `outputSizes`, so instead
+    /// we fold the extra size into additional end-padding and pool with plain floor
+    /// rounding: for a target output `out`, the input must span `(out-1)*stride + kernel`
+    /// after padding, so `end_pad += needed - (input + begin_pad + end_pad)`.
+    ///
+    /// `kernel`/`strides` are `[H, W]`; `base_pad` is WebNN `[Hbegin, Hend, Wbegin, Wend]`.
+    /// Returns the adjusted `[Hbegin, Hend', Wbegin, Wend']`, or `None` if shapes are
+    /// unavailable (caller falls back to the base padding).
+    fn pool_effective_padding(
+        graph: &GraphInfo,
+        op: &Operation,
+        kernel: &[u32],
+        strides: &[u32],
+        base_pad: &[u32],
+        is_nhwc: bool,
+    ) -> Option<Vec<u32>> {
+        if kernel.len() < 2 || strides.len() < 2 || base_pad.len() < 4 {
+            return None;
+        }
+        let input_shape = op
+            .input_operands()
+            .first()
+            .and_then(|&id| graph.operand(id))
+            .map(|o| o.descriptor.static_or_max_shape())?;
+        let output_shape = op
+            .output_operand()
+            .and_then(|id| graph.operand(id))
+            .map(|o| o.descriptor.static_or_max_shape())?;
+        if input_shape.len() < 4 || output_shape.len() < 4 {
+            return None;
+        }
+        // Spatial dimension indices for [H, W] under each layout.
+        let (h_idx, w_idx) = if is_nhwc { (1, 2) } else { (2, 3) };
+        let mut pad = base_pad.to_vec();
+        for (axis, &dim_idx) in [h_idx, w_idx].iter().enumerate() {
+            let input_dim = input_shape[dim_idx];
+            let output_dim = output_shape[dim_idx];
+            let k = kernel[axis];
+            let s = strides[axis].max(1);
+            let begin = base_pad[axis * 2];
+            let end = base_pad[axis * 2 + 1];
+            let needed = output_dim.saturating_sub(1) * s + k;
+            let current = input_dim + begin + end;
+            let extra = needed.saturating_sub(current);
+            pad[axis * 2 + 1] = end + extra;
+        }
+        Some(pad)
+    }
+
     /// Create inputs map for MIL operation
     fn create_operation_inputs(
         &self,
@@ -1926,157 +1979,91 @@ impl CoremlMlProgramConverter {
             } => {
                 // NHWC pooling is handled by emitting NHWC→NCHW transpose wrappers in the
                 // main convert loop before reaching here. By the time we get here the input
-                // is already in NCHW form, so we proceed unconditionally.
-                let _layout = pool_opts
+                // is already in NCHW form, but the graph operands remain in WebNN layout.
+                let is_nhwc = pool_opts
                     .as_ref()
-                    .map(|o| {
-                        if o.layout.is_empty() {
-                            "nchw"
-                        } else {
-                            o.layout.as_str()
-                        }
-                    })
-                    .unwrap_or("nchw");
-
-                // WebNN `outputSizes` for pooling is not currently lowered to CoreML
-                // pooling parameters in this converter. Reject explicitly to avoid
-                // output-shape mismatches that can lead to runtime crashes.
-                if let Some(output_sizes) = pool_opts.as_ref().and_then(|o| o.output_sizes.as_ref())
-                    && !output_sizes.is_empty()
-                {
-                    return Err(GraphError::ConversionFailed {
-                        format: "coreml_mlprogram".to_string(),
-                        reason: format!(
-                            "CoreML pooling with outputSizes is not supported yet; got {:?} for {}",
-                            output_sizes,
-                            op.op_type()
-                        ),
-                    });
-                }
+                    .map(|o| o.layout.eq_ignore_ascii_case("nhwc"))
+                    .unwrap_or(false);
 
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
 
-                // outputShapeRounding: "floor" (default) or "ceil"
-                let ceil_mode = pool_opts
+                // CoreML pooling has no dilation parameter.
+                if let Some(dil) = pool_opts.as_ref().map(|o| &o.dilations)
+                    && !dil.is_empty()
+                    && dil.iter().any(|&d| d != 1)
+                {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".to_string(),
+                        reason: format!(
+                            "CoreML pooling does not support non-default dilations; got {:?} for {}",
+                            dil,
+                            op.op_type()
+                        ),
+                    });
+                }
+
+                // Kernel sizes: explicit windowDimensions, else the full spatial extent.
+                let kernel: Vec<u32> = pool_opts
                     .as_ref()
-                    .map(|o| o.output_shape_rounding.eq_ignore_ascii_case("ceil"))
-                    .unwrap_or(false);
+                    .and_then(|o| o.window_dimensions.clone())
+                    .filter(|w| !w.is_empty())
+                    .or_else(|| {
+                        op.input_operands()
+                            .first()
+                            .and_then(|&id| graph.operand(id))
+                            .map(|o| o.descriptor.static_or_max_shape())
+                            .filter(|s| s.len() >= 4)
+                            .map(|s| {
+                                if is_nhwc {
+                                    vec![s[1], s[2]]
+                                } else {
+                                    vec![s[2], s[3]]
+                                }
+                            })
+                    })
+                    .unwrap_or_else(|| vec![1, 1]);
                 inputs.insert(
-                    "ceil_mode".to_string(),
-                    Self::create_immediate_bool(ceil_mode),
+                    "kernel_sizes".to_string(),
+                    Self::create_immediate_int_array(&kernel),
                 );
 
-                // Only average pooling accepts this parameter. WebNN averagePool2d
-                // averages over the true window size, excluding padded elements from
-                // the divisor (a boundary window covering N real elements divides by
-                // N, not by the full kernel area).
+                let strides = pool_opts
+                    .as_ref()
+                    .map(|o| o.strides.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| vec![1, 1]);
+                inputs.insert(
+                    "strides".to_string(),
+                    Self::create_immediate_int_array(&strides),
+                );
+
+                // Fold outputShapeRounding="ceil"/outputSizes into extra end-padding and
+                // pool with floor rounding + custom padding (see pool_effective_padding).
+                let base_pad = pool_opts
+                    .as_ref()
+                    .map(|o| o.padding.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| vec![0, 0, 0, 0]);
+                let pad = Self::pool_effective_padding(
+                    graph, &op, &kernel, &strides, &base_pad, is_nhwc,
+                )
+                .unwrap_or(base_pad);
+                inputs.insert("pad".to_string(), Self::create_immediate_int_array(&pad));
+                inputs.insert(
+                    "pad_type".to_string(),
+                    Self::create_immediate_string("custom"),
+                );
+                inputs.insert("ceil_mode".to_string(), Self::create_immediate_bool(false));
+
+                // WebNN averagePool2d excludes padded elements from the divisor (a
+                // boundary window covering N real elements divides by N, not the kernel
+                // area). Only average pooling accepts this parameter.
                 if matches!(&op, Operation::AveragePool2d { .. }) {
                     inputs.insert(
                         "exclude_padding_from_average".to_string(),
                         Self::create_immediate_bool(true),
-                    );
-                }
-
-                // Add parameters from operator options
-                if let Some(opts) = pool_opts.as_ref() {
-                    if let Some(window_dimensions) = opts.window_dimensions.as_ref()
-                        && !window_dimensions.is_empty()
-                    {
-                        inputs.insert(
-                            "kernel_sizes".to_string(),
-                            Self::create_immediate_int_array(window_dimensions),
-                        );
-                    } else {
-                        // window_dimensions is None or empty: infer kernel_sizes from input shape.
-                        // Layout determines which dims are H and W:
-                        //   NCHW → [N, C, H, W]: H=dim2, W=dim3
-                        //   NHWC → [N, H, W, C]: H=dim1, W=dim2
-                        let is_nhwc = opts.layout.eq_ignore_ascii_case("nhwc");
-                        if let Some(&input_id) = op.input_operands().first() {
-                            if let Some(input_op) = graph.operand(input_id) {
-                                let shape = input_op.descriptor.static_or_max_shape();
-                                if shape.len() >= 4 {
-                                    let kernel_sizes = if is_nhwc {
-                                        vec![shape[1], shape[2]]
-                                    } else {
-                                        vec![shape[2], shape[3]]
-                                    };
-                                    inputs.insert(
-                                        "kernel_sizes".to_string(),
-                                        Self::create_immediate_int_array(&kernel_sizes),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let strides = if opts.strides.is_empty() {
-                        vec![1u32, 1]
-                    } else {
-                        opts.strides.clone()
-                    };
-                    inputs.insert(
-                        "strides".to_string(),
-                        Self::create_immediate_int_array(&strides),
-                    );
-                    if !opts.dilations.is_empty() && opts.dilations.iter().any(|&d| d != 1) {
-                        return Err(GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: format!(
-                                "CoreML pooling does not support non-default dilations; got {:?} for {}",
-                                opts.dilations,
-                                op.op_type()
-                            ),
-                        });
-                    }
-                    if !opts.padding.is_empty() {
-                        inputs.insert(
-                            "pad".to_string(),
-                            Self::create_immediate_int_array(&opts.padding),
-                        );
-                        inputs.insert(
-                            "pad_type".to_string(),
-                            Self::create_immediate_string("custom"),
-                        );
-                    } else {
-                        // CoreML avg_pool/max_pool requires pad to be exactly 4 elements
-                        // (2 * spatial_rank) even when all zeros.
-                        inputs.insert(
-                            "pad".to_string(),
-                            Self::create_immediate_int_array(&[0u32, 0, 0, 0]),
-                        );
-                        inputs.insert(
-                            "pad_type".to_string(),
-                            Self::create_immediate_string("valid"),
-                        );
-                    }
-                } else {
-                    // No opts: infer kernel_sizes from input shape (NCHW: spatial dims at [2], [3]).
-                    if let Some(&input_id) = op.input_operands().first() {
-                        if let Some(input_op) = graph.operand(input_id) {
-                            let shape = input_op.descriptor.static_or_max_shape();
-                            if shape.len() >= 4 {
-                                let kernel_sizes = vec![shape[2], shape[3]];
-                                inputs.insert(
-                                    "kernel_sizes".to_string(),
-                                    Self::create_immediate_int_array(&kernel_sizes),
-                                );
-                            }
-                        }
-                    }
-                    // CoreML requires pad to be exactly 4 elements even when all zeros.
-                    inputs.insert(
-                        "pad".to_string(),
-                        Self::create_immediate_int_array(&[0u32, 0, 0, 0]),
-                    );
-                    inputs.insert(
-                        "pad_type".to_string(),
-                        Self::create_immediate_string("valid"),
-                    );
-                    inputs.insert(
-                        "strides".to_string(),
-                        Self::create_immediate_int_array(&[1u32, 1]),
                     );
                 }
             }
