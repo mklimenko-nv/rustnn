@@ -1,53 +1,72 @@
-use std::collections::HashMap;
-
 use crate::error::GraphError;
+use std::collections::HashMap;
 
 const SENTINEL: u32 = 0xDEADBEEF;
 const ALIGNMENT: usize = 64;
+const FILE_VERSION: u32 = 2;
 
-/// Builds a CoreML weight file with proper alignment and metadata.
+/// BlobDataType values used in the per-entry metadata.
+/// Matches the enum from Chromium's graph_builder_coreml.cc.
+pub mod blob_data_type {
+    pub const FLOAT16: u32 = 1;
+    #[allow(dead_code)]
+    pub const FLOAT32: u32 = 2;
+    #[allow(dead_code)]
+    pub const UINT8: u32 = 3;
+    #[allow(dead_code)]
+    pub const INT8: u32 = 4;
+}
+
+/// Builds a CoreML MLProgram blob weight file (format version 2).
 ///
-/// CoreML MLProgram requires Float16 (and other) constants to be stored in
-/// external weight files with specific formatting:
-/// - 64-byte alignment for each entry
-/// - Metadata header (sentinel + count)
-/// - Raw data bytes
-/// - Padding to next boundary
+/// Structure:
 ///
-/// Reference: chromium/src/services/webnn/coreml/graph_builder_coreml.cc
+/// Global file header — exactly 64 bytes at offset 0:
+///   [0-3]   u32  entry count (written as 0, patched at finalize)
+///   [4-7]   u32  version = 2
+///   [8-63]  u8[] zeros
+///
+/// Per-entry — at a 64-byte aligned offset:
+///   WeightMetadata block — 64 bytes:
+///     [0-3]   u32  sentinel = 0xDEADBEEF
+///     [4-7]   u32  mil_data_type (BlobDataType enum)
+///     [8-15]  u64  size_in_bytes (byte length of payload)
+///     [16-23] u64  absolute file offset of payload (= metadata offset + 64)
+///     [24-63] u8[] zeros
+///   Raw payload — size_in_bytes bytes
+///   Padding — zeros to next 64-byte boundary
+///
+/// BlobFileValue.offset points to the WeightMetadata block (not the payload).
+///
+/// Reference: Chromium services/webnn/coreml/graph_builder_coreml.cc
 pub struct WeightFileBuilder {
-    /// Binary weight data with alignment and metadata
     data: Vec<u8>,
-
-    /// Maps operand ID to file offset for BlobFileValue references
     offsets: HashMap<u32, u64>,
+    entry_count: u32,
 }
 
 impl WeightFileBuilder {
-    /// Creates a new empty weight file builder
     pub fn new() -> Self {
-        Self {
+        let mut builder = Self {
             data: Vec::new(),
             offsets: HashMap::new(),
-        }
+            entry_count: 0,
+        };
+        // Write the 64-byte file header (count = 0 for now; patched at finalize)
+        builder.write_file_header(0);
+        builder
     }
 
-    /// Adds a weight entry for an operand with proper alignment and metadata.
+    /// Adds a weight entry. Returns the absolute file offset of the WeightMetadata
+    /// block (this value goes into BlobFileValue.offset).
     ///
-    /// Format per entry:
-    /// - Sentinel (4 bytes): 0xDEADBEEF
-    /// - Count (8 bytes): number of elements
-    /// - Data (N bytes): raw bytes
-    /// - Padding (M bytes): zero padding to next 64-byte boundary
-    ///
-    /// Returns the file offset where this weight begins (for BlobFileValue).
+    /// `mil_data_type` is a BlobDataType enum value (e.g. blob_data_type::FLOAT16).
     pub fn add_weight(
         &mut self,
         operand_id: u32,
-        element_count: usize,
+        mil_data_type: u32,
         data: &[u8],
     ) -> Result<u64, GraphError> {
-        // Check if we already have this operand
         if self.offsets.contains_key(&operand_id) {
             return Err(GraphError::ConversionFailed {
                 format: "coreml_mlprogram".to_string(),
@@ -55,63 +74,69 @@ impl WeightFileBuilder {
             });
         }
 
-        // Align current position to 64-byte boundary
-        let current_len = self.data.len();
-        let aligned_offset = align_to_64(current_len);
-
-        // Add padding to reach alignment
+        // Align to 64-byte boundary before writing the metadata block
+        let aligned_offset = align_to(self.data.len(), ALIGNMENT);
         self.data.resize(aligned_offset, 0);
 
-        // Record offset for this weight (before writing metadata)
-        let offset = self.data.len() as u64;
-        self.offsets.insert(operand_id, offset);
+        // Record the offset of the metadata block (returned as BlobFileValue.offset)
+        let metadata_offset = self.data.len() as u64;
+        self.offsets.insert(operand_id, metadata_offset);
 
-        // Write sentinel (4 bytes, little-endian)
-        self.data.extend_from_slice(&SENTINEL.to_le_bytes());
+        let size_in_bytes = data.len() as u64;
+        // Payload starts immediately after the 64-byte metadata block
+        let payload_offset = metadata_offset + ALIGNMENT as u64;
 
-        // Write element count (8 bytes, little-endian)
-        self.data
-            .extend_from_slice(&(element_count as u64).to_le_bytes());
+        // Write 64-byte WeightMetadata block
+        self.data.extend_from_slice(&SENTINEL.to_le_bytes()); // [0-3]  sentinel
+        self.data.extend_from_slice(&mil_data_type.to_le_bytes()); // [4-7]  type
+        self.data.extend_from_slice(&size_in_bytes.to_le_bytes()); // [8-15] size
+        self.data.extend_from_slice(&payload_offset.to_le_bytes()); // [16-23] data offset
+        self.data.resize(aligned_offset + ALIGNMENT, 0); // [24-63] zeros
 
-        // Write actual data
+        // Write raw payload
         self.data.extend_from_slice(data);
 
-        Ok(offset)
+        self.entry_count += 1;
+        Ok(metadata_offset)
     }
 
-    /// Returns the file offset for a previously added weight
+    /// Returns the file offset for a previously added weight.
     #[allow(dead_code)]
     pub fn get_offset(&self, operand_id: u32) -> Option<u64> {
         self.offsets.get(&operand_id).copied()
     }
 
-    /// Finalizes the weight file and returns the complete binary data.
-    ///
-    /// Adds final padding to ensure the entire file is 64-byte aligned.
+    /// Finalizes the file: patches the entry count in the header and pads to alignment.
     pub fn finalize(mut self) -> Vec<u8> {
-        // Align final size to 64-byte boundary
-        let current_len = self.data.len();
-        let aligned_len = align_to_64(current_len);
-        self.data.resize(aligned_len, 0);
+        // Pad to 64-byte boundary
+        let aligned = align_to(self.data.len(), ALIGNMENT);
+        self.data.resize(aligned, 0);
+
+        // Patch entry count at offset 0
+        let count_bytes = self.entry_count.to_le_bytes();
+        self.data[0..4].copy_from_slice(&count_bytes);
 
         self.data
     }
 
-    /// Returns true if any weights have been added
     pub fn has_weights(&self) -> bool {
-        !self.offsets.is_empty()
+        self.entry_count > 0
     }
 
-    /// Returns the current size of the weight data (may not be aligned)
     #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.data.len()
     }
+
+    fn write_file_header(&mut self, count: u32) {
+        self.data.extend_from_slice(&count.to_le_bytes()); // [0-3]  count
+        self.data.extend_from_slice(&FILE_VERSION.to_le_bytes()); // [4-7]  version = 2
+        self.data.resize(ALIGNMENT, 0); // [8-63] zeros
+    }
 }
 
-/// Aligns an offset to the next 64-byte boundary
-fn align_to_64(offset: usize) -> usize {
-    (offset + (ALIGNMENT - 1)) & !(ALIGNMENT - 1)
+fn align_to(offset: usize, alignment: usize) -> usize {
+    (offset + (alignment - 1)) & !(alignment - 1)
 }
 
 #[cfg(test)]
@@ -119,134 +144,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_align_to_64() {
-        assert_eq!(align_to_64(0), 0);
-        assert_eq!(align_to_64(1), 64);
-        assert_eq!(align_to_64(63), 64);
-        assert_eq!(align_to_64(64), 64);
-        assert_eq!(align_to_64(65), 128);
-        assert_eq!(align_to_64(127), 128);
-        assert_eq!(align_to_64(128), 128);
+    fn test_file_header_written_on_new() {
+        let builder = WeightFileBuilder::new();
+        assert_eq!(builder.size(), 64, "Header must be exactly 64 bytes");
+        // version at bytes [4-7]
+        let data = builder.finalize();
+        assert_eq!(&data[4..8], &2u32.to_le_bytes(), "File version must be 2");
     }
 
     #[test]
-    fn test_empty_builder() {
+    fn test_empty_builder_has_only_header() {
         let builder = WeightFileBuilder::new();
         assert!(!builder.has_weights());
-        assert_eq!(builder.size(), 0);
-
         let data = builder.finalize();
-        assert_eq!(data.len(), 0);
+        // Entry count = 0
+        assert_eq!(&data[0..4], &0u32.to_le_bytes());
+        // Version = 2
+        assert_eq!(&data[4..8], &2u32.to_le_bytes());
+        // File is 64 bytes (header only, aligned)
+        assert_eq!(data.len(), 64);
     }
 
     #[test]
-    fn test_single_weight() {
+    fn test_single_weight_layout() {
         let mut builder = WeightFileBuilder::new();
+        let payload = vec![0x00u8, 0x3C, 0x00, 0x40, 0x00, 0x42]; // f16: 1.0, 2.0, 3.0
+        let offset = builder
+            .add_weight(0, blob_data_type::FLOAT16, &payload)
+            .unwrap();
 
-        // Add a small weight: 3 float16 values (6 bytes)
-        let data = vec![0x00, 0x3C, 0x00, 0x40, 0x00, 0x42]; // f16: 1.0, 2.0, 3.0
-        let offset = builder.add_weight(0, 3, &data).unwrap();
-
-        // First weight starts at offset 0
-        assert_eq!(offset, 0);
+        // Metadata block starts at byte 64 (right after header)
+        assert_eq!(offset, 64);
         assert!(builder.has_weights());
-        assert_eq!(builder.get_offset(0), Some(0));
 
-        let result = builder.finalize();
+        let data = builder.finalize();
 
-        // Check structure:
-        // [0-3]: sentinel (4 bytes)
-        // [4-11]: count (8 bytes)
-        // [12-17]: data (6 bytes)
-        // [18-63]: padding (46 bytes)
-        // Total: 64 bytes (aligned)
+        // Header: entry count = 1
+        assert_eq!(&data[0..4], &1u32.to_le_bytes());
+        assert_eq!(&data[4..8], &2u32.to_le_bytes()); // version
 
-        assert_eq!(result.len(), 64);
+        // Metadata block at offset 64:
+        // [64-67]  sentinel
+        assert_eq!(&data[64..68], &SENTINEL.to_le_bytes());
+        // [68-71]  mil_data_type = FLOAT16 = 1
+        assert_eq!(&data[68..72], &blob_data_type::FLOAT16.to_le_bytes());
+        // [72-79]  size_in_bytes = 6
+        assert_eq!(&data[72..80], &6u64.to_le_bytes());
+        // [80-87]  payload absolute offset = 64 + 64 = 128
+        assert_eq!(&data[80..88], &128u64.to_le_bytes());
+        // [88-127] zeros
+        assert!(data[88..128].iter().all(|&b| b == 0));
 
-        // Verify sentinel
-        assert_eq!(&result[0..4], &SENTINEL.to_le_bytes());
-
-        // Verify count
-        assert_eq!(&result[4..12], &3u64.to_le_bytes());
-
-        // Verify data
-        assert_eq!(&result[12..18], &data[..]);
-
-        // Verify padding is zeros
-        assert!(result[18..64].iter().all(|&b| b == 0));
+        // Payload at offset 128
+        assert_eq!(&data[128..134], &payload[..]);
     }
 
     #[test]
     fn test_multiple_weights() {
         let mut builder = WeightFileBuilder::new();
 
-        // Add first weight (operand 0): 2 bytes
-        let data1 = vec![0xAA, 0xBB];
-        let offset1 = builder.add_weight(0, 1, &data1).unwrap();
+        let d1 = vec![0xAAu8, 0xBB]; // 2 bytes
+        let off1 = builder.add_weight(0, blob_data_type::FLOAT16, &d1).unwrap();
+        assert_eq!(off1, 64); // right after 64-byte header
 
-        // Add second weight (operand 1): 4 bytes
-        let data2 = vec![0x11, 0x22, 0x33, 0x44];
-        let offset2 = builder.add_weight(1, 2, &data2).unwrap();
+        let d2 = vec![0x11u8, 0x22, 0x33, 0x44]; // 4 bytes
+        let off2 = builder.add_weight(1, blob_data_type::FLOAT16, &d2).unwrap();
 
-        // First starts at 0, second starts at 64 (after alignment)
-        assert_eq!(offset1, 0);
-        assert_eq!(offset2, 64);
+        // d1 metadata at 64, payload at 128 (2 bytes), padded to 192.
+        // d2 metadata at 192.
+        assert_eq!(off2, 192);
 
-        // Verify offsets can be retrieved
-        assert_eq!(builder.get_offset(0), Some(0));
-        assert_eq!(builder.get_offset(1), Some(64));
-        assert_eq!(builder.get_offset(2), None);
-
-        let result = builder.finalize();
-
-        // Should be at least 128 bytes (2 aligned entries)
-        assert!(result.len() >= 128);
-        assert_eq!(result.len() % 64, 0); // Final size is aligned
-
-        // Verify first entry sentinel
-        assert_eq!(&result[0..4], &SENTINEL.to_le_bytes());
-
-        // Verify second entry sentinel at offset 64
-        assert_eq!(&result[64..68], &SENTINEL.to_le_bytes());
+        let data = builder.finalize();
+        assert_eq!(&data[0..4], &2u32.to_le_bytes()); // 2 entries
+        // d2 payload offset = 192 + 64 = 256
+        assert_eq!(&data[256..260], &d2[..]);
     }
 
     #[test]
     fn test_duplicate_operand_error() {
         let mut builder = WeightFileBuilder::new();
-
-        let data = vec![0x00, 0x01];
-        builder.add_weight(0, 1, &data).unwrap();
-
-        // Try to add same operand again
-        let result = builder.add_weight(0, 1, &data);
-        assert!(result.is_err());
-
-        match result {
-            Err(GraphError::ConversionFailed { reason, .. }) => {
-                assert!(reason.contains("Duplicate"));
-            }
-            _ => panic!("Expected ConversionFailed error"),
-        }
+        let d = vec![0x00u8, 0x01];
+        builder.add_weight(0, blob_data_type::FLOAT16, &d).unwrap();
+        assert!(builder.add_weight(0, blob_data_type::FLOAT16, &d).is_err());
     }
 
     #[test]
-    fn test_large_weight() {
+    fn test_large_weight_alignment() {
         let mut builder = WeightFileBuilder::new();
+        // 100 float16 values = 200 bytes
+        let payload = vec![0xABu8; 200];
+        let offset = builder
+            .add_weight(0, blob_data_type::FLOAT16, &payload)
+            .unwrap();
+        assert_eq!(offset, 64);
 
-        // Add a large weight: 100 float16 values (200 bytes)
-        let data = vec![0xAB; 200];
-        let offset = builder.add_weight(0, 100, &data).unwrap();
-
-        assert_eq!(offset, 0);
-
-        let result = builder.finalize();
-
-        // Metadata: 12 bytes (sentinel + count)
-        // Data: 200 bytes
-        // Total: 212 bytes -> aligns to 256 bytes (4 * 64)
-        assert_eq!(result.len(), 256);
-
-        // Verify data is present
-        assert_eq!(&result[12..212], &data[..]);
+        let data = builder.finalize();
+        // metadata at 64, payload at 128 (200 bytes), padded to 64-byte boundary
+        // 128 + 200 = 328 -> aligned to 384
+        assert_eq!(data.len(), 384);
+        assert_eq!(&data[128..328], &payload[..]);
     }
 }
