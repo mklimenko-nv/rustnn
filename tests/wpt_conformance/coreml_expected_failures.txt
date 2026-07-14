@@ -3,7 +3,6 @@
 coreml::abs::abs_float16_6D_tensor
 coreml::abs::abs_int32_4D_tensor
 coreml::abs::abs_int64_4D_tensor
-coreml::abs::abs_int8_4D_tensor
 coreml::add::add_float32_with_special_character_names
 coreml::arg_min_max::argMax_int64_4D_tensor__axis_0__all_options
 coreml::arg_min_max::argMax_uint32_4D_tensor__axis_1__all_options
@@ -52,7 +51,6 @@ coreml::cast::cast_uint8_4D_tensor_to_int64
 coreml::cast::cast_uint8_4D_tensor_to_uint32
 coreml::clamp::clamp_int32_1D_tensor
 coreml::clamp::clamp_int64_1D_tensor_with_bigint_max
-coreml::clamp::clamp_int8_1D_tensor
 coreml::clamp::clamp_uint32_1D_tensor
 coreml::clamp::clamp_uint64_1D_tensor_with_Number_min_and_max
 coreml::clamp::clamp_uint64_1D_tensor_with_bigint_max
@@ -235,7 +233,6 @@ coreml::mlNumber::cast_float_to_integer_underflows
 coreml::mlNumber::cast_fractional_float_to_integer
 coreml::mul::mul_uint32_4D_tensors
 coreml::neg::neg_int64_4D_tensor
-coreml::neg::neg_int8_4D_tensor
 coreml::pad::pad_float16_4D_tensor_options_mode__edge_
 coreml::pad::pad_float16_4D_tensor_options_mode__reflection_
 coreml::pad::pad_float32_4D_tensor_options_mode__edge_
@@ -287,10 +284,8 @@ coreml::scatterElements::scatterElements_float32_tensors_along_axis_1
 coreml::scatterElements::scatterElements_float32_tensors_along_axis_1_and_constant_indices
 coreml::scatterND::scatterND_2D_int8_tensors_with_index_out_of_bound
 coreml::sign::sign_int64_3D_tensor
-coreml::sign::sign_int8_4D_tensor
 coreml::slice::slicing_float32_0D_constant_tensor_with_empty_starts_and_sizes_should_be_a_no-op
 coreml::sub::sub_int64_4D_tensors
-coreml::sub::sub_int8_4D_tensors
 coreml::sub::sub_uint32_4D_tensors
 coreml::sub::sub_uint64_4D_tensors
 coreml::subgraph::add___sub___mul___gather_default

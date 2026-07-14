@@ -3868,9 +3868,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
             // Relu with integer input: CoreML relu only accepts float (fp32/fp16).
             // Cast int → fp32, apply relu, cast back.
-            // sub / sign with int8/uint8: CoreML only supports int32/fp32/fp16.
+            // sub / sign / abs with int8/uint8: CoreML only supports int32/fp32/fp16.
             // Cast inputs to int32, apply op, cast back to the original int type.
-            if matches!(op_type_lower.as_str(), "sub" | "sign") {
+            if matches!(op_type_lower.as_str(), "sub" | "sign" | "abs") {
                 let first_input_id = op.input_operands().first().copied();
                 let output_id = op.output_operand();
                 if let (Some(input_id), Some(output_id)) = (first_input_id, output_id) {
@@ -3928,6 +3928,64 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             // Cast result back to original int type
                             main_block.operations.push(Self::create_cast_operation(
                                 int32_out_name,
+                                output_type,
+                                back_dtype,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // neg with int8/uint8: emitted as mul-by-(-1), but the -1 multiplier is a
+            // float immediate, so route through fp32 (int8 values are exact in fp32),
+            // then cast back to the original int type.
+            if op_type_lower == "neg" {
+                if let (Some(&input_id), Some(output_id)) =
+                    (op.input_operands().first(), op.output_operand())
+                {
+                    if let Some(input_op) = graph_info.operand(input_id) {
+                        let int_dtype = input_op.descriptor.data_type.clone();
+                        if matches!(int_dtype, DataType::Int8 | DataType::Uint8) {
+                            let int_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let (output_name, output_type) = Self::create_output_value(
+                                graph_info,
+                                output_id,
+                                &operand_name_overrides,
+                            )?;
+                            let float_name = format!("{}_neg_float", output_name);
+                            let float_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                output_id,
+                                float_name.clone(),
+                                crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                            )?;
+                            main_block
+                                .operations
+                                .push(Self::create_cast_operation(int_name, float_type, "fp32"));
+                            let neg_name = format!("{}_neg_result", output_name);
+                            let neg_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                output_id,
+                                neg_name.clone(),
+                                crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                            )?;
+                            let mut neg_inputs = HashMap::new();
+                            neg_inputs
+                                .insert("x".to_string(), Self::create_name_argument(float_name));
+                            neg_inputs.insert("y".to_string(), Self::create_immediate_float(-1.0));
+                            main_block.operations.push(Self::create_mil_operation(
+                                self.get_mil_op_type("neg")?,
+                                neg_inputs,
+                                vec![neg_type],
+                            ));
+                            let back_dtype = Self::cast_dtype_string_for_graph_type(&int_dtype)?;
+                            main_block.operations.push(Self::create_cast_operation(
+                                neg_name,
                                 output_type,
                                 back_dtype,
                             ));
