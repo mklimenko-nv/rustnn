@@ -1815,9 +1815,10 @@ impl CoremlMlProgramConverter {
             | Operation::MaxPool2d {
                 options: pool_opts, ..
             } => {
-                // CoreML MLProgram pooling path currently assumes NCHW input layout.
-                // Reject NHWC explicitly to avoid invalid model/runtime crashes.
-                let layout = pool_opts
+                // NHWC pooling is handled by emitting NHWC→NCHW transpose wrappers in the
+                // main convert loop before reaching here. By the time we get here the input
+                // is already in NCHW form, so we proceed unconditionally.
+                let _layout = pool_opts
                     .as_ref()
                     .map(|o| {
                         if o.layout.is_empty() {
@@ -1827,16 +1828,6 @@ impl CoremlMlProgramConverter {
                         }
                     })
                     .unwrap_or("nchw");
-                if !layout.eq_ignore_ascii_case("nchw") {
-                    return Err(GraphError::ConversionFailed {
-                        format: "coreml_mlprogram".to_string(),
-                        reason: format!(
-                            "CoreML pooling currently supports only NCHW layout; got '{}' for {}",
-                            layout,
-                            op.op_type(),
-                        ),
-                    });
-                }
 
                 // WebNN `outputSizes` for pooling is not currently lowered to CoreML
                 // pooling parameters in this converter. Reject explicitly to avoid
@@ -1975,11 +1966,24 @@ impl CoremlMlProgramConverter {
             Operation::LayerNormalization { options, .. } => {
                 // Build sorted axes vector (CoreML requires sorted axes; empty axes are handled
                 // as a special case in the main convert loop before reaching here).
-                let mut axes_vec: Vec<i32> = options
-                    .as_ref()
-                    .and_then(|o| o.axes.as_ref())
-                    .map(|ax| ax.iter().map(|&u| u as i32).collect())
-                    .unwrap_or_default();
+                // axes=None means "last axis" per WebNN spec.
+                let mut axes_vec: Vec<i32> =
+                    if let Some(ax) = options.as_ref().and_then(|o| o.axes.as_ref()) {
+                        ax.iter().map(|&u| u as i32).collect()
+                    } else {
+                        // axes=None: default to last axis of the input operand
+                        let input_rank = op
+                            .input_operands()
+                            .first()
+                            .and_then(|&id| graph.operand(id))
+                            .map(|o| o.descriptor.shape.len())
+                            .unwrap_or(1);
+                        if input_rank > 0 {
+                            vec![(input_rank as i32) - 1]
+                        } else {
+                            vec![0]
+                        }
+                    };
                 axes_vec.sort_unstable();
 
                 // Add input operand (only x; scale/bias come from options, not input_operands)
@@ -4109,12 +4113,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             if op_type_lower == "layernormalization" {
                 let axes_empty = match &op {
                     Operation::LayerNormalization { options, .. } => {
-                        let axes_vec: Vec<i32> = options
+                        // None means "default to last axis" (not empty)
+                        options
                             .as_ref()
                             .and_then(|o| o.axes.as_ref())
-                            .map(|ax| ax.iter().map(|&u| u as i32).collect())
-                            .unwrap_or_default();
-                        axes_vec.is_empty()
+                            .map(|ax| ax.is_empty())
+                            .unwrap_or(false)
                     }
                     _ => false,
                 };
@@ -4472,6 +4476,369 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     operand_name_overrides.insert(output_id, transposed_name);
                 }
                 continue;
+            }
+
+            // Special handling for argmax/argmin: CoreML outputs int32 but WebNN declares int64.
+            // Emit with int32 intermediate output and cast to int64 when needed.
+            if op_type_lower == "argmax" || op_type_lower == "argmin" {
+                use crate::protos::coreml::mil_spec::DataType as MilDataType;
+                let output_id =
+                    op.output_operand()
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("operation '{}' has no output operand", op.op_type()),
+                        })?;
+                let output_operand =
+                    graph_info
+                        .operand(output_id)
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("Output operand {} not found", output_id),
+                        })?;
+                if output_operand.descriptor.data_type == DataType::Int64 {
+                    let (output_name, output_type) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                    let int32_name = format!("{}_int32", output_name);
+                    let int32_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        output_id,
+                        int32_name.clone(),
+                        MilDataType::Int32 as i32,
+                    )?;
+                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                    let input_names =
+                        Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                    let arg_op = self.convert_operation_with_input_names_and_outputs(
+                        graph_info,
+                        op,
+                        &input_names,
+                        vec![int32_type],
+                        mil_op_type,
+                    )?;
+                    main_block.operations.push(arg_op);
+                    main_block.operations.push(Self::create_cast_operation(
+                        int32_name,
+                        output_type,
+                        "int64",
+                    ));
+                    continue;
+                }
+            }
+
+            // Special handling for averagePool2d / maxPool2d with NHWC layout.
+            // CoreML pooling only supports NCHW, so we wrap with transpose ops:
+            //   transpose(NHWC→NCHW), pool(NCHW), transpose(NCHW→NHWC).
+            if op_type_lower == "averagepool2d" || op_type_lower == "maxpool2d" {
+                let pool_layout = match op {
+                    Operation::AveragePool2d { options, .. }
+                    | Operation::MaxPool2d { options, .. } => {
+                        options.as_ref().map(|o| o.layout.as_str()).unwrap_or("")
+                    }
+                    _ => "",
+                };
+                if pool_layout.eq_ignore_ascii_case("nhwc") {
+                    let input_id = op.input_operands().first().copied().ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("pool op '{}' has no input operand", op.op_type()),
+                        }
+                    })?;
+                    let output_id =
+                        op.output_operand()
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("pool op '{}' has no output operand", op.op_type()),
+                            })?;
+
+                    let input_operand = graph_info.operand(input_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("pool input operand {} not found", input_id),
+                        }
+                    })?;
+                    let output_operand = graph_info.operand(output_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("pool output operand {} not found", output_id),
+                        }
+                    })?;
+
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        input_id,
+                        &operand_name_overrides,
+                    );
+                    let (output_name, output_type) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                    let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
+
+                    // Pre-transpose: NHWC [N,H,W,C] -> NCHW [N,C,H,W], perm=[0,3,1,2]
+                    let nchw_input_name = format!("{}_pool_nchw_in", output_name);
+                    let nchw_input_perm = [0u32, 3, 1, 2];
+                    let nchw_input_shape = Self::permute_graph_shape(
+                        &input_operand.descriptor.shape,
+                        &nchw_input_perm,
+                    );
+                    let nchw_input_dims =
+                        Self::mil_dimensions_from_graph_shape(&nchw_input_shape, false);
+
+                    let nchw_input_type = NamedValueType {
+                        name: nchw_input_name.clone(),
+                        r#type: Some(ValueType {
+                            r#type: Some(
+                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                    TensorType {
+                                        rank: nchw_input_dims.len() as i64,
+                                        data_type: dtype,
+                                        dimensions: nchw_input_dims,
+                                        attributes: HashMap::new(),
+                                    },
+                                ),
+                            ),
+                        }),
+                    };
+                    let mut pre_tp_inputs: HashMap<String, Argument> = HashMap::new();
+                    pre_tp_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                    pre_tp_inputs.insert(
+                        "perm".to_string(),
+                        Self::create_immediate_int_array(&nchw_input_perm),
+                    );
+                    main_block.operations.push(Self::create_mil_operation(
+                        "transpose",
+                        pre_tp_inputs,
+                        vec![nchw_input_type],
+                    ));
+
+                    // Pool (NCHW): intermediate output shape is [N,C,H',W']
+                    let nchw_pool_output_name = format!("{}_pool_nchw_out", output_name);
+                    // Compute NCHW output shape: permute NHWC output [N,H',W',C] -> [N,C,H',W']
+                    let nchw_out_perm = [0u32, 3, 1, 2];
+                    let nchw_pool_shape =
+                        Self::permute_graph_shape(&output_operand.descriptor.shape, &nchw_out_perm);
+                    let nchw_pool_dims =
+                        Self::mil_dimensions_from_graph_shape(&nchw_pool_shape, false);
+                    let nchw_pool_output_type = NamedValueType {
+                        name: nchw_pool_output_name.clone(),
+                        r#type: Some(ValueType {
+                            r#type: Some(
+                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                    TensorType {
+                                        rank: nchw_pool_dims.len() as i64,
+                                        data_type: dtype,
+                                        dimensions: nchw_pool_dims,
+                                        attributes: HashMap::new(),
+                                    },
+                                ),
+                            ),
+                        }),
+                    };
+                    // Build pool inputs using the NCHW-transposed input name
+                    let mut overrides_for_pool = operand_name_overrides.clone();
+                    overrides_for_pool.insert(input_id, nchw_input_name);
+                    let pool_input_names =
+                        Self::input_names_for_operation(graph_info, op, &overrides_for_pool);
+                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                    let pool_op = self.convert_operation_with_input_names_and_outputs(
+                        graph_info,
+                        op,
+                        &pool_input_names,
+                        vec![nchw_pool_output_type],
+                        mil_op_type,
+                    )?;
+                    main_block.operations.push(pool_op);
+
+                    // Post-transpose: NCHW [N,C,H',W'] -> NHWC [N,H',W',C], perm=[0,2,3,1]
+                    let post_tp_perm = [0u32, 2, 3, 1];
+                    let mut post_tp_inputs: HashMap<String, Argument> = HashMap::new();
+                    post_tp_inputs.insert(
+                        "x".to_string(),
+                        Self::create_name_argument(nchw_pool_output_name),
+                    );
+                    post_tp_inputs.insert(
+                        "perm".to_string(),
+                        Self::create_immediate_int_array(&post_tp_perm),
+                    );
+                    main_block.operations.push(Self::create_mil_operation(
+                        "transpose",
+                        post_tp_inputs,
+                        vec![output_type],
+                    ));
+
+                    // Flush deferred transposes for this output
+                    if let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                    {
+                        main_block.operations.extend(pending_ops);
+                        operand_name_overrides.insert(output_id, transposed_name);
+                    }
+                    continue;
+                }
+            }
+
+            // Special handling for reduce ops on 0D (scalar) inputs.
+            // CoreML requires at least rank-1 inputs for reduce operations.
+            // Wrap: reshape([] -> [1]), reduce(axes=[0], keep_dims=False), reshape([1] -> []) if needed.
+            let is_reduce_op = matches!(
+                op_type_lower.as_str(),
+                "reducesum"
+                    | "reducemean"
+                    | "reducemax"
+                    | "reducemin"
+                    | "reduceproduct"
+                    | "reducel1"
+                    | "reducel2"
+                    | "reducelogsum"
+                    | "reducelogsumexp"
+                    | "reducesumsquare"
+            );
+            if is_reduce_op {
+                let maybe_0d_input = op.input_operands().first().and_then(|&id| {
+                    graph_info
+                        .operand(id)
+                        .filter(|o| o.descriptor.shape.is_empty())
+                        .map(|o| (id, o.descriptor.data_type.clone()))
+                });
+                if let Some((input_id, input_dtype)) = maybe_0d_input {
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        input_id,
+                        &operand_name_overrides,
+                    );
+                    let reshaped_input_name = format!("{}_reduce1d", input_name);
+                    let mil_dtype = Self::mil_data_type(&input_dtype)?;
+
+                    // Build the [1] dimension for the reshaped input
+                    let one_dim = Dimension {
+                        dimension: Some(dimension::Dimension::Constant(
+                            dimension::ConstantDimension { size: 1 },
+                        )),
+                    };
+                    let reshaped_input_type = NamedValueType {
+                        name: reshaped_input_name.clone(),
+                        r#type: Some(ValueType {
+                            r#type: Some(
+                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                    TensorType {
+                                        rank: 1,
+                                        data_type: mil_dtype,
+                                        dimensions: vec![one_dim],
+                                        attributes: HashMap::new(),
+                                    },
+                                ),
+                            ),
+                        }),
+                    };
+
+                    // Emit: reshape(x=input, shape=[1]) -> reshaped_input_name
+                    let mut reshape_inputs: HashMap<String, Argument> = HashMap::new();
+                    reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                    reshape_inputs.insert(
+                        "shape".to_string(),
+                        Self::create_immediate_int_array(&[1u32]),
+                    );
+                    main_block.operations.push(Self::create_mil_operation(
+                        "reshape",
+                        reshape_inputs,
+                        vec![reshaped_input_type],
+                    ));
+
+                    // Override the input operand name so create_operation_inputs uses the 1D version
+                    let mut overrides_with_reshape = operand_name_overrides.clone();
+                    overrides_with_reshape.insert(input_id, reshaped_input_name.clone());
+
+                    // Get the output operand
+                    let output_id =
+                        op.output_operand()
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!(
+                                    "reduce op '{}' has no output operand",
+                                    op.op_type()
+                                ),
+                            })?;
+                    let output_operand = graph_info.operand(output_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("Output operand {} not found", output_id),
+                        }
+                    })?;
+                    let webnn_output_is_0d = output_operand.descriptor.shape.is_empty();
+
+                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                    let input_names =
+                        Self::input_names_for_operation(graph_info, op, &overrides_with_reshape);
+
+                    if webnn_output_is_0d {
+                        // The reduce will output [1] (axes=[0], keep_dims would give [1])
+                        // but we need [] — use a reduce-to-scalar intermediate then reshape.
+                        let (output_name, output_type) = Self::create_output_value(
+                            graph_info,
+                            output_id,
+                            &operand_name_overrides,
+                        )?;
+                        let reduce_intermediate_name = format!("{}_reduce_1d", output_name);
+                        let reduce_intermediate_type = NamedValueType {
+                            name: reduce_intermediate_name.clone(),
+                            r#type: Some(ValueType {
+                                r#type: Some(
+                                    crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                        TensorType {
+                                            rank: 1,
+                                            data_type: mil_dtype,
+                                            dimensions: vec![Dimension {
+                                                dimension: Some(dimension::Dimension::Constant(
+                                                    dimension::ConstantDimension { size: 1 },
+                                                )),
+                                            }],
+                                            attributes: HashMap::new(),
+                                        },
+                                    ),
+                                ),
+                            }),
+                        };
+
+                        // Build reduce inputs manually: x=reshaped, axes=[0], keep_dims=True
+                        // so the output stays [1] (which we can reshape to [])
+                        let mut reduce_inputs: HashMap<String, Argument> = HashMap::new();
+                        if let Some(first) = input_names.first() {
+                            reduce_inputs.insert("x".to_string(), Self::create_argument(first));
+                        }
+                        reduce_inputs.insert(
+                            "axes".to_string(),
+                            Self::create_immediate_int_array(&[0u32]),
+                        );
+                        reduce_inputs
+                            .insert("keep_dims".to_string(), Self::create_immediate_bool(true));
+                        main_block.operations.push(Self::create_mil_operation(
+                            mil_op_type,
+                            reduce_inputs,
+                            vec![reduce_intermediate_type],
+                        ));
+
+                        // Reshape [1] -> []
+                        let mut reshape_back: HashMap<String, Argument> = HashMap::new();
+                        reshape_back.insert(
+                            "x".to_string(),
+                            Self::create_name_argument(reduce_intermediate_name),
+                        );
+                        reshape_back
+                            .insert("shape".to_string(), Self::create_immediate_int_array(&[]));
+                        main_block.operations.push(Self::create_mil_operation(
+                            "reshape",
+                            reshape_back,
+                            vec![output_type],
+                        ));
+                    } else {
+                        // Output is not 0D — just emit normally with the 1D input override
+                        let mil_op = self.convert_operation_with_overrides(
+                            graph_info,
+                            op,
+                            &overrides_with_reshape,
+                        )?;
+                        main_block.operations.push(mil_op);
+                    }
+                    continue;
+                }
             }
 
             let mil_op =
