@@ -1478,6 +1478,514 @@ impl CoremlMlProgramConverter {
         Some(pad)
     }
 
+    /// Whether a quantize/dequantize with this quantized integer type and scale shape
+    /// can use CoreML's native `quantize`/`dequantize`. CoreML supports only int8/uint8
+    /// quantized tensors with a scalar (per-tensor) or single-axis 1-D (per-channel)
+    /// scale; int32 tensors, block-wise scales, and multi-axis scales are not supported
+    /// and must be decomposed into elementwise arithmetic.
+    fn qdq_native_supported(
+        quant_dtype: &DataType,
+        input_shape: &[u32],
+        scale_shape: &[u32],
+    ) -> bool {
+        if !matches!(quant_dtype, DataType::Int8 | DataType::Uint8) {
+            return false;
+        }
+        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
+        // per-tensor (scalar), or per-channel (one non-unit dim equal to some input dim).
+        squeezed.is_empty() || (squeezed.len() == 1 && input_shape.contains(&squeezed[0]))
+    }
+
+    /// Whether a quantize/dequantize op must be lowered to elementwise arithmetic because
+    /// CoreML's native op can't express it. int4/uint4 tensors are excluded (they cannot
+    /// be materialized at all) and scalar tensors keep the native rank-0 fast path.
+    fn qdq_should_decompose(graph: &GraphInfo, op: &Operation) -> bool {
+        let (quant_id, tensor_shape_id, scale_id) = match op {
+            // dequantize: the quantized tensor is the input; its type/shape drive the check.
+            Operation::DequantizeLinear { input, scale, .. } => (*input, *input, *scale),
+            // quantize: the quantized tensor is the output; the float input carries the shape.
+            Operation::QuantizeLinear { input, scale, .. } => match op.output_operand() {
+                Some(out) => (out, *input, *scale),
+                None => return false,
+            },
+            _ => return false,
+        };
+        let (Some(quant_op), Some(tensor_op), Some(scale_op)) = (
+            graph.operand(quant_id),
+            graph.operand(tensor_shape_id),
+            graph.operand(scale_id),
+        ) else {
+            return false;
+        };
+        let quant_dt = quant_op.descriptor.data_type.clone();
+        if matches!(quant_dt, DataType::Int4 | DataType::Uint4) {
+            return false;
+        }
+        if tensor_op.descriptor.shape.is_empty() {
+            return false;
+        }
+        let tensor_shape = tensor_op.descriptor.static_or_max_shape();
+        let scale_shape = scale_op.descriptor.static_or_max_shape();
+        !Self::qdq_native_supported(&quant_dt, &tensor_shape, &scale_shape)
+    }
+
+    /// Build a value type for a concrete static `shape` with the given MIL dtype.
+    fn value_type_for_static_shape(name: String, dtype: i32, shape: &[u32]) -> NamedValueType {
+        let dims: Vec<GraphDimension> = shape.iter().map(|&d| GraphDimension::Static(d)).collect();
+        Self::create_named_value_type(name, dtype, &dims, false)
+    }
+
+    /// Compute reshape targets that make a block-wise quantization scale broadcast against
+    /// the tensor. Each axis `i` where `1 < scale[i] < input[i]` is split into
+    /// `[scale[i], input[i]/scale[i]]` for the tensor and `[scale[i], 1]` for the scale;
+    /// per-tensor/per-element axes keep their single dim (ordinary broadcasting applies).
+    /// Splitting only genuine block axes keeps the rank low (CoreML reshape allows rank <= 5).
+    /// Returns `(interleaved_input_shape, interleaved_scale_shape)`.
+    fn qdq_interleave_shapes(
+        input_shape: &[u32],
+        scale_shape: &[u32],
+    ) -> Result<(Vec<u32>, Vec<u32>), GraphError> {
+        let rank = input_shape.len();
+        // WebNN block dims right-align with the input.
+        let mut aligned = vec![1u32; rank];
+        if scale_shape.len() <= rank {
+            let off = rank - scale_shape.len();
+            for (i, &d) in scale_shape.iter().enumerate() {
+                aligned[off + i] = d;
+            }
+        }
+        let mut interleaved_input: Vec<u32> = Vec::with_capacity(rank * 2);
+        let mut interleaved_scale: Vec<u32> = Vec::with_capacity(rank * 2);
+        for i in 0..rank {
+            let nb = aligned[i].max(1);
+            if input_shape[i] % nb != 0 {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!(
+                        "quantize/dequantize: input dim {} not divisible by scale dim {}",
+                        input_shape[i], nb
+                    ),
+                });
+            }
+            let block = input_shape[i] / nb;
+            if nb > 1 && block > 1 {
+                interleaved_input.push(nb);
+                interleaved_input.push(block);
+                interleaved_scale.push(nb);
+                interleaved_scale.push(1);
+            } else {
+                interleaved_input.push(input_shape[i]);
+                interleaved_scale.push(nb);
+            }
+        }
+        Ok((interleaved_input, interleaved_scale))
+    }
+
+    /// Lower `dequantizeLinear` as `(input - zeroPoint) * scale` in elementwise form.
+    ///
+    /// Handles quantized types and scale shapes CoreML's native `dequantize` cannot:
+    /// int32 tensors, block-wise scales, and multi-axis scales. Block quantization is
+    /// expressed by reshaping each axis `i` of length `input[i]` into `[scale[i],
+    /// block[i]]` (with `block[i] = input[i]/scale[i]`) and the scale/zeroPoint into
+    /// `[scale[i], 1]`, so ordinary broadcasting applies; the result is reshaped back.
+    fn emit_dequantize_decomposition(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        main_block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let (input_id, scale_id, zp_id) = match op {
+            Operation::DequantizeLinear {
+                input,
+                scale,
+                zero_point,
+                ..
+            } => (*input, *scale, *zero_point),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "emit_dequantize_decomposition called on non-dequantize op".to_string(),
+                });
+            }
+        };
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "dequantizeLinear has no output operand".to_string(),
+            })?;
+        let input_op = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("dequantize input operand {} not found", input_id),
+            })?;
+        let scale_op = graph
+            .operand(scale_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("dequantize scale operand {} not found", scale_id),
+            })?;
+        let input_shape = input_op.descriptor.static_or_max_shape();
+        let scale_shape = scale_op.descriptor.static_or_max_shape();
+
+        // Output MIL dtype is the (float) scale/output type.
+        let out_dtype = Self::mil_data_type(
+            &graph
+                .operand(output_id)
+                .ok_or_else(|| GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!("dequantize output operand {} not found", output_id),
+                })?
+                .descriptor
+                .data_type,
+        )?;
+        let float_str = Self::cast_dtype_string_for_mil_type(out_dtype)?;
+        let (output_name, output_type) = Self::create_output_value(graph, output_id, overrides)?;
+
+        let (interleaved_input, interleaved_scale) =
+            Self::qdq_interleave_shapes(&input_shape, &scale_shape)?;
+
+        // 1. cast input -> float, reshape to interleaved.
+        let input_name = Self::output_name_for_operand(graph, input_id, overrides);
+        let in_f_name = format!("{}_dq_in_f", output_name);
+        let in_f_type =
+            Self::value_type_for_static_shape(in_f_name.clone(), out_dtype, &input_shape);
+        main_block.operations.push(Self::create_cast_operation(
+            input_name, in_f_type, float_str,
+        ));
+        let in_r_name = format!("{}_dq_in_r", output_name);
+        let in_r_type =
+            Self::value_type_for_static_shape(in_r_name.clone(), out_dtype, &interleaved_input);
+        let mut in_reshape = HashMap::new();
+        in_reshape.insert("x".to_string(), Self::create_name_argument(in_f_name));
+        in_reshape.insert(
+            "shape".to_string(),
+            Self::create_immediate_int_array(&interleaved_input),
+        );
+        main_block.operations.push(Self::create_mil_operation(
+            "reshape",
+            in_reshape,
+            vec![in_r_type],
+        ));
+
+        // 2. scale -> reshape to interleaved.
+        let scale_name = operand_name(graph, scale_id);
+        let scale_r_name = format!("{}_dq_scale_r", output_name);
+        let scale_r_type =
+            Self::value_type_for_static_shape(scale_r_name.clone(), out_dtype, &interleaved_scale);
+        let mut scale_reshape = HashMap::new();
+        scale_reshape.insert("x".to_string(), Self::create_name_argument(scale_name));
+        scale_reshape.insert(
+            "shape".to_string(),
+            Self::create_immediate_int_array(&interleaved_scale),
+        );
+        main_block.operations.push(Self::create_mil_operation(
+            "reshape",
+            scale_reshape,
+            vec![scale_r_type],
+        ));
+
+        // 3. (input - zeroPoint), if a zero_point is present.
+        let minus_zp_name = if let Some(zp_id) = zp_id {
+            let zp_name = operand_name(graph, zp_id);
+            let zp_f_name = format!("{}_dq_zp_f", output_name);
+            let zp_f_type =
+                Self::value_type_for_static_shape(zp_f_name.clone(), out_dtype, &scale_shape);
+            main_block
+                .operations
+                .push(Self::create_cast_operation(zp_name, zp_f_type, float_str));
+            let zp_r_name = format!("{}_dq_zp_r", output_name);
+            let zp_r_type =
+                Self::value_type_for_static_shape(zp_r_name.clone(), out_dtype, &interleaved_scale);
+            let mut zp_reshape = HashMap::new();
+            zp_reshape.insert("x".to_string(), Self::create_name_argument(zp_f_name));
+            zp_reshape.insert(
+                "shape".to_string(),
+                Self::create_immediate_int_array(&interleaved_scale),
+            );
+            main_block.operations.push(Self::create_mil_operation(
+                "reshape",
+                zp_reshape,
+                vec![zp_r_type],
+            ));
+            let sub_name = format!("{}_dq_sub", output_name);
+            let sub_type =
+                Self::value_type_for_static_shape(sub_name.clone(), out_dtype, &interleaved_input);
+            let mut sub_inputs = HashMap::new();
+            sub_inputs.insert("x".to_string(), Self::create_name_argument(in_r_name));
+            sub_inputs.insert("y".to_string(), Self::create_name_argument(zp_r_name));
+            main_block.operations.push(Self::create_mil_operation(
+                mil_ops::SUB,
+                sub_inputs,
+                vec![sub_type],
+            ));
+            sub_name
+        } else {
+            in_r_name
+        };
+
+        // 4. multiply by scale, reshape back to the input shape.
+        let mul_name = format!("{}_dq_mul", output_name);
+        let mul_type =
+            Self::value_type_for_static_shape(mul_name.clone(), out_dtype, &interleaved_input);
+        let mut mul_inputs = HashMap::new();
+        mul_inputs.insert("x".to_string(), Self::create_name_argument(minus_zp_name));
+        mul_inputs.insert("y".to_string(), Self::create_name_argument(scale_r_name));
+        main_block.operations.push(Self::create_mil_operation(
+            mil_ops::MUL,
+            mul_inputs,
+            vec![mul_type],
+        ));
+
+        let mut out_reshape = HashMap::new();
+        out_reshape.insert("x".to_string(), Self::create_name_argument(mul_name));
+        out_reshape.insert(
+            "shape".to_string(),
+            Self::create_immediate_int_array(&input_shape),
+        );
+        main_block.operations.push(Self::create_mil_operation(
+            "reshape",
+            out_reshape,
+            vec![output_type],
+        ));
+        Ok(())
+    }
+
+    /// Lower `quantizeLinear` as `cast(clamp(round(input / scale) + zeroPoint, qmin, qmax))`
+    /// in elementwise form. Handles quantized types and scale shapes CoreML's native
+    /// `quantize` cannot: int32 outputs, block-wise scales, and multi-axis scales. Block
+    /// quantization uses the same reshape trick as the dequantize decomposition.
+    fn emit_quantize_decomposition(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        main_block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let (input_id, scale_id, zp_id) = match op {
+            Operation::QuantizeLinear {
+                input,
+                scale,
+                zero_point,
+                ..
+            } => (*input, *scale, *zero_point),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "emit_quantize_decomposition called on non-quantize op".to_string(),
+                });
+            }
+        };
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "quantizeLinear has no output operand".to_string(),
+            })?;
+        let input_op = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("quantize input operand {} not found", input_id),
+            })?;
+        let scale_op = graph
+            .operand(scale_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("quantize scale operand {} not found", scale_id),
+            })?;
+        let output_op = graph
+            .operand(output_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("quantize output operand {} not found", output_id),
+            })?;
+        let input_shape = input_op.descriptor.static_or_max_shape();
+        let scale_shape = scale_op.descriptor.static_or_max_shape();
+        let quant_dt = output_op.descriptor.data_type.clone();
+
+        // Compute in fp32 regardless of the input's float type: the output is an integer,
+        // so upcasting is safe and avoids fp16 rounding (e.g. an exact 12347 that fp16
+        // can't represent) and clip dtype-mismatch errors.
+        let float_dtype = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
+        let (output_name, output_type) = Self::create_output_value(graph, output_id, overrides)?;
+        let out_int_str = Self::cast_dtype_string_for_graph_type(&quant_dt)?;
+
+        let (interleaved_input, interleaved_scale) =
+            Self::qdq_interleave_shapes(&input_shape, &scale_shape)?;
+
+        // 1. cast input -> fp32, reshape to interleaved form.
+        let input_name = Self::output_name_for_operand(graph, input_id, overrides);
+        let in_f_name = format!("{}_q_in_f", output_name);
+        let in_f_type =
+            Self::value_type_for_static_shape(in_f_name.clone(), float_dtype, &input_shape);
+        main_block
+            .operations
+            .push(Self::create_cast_operation(input_name, in_f_type, "fp32"));
+        let in_r_name = format!("{}_q_in_r", output_name);
+        let in_r_type =
+            Self::value_type_for_static_shape(in_r_name.clone(), float_dtype, &interleaved_input);
+        let mut in_reshape = HashMap::new();
+        in_reshape.insert("x".to_string(), Self::create_name_argument(in_f_name));
+        in_reshape.insert(
+            "shape".to_string(),
+            Self::create_immediate_int_array(&interleaved_input),
+        );
+        main_block.operations.push(Self::create_mil_operation(
+            "reshape",
+            in_reshape,
+            vec![in_r_type],
+        ));
+
+        // 2. cast scale -> fp32, reshape to interleaved form.
+        let scale_name = operand_name(graph, scale_id);
+        let scale_f_name = format!("{}_q_scale_f", output_name);
+        let scale_f_type =
+            Self::value_type_for_static_shape(scale_f_name.clone(), float_dtype, &scale_shape);
+        main_block.operations.push(Self::create_cast_operation(
+            scale_name,
+            scale_f_type,
+            "fp32",
+        ));
+        let scale_r_name = format!("{}_q_scale_r", output_name);
+        let scale_r_type = Self::value_type_for_static_shape(
+            scale_r_name.clone(),
+            float_dtype,
+            &interleaved_scale,
+        );
+        let mut scale_reshape = HashMap::new();
+        scale_reshape.insert("x".to_string(), Self::create_name_argument(scale_f_name));
+        scale_reshape.insert(
+            "shape".to_string(),
+            Self::create_immediate_int_array(&interleaved_scale),
+        );
+        main_block.operations.push(Self::create_mil_operation(
+            "reshape",
+            scale_reshape,
+            vec![scale_r_type],
+        ));
+
+        // 3. div = input / scale, then round to nearest even.
+        let div_name = format!("{}_q_div", output_name);
+        let div_type =
+            Self::value_type_for_static_shape(div_name.clone(), float_dtype, &interleaved_input);
+        let mut div_inputs = HashMap::new();
+        div_inputs.insert("x".to_string(), Self::create_name_argument(in_r_name));
+        div_inputs.insert("y".to_string(), Self::create_name_argument(scale_r_name));
+        main_block.operations.push(Self::create_mil_operation(
+            mil_ops::DIV,
+            div_inputs,
+            vec![div_type],
+        ));
+        let round_name = format!("{}_q_round", output_name);
+        let round_type =
+            Self::value_type_for_static_shape(round_name.clone(), float_dtype, &interleaved_input);
+        let mut round_inputs = HashMap::new();
+        round_inputs.insert("x".to_string(), Self::create_name_argument(div_name));
+        main_block.operations.push(Self::create_mil_operation(
+            mil_ops::ROUND_EVEN,
+            round_inputs,
+            vec![round_type],
+        ));
+
+        // 4. add the zero_point (cast to float, reshaped), if present.
+        let biased_name = if let Some(zp_id) = zp_id {
+            let zp_name = operand_name(graph, zp_id);
+            let zp_f_name = format!("{}_q_zp_f", output_name);
+            let zp_f_type =
+                Self::value_type_for_static_shape(zp_f_name.clone(), float_dtype, &scale_shape);
+            main_block.operations.push(Self::create_cast_operation(
+                zp_name,
+                zp_f_type,
+                Self::cast_dtype_string_for_mil_type(float_dtype)?,
+            ));
+            let zp_r_name = format!("{}_q_zp_r", output_name);
+            let zp_r_type = Self::value_type_for_static_shape(
+                zp_r_name.clone(),
+                float_dtype,
+                &interleaved_scale,
+            );
+            let mut zp_reshape = HashMap::new();
+            zp_reshape.insert("x".to_string(), Self::create_name_argument(zp_f_name));
+            zp_reshape.insert(
+                "shape".to_string(),
+                Self::create_immediate_int_array(&interleaved_scale),
+            );
+            main_block.operations.push(Self::create_mil_operation(
+                "reshape",
+                zp_reshape,
+                vec![zp_r_type],
+            ));
+            let add_name = format!("{}_q_add", output_name);
+            let add_type = Self::value_type_for_static_shape(
+                add_name.clone(),
+                float_dtype,
+                &interleaved_input,
+            );
+            let mut add_inputs = HashMap::new();
+            add_inputs.insert("x".to_string(), Self::create_name_argument(round_name));
+            add_inputs.insert("y".to_string(), Self::create_name_argument(zp_r_name));
+            main_block.operations.push(Self::create_mil_operation(
+                "add",
+                add_inputs,
+                vec![add_type],
+            ));
+            add_name
+        } else {
+            round_name
+        };
+
+        // 5. clamp to the quantized type's range (int8/uint8; int32 needs no clamp).
+        let clamped_name = match quant_dt {
+            DataType::Int8 | DataType::Uint8 => {
+                let (qmin, qmax) = if matches!(quant_dt, DataType::Uint8) {
+                    (0.0f32, 255.0f32)
+                } else {
+                    (-128.0f32, 127.0f32)
+                };
+                let clip_name = format!("{}_q_clip", output_name);
+                let clip_type = Self::value_type_for_static_shape(
+                    clip_name.clone(),
+                    float_dtype,
+                    &interleaved_input,
+                );
+                let mut clip_inputs = HashMap::new();
+                clip_inputs.insert("x".to_string(), Self::create_name_argument(biased_name));
+                clip_inputs.insert("alpha".to_string(), Self::create_immediate_float(qmin));
+                clip_inputs.insert("beta".to_string(), Self::create_immediate_float(qmax));
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_ops::CLIP,
+                    clip_inputs,
+                    vec![clip_type],
+                ));
+                clip_name
+            }
+            _ => biased_name,
+        };
+
+        // 6. reshape back to the output shape (still float), then cast to the int type.
+        let out_f_name = format!("{}_q_out_f", output_name);
+        let out_f_type =
+            Self::value_type_for_static_shape(out_f_name.clone(), float_dtype, &input_shape);
+        let mut out_reshape = HashMap::new();
+        out_reshape.insert("x".to_string(), Self::create_name_argument(clamped_name));
+        out_reshape.insert(
+            "shape".to_string(),
+            Self::create_immediate_int_array(&input_shape),
+        );
+        main_block.operations.push(Self::create_mil_operation(
+            "reshape",
+            out_reshape,
+            vec![out_f_type],
+        ));
+        main_block.operations.push(Self::create_cast_operation(
+            out_f_name,
+            output_type,
+            out_int_str,
+        ));
+        Ok(())
+    }
+
     /// Create inputs map for MIL operation
     fn create_operation_inputs(
         &self,
@@ -3019,6 +3527,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             let op_lower = op.op_type().to_lowercase();
             if matches!(op_lower.as_str(), "quantizelinear" | "dequantizelinear") {
                 let input_ids = op.input_operands();
+                // Skip decomposed quantize/dequantize ops: they consume scale/zero_point in
+                // their native dtype and shape (see emit_*_decomposition), so the per-channel
+                // squeeze and int8 zero_point coercion below must not apply.
+                if Self::qdq_should_decompose(graph_info, op) {
+                    continue;
+                }
                 // Squeeze shape for both scale (index 1) and zero_point (index 2).
                 // CoreML interprets a rank-1 scale as per-channel; for per-tensor semantics,
                 // scale/zp must be scalar. Squeeze rank > 1 AND rank-1 with single element [1].
@@ -5259,6 +5773,29 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     main_block.operations.extend(pending_ops);
                     operand_name_overrides.insert(output_id, transposed_name);
                 }
+                continue;
+            }
+
+            // quantize/dequantize that CoreML's native op can't express (int32 tensors,
+            // block-wise or multi-axis scales) is lowered to elementwise arithmetic.
+            // int4/uint4 tensors can't be materialized at all, so leave those to the native
+            // path (which errors) rather than decomposing.
+            if op_type_lower == "dequantizelinear" && Self::qdq_should_decompose(graph_info, op) {
+                Self::emit_dequantize_decomposition(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                continue;
+            }
+            if op_type_lower == "quantizelinear" && Self::qdq_should_decompose(graph_info, op) {
+                Self::emit_quantize_decomposition(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
                 continue;
             }
 
