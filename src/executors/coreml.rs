@@ -615,11 +615,20 @@ unsafe fn fill_multiarray_from_bytes(
 /// Used when CoreML promotes an input type (e.g. uint8 boolean → float32).
 fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count: usize) -> Vec<u8> {
     match (src_dtype, target_code) {
-        (DataType::Uint8 | DataType::Int8, 32) => {
-            // bool/uint8 → float32: 0→0.0, 1→1.0 (used for boolean condition inputs)
+        (DataType::Uint8, 32) => {
+            // uint8/bool → float32: 0→0.0, 1→1.0 (also used for boolean condition inputs)
             let mut out = Vec::with_capacity(count * 4);
             for &b in src.iter().take(count) {
                 out.extend_from_slice(&(b as f32).to_le_bytes());
+            }
+            out
+        }
+        (DataType::Int8, 32) => {
+            // int8 → float32: reinterpret the byte as signed so negatives are preserved
+            // (a raw `b as f32` would turn -128 into 128.0).
+            let mut out = Vec::with_capacity(count * 4);
+            for &b in src.iter().take(count) {
+                out.extend_from_slice(&((b as i8) as f32).to_le_bytes());
             }
             out
         }
@@ -752,7 +761,10 @@ fn convert_multiarray_bytes(actual_bytes: Vec<u8>, actual_code: i32, target: Dat
             let src =
                 unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const f32, count) };
             match target {
-                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
+                DataType::Uint8 => src.iter().map(|&v| v as u8).collect(),
+                // f32 -> int8: go through i8 so negatives keep their bit pattern
+                // (`v as u8` saturates a negative float to 0).
+                DataType::Int8 => src.iter().map(|&v| (v as i8) as u8).collect(),
                 DataType::Int32 | DataType::Uint32 => {
                     let mut out = Vec::with_capacity(count * 4);
                     for &v in src {
@@ -775,9 +787,14 @@ fn convert_multiarray_bytes(actual_bytes: Vec<u8>, actual_code: i32, target: Dat
             let src =
                 unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const u16, count) };
             match target {
-                DataType::Uint8 | DataType::Int8 => src
+                DataType::Uint8 => src
                     .iter()
                     .map(|&bits| half::f16::from_bits(bits).to_f32() as u8)
+                    .collect(),
+                // f16 -> int8: go through i8 so negatives keep their bit pattern.
+                DataType::Int8 => src
+                    .iter()
+                    .map(|&bits| (half::f16::from_bits(bits).to_f32() as i8) as u8)
                     .collect(),
                 DataType::Float32 => {
                     let mut out = Vec::with_capacity(count * 4);
