@@ -3368,9 +3368,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     } else {
                         f32::MAX
                     };
+                    let max_val_arg = if input_dtype == DataType::Float16 {
+                        Self::create_immediate_float16(max_val)
+                    } else {
+                        Self::create_immediate_float(max_val)
+                    };
                     let mut gt_inputs = HashMap::new();
                     gt_inputs.insert("x".to_string(), Self::create_name_argument(abs_name));
-                    gt_inputs.insert("y".to_string(), Self::create_immediate_float(max_val));
+                    gt_inputs.insert("y".to_string(), max_val_arg);
                     main_block.operations.push(Self::create_mil_operation(
                         mil_ops::GREATER,
                         gt_inputs,
@@ -3395,6 +3400,98 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 continue;
             }
 
+            // Prelu decomposition: select(x >= 0, x, x * alpha).
+            // CoreML native prelu has strict constraints: alpha must be 1D const, x rank >= 2.
+            // The element-wise decomposition handles all shapes, broadcasting, and non-constant
+            // alpha without any of those constraints.
+            if op_type_lower == "prelu" {
+                if let (Some(&x_id), Some(&alpha_id)) =
+                    (op.input_operands().first(), op.input_operands().get(1))
+                {
+                    if let Some(output_id) = op.output_operand() {
+                        let x_operand = graph_info.operand(x_id).ok_or_else(|| {
+                            GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("prelu input operand {} not found", x_id),
+                            }
+                        })?;
+                        let input_dtype = &x_operand.descriptor.data_type;
+                        let is_float16 = *input_dtype == DataType::Float16;
+                        let mil_dtype = Self::mil_data_type(input_dtype)?;
+                        let (output_name, output_type) = Self::create_output_value(
+                            graph_info,
+                            output_id,
+                            &operand_name_overrides,
+                        )?;
+                        let x_name = Self::output_name_for_operand(
+                            graph_info,
+                            x_id,
+                            &operand_name_overrides,
+                        );
+                        let alpha_name = Self::output_name_for_operand(
+                            graph_info,
+                            alpha_id,
+                            &operand_name_overrides,
+                        );
+
+                        // cond = greater_equal(x, 0): bool, same shape as x (not the broadcast output)
+                        let cond_name = format!("{}_prelu_cond", output_name);
+                        let cond_type = Self::create_value_with_mil_type(
+                            graph_info,
+                            x_id,
+                            cond_name.clone(),
+                            crate::protos::coreml::mil_spec::DataType::Bool as i32,
+                        )?;
+                        let zero_arg = if is_float16 {
+                            Self::create_immediate_float16(0.0)
+                        } else {
+                            Self::create_immediate_float(0.0)
+                        };
+                        let mut cond_inputs = HashMap::new();
+                        cond_inputs
+                            .insert("x".to_string(), Self::create_name_argument(x_name.clone()));
+                        cond_inputs.insert("y".to_string(), zero_arg);
+                        main_block.operations.push(Self::create_mil_operation(
+                            mil_ops::GREATER_EQUAL,
+                            cond_inputs,
+                            vec![cond_type],
+                        ));
+
+                        // neg_branch = mul(x, alpha): same dtype as x
+                        let neg_name = format!("{}_prelu_neg", output_name);
+                        let neg_type = Self::create_value_with_mil_type(
+                            graph_info,
+                            output_id,
+                            neg_name.clone(),
+                            mil_dtype,
+                        )?;
+                        let mut mul_inputs = HashMap::new();
+                        mul_inputs
+                            .insert("x".to_string(), Self::create_name_argument(x_name.clone()));
+                        mul_inputs.insert("y".to_string(), Self::create_name_argument(alpha_name));
+                        main_block.operations.push(Self::create_mil_operation(
+                            mil_ops::MUL,
+                            mul_inputs,
+                            vec![neg_type],
+                        ));
+
+                        // output = select(cond, x, neg_branch)
+                        let mut sel_inputs = HashMap::new();
+                        sel_inputs
+                            .insert("cond".to_string(), Self::create_name_argument(cond_name));
+                        sel_inputs.insert("a".to_string(), Self::create_name_argument(x_name));
+                        sel_inputs.insert("b".to_string(), Self::create_name_argument(neg_name));
+                        main_block.operations.push(Self::create_mil_operation(
+                            mil_ops::WHERE,
+                            sel_inputs,
+                            vec![output_type],
+                        ));
+
+                        continue;
+                    }
+                }
+            }
+
             // Special handling for clamp with equal bounds.
             // CoreML clip rejects alpha == beta, while WebNN clamp(min==max) is valid and
             // should produce a constant tensor. Lower as: output = input * 0 + bound.
@@ -3411,6 +3508,83 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         .unwrap_or((f64::NEG_INFINITY, f64::INFINITY)),
                     _ => (f64::NEG_INFINITY, f64::INFINITY),
                 };
+
+                // For integer inputs (int8, uint8, int32), CoreML clip only accepts float.
+                // Cast: int → fp32, clip, cast back to int.
+                // Only int8/uint8/int32 are supported because CoreML cast cannot produce uint32/int64.
+                {
+                    let input_id = op.input_operands().first().copied();
+                    let output_id_opt = op.output_operand();
+                    if let (Some(input_id), Some(output_id)) = (input_id, output_id_opt) {
+                        if let Some(input_op) = graph_info.operand(input_id) {
+                            let int_dtype = &input_op.descriptor.data_type;
+                            let is_castable_int = matches!(
+                                int_dtype,
+                                DataType::Int8 | DataType::Uint8 | DataType::Int32
+                            );
+                            if is_castable_int {
+                                let int_name = Self::output_name_for_operand(
+                                    graph_info,
+                                    input_id,
+                                    &operand_name_overrides,
+                                );
+                                let (output_name, output_type) = Self::create_output_value(
+                                    graph_info,
+                                    output_id,
+                                    &operand_name_overrides,
+                                )?;
+
+                                // Cast int input to float32
+                                let float_name = format!("{}_clamp_float", output_name);
+                                let float_type = Self::create_value_with_mil_type(
+                                    graph_info,
+                                    output_id,
+                                    float_name.clone(),
+                                    crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                                )?;
+                                main_block.operations.push(Self::create_cast_operation(
+                                    int_name, float_type, "fp32",
+                                ));
+
+                                // Clip in float32
+                                let clipped_name = format!("{}_clamp_clipped", output_name);
+                                let clipped_type = Self::create_value_with_mil_type(
+                                    graph_info,
+                                    output_id,
+                                    clipped_name.clone(),
+                                    crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                                )?;
+                                let mut clip_inputs = HashMap::new();
+                                clip_inputs.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(float_name),
+                                );
+                                clip_inputs.insert(
+                                    "alpha".to_string(),
+                                    Self::create_immediate_float(min_value as f32),
+                                );
+                                clip_inputs.insert(
+                                    "beta".to_string(),
+                                    Self::create_immediate_float(max_value as f32),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    mil_ops::CLIP,
+                                    clip_inputs,
+                                    vec![clipped_type],
+                                ));
+
+                                // Cast back to the original int type
+                                let back_dtype = Self::cast_dtype_string_for_graph_type(int_dtype)?;
+                                main_block.operations.push(Self::create_cast_operation(
+                                    clipped_name,
+                                    output_type,
+                                    back_dtype,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 if min_value == max_value {
                     if op.input_operands().is_empty() || op.output_operand().is_none() {
