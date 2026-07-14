@@ -566,6 +566,35 @@ unsafe fn fill_multiarray_from_bytes(
     let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
         reason: format!("invalid element count: {count_obj}"),
     })?;
+    // int4/uint4 inputs arrive packed two-per-byte and are exposed as float32 at the
+    // model boundary; unpack the nibbles and write them into the float32 array.
+    if matches!(dtype, DataType::Int4 | DataType::Uint4) {
+        if count == 0 {
+            return Ok(());
+        }
+        let floats: Vec<f32> = if matches!(dtype, DataType::Int4) {
+            crate::graph::unpack_int4(src, count)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        } else {
+            crate::graph::unpack_uint4(src, count)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        };
+        let ptr: *mut c_void = msg_send![array, dataPointer];
+        if ptr.is_null() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
+            });
+        }
+        let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, count * 4);
+        for (i, f) in floats.iter().enumerate() {
+            dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        return Ok(());
+    }
     let elem = dtype.bytes_per_element();
     let expected = count.saturating_mul(elem);
     if src.len() != expected {
@@ -713,6 +742,50 @@ unsafe fn extract_multiarray_bytes(
     // the dtype (e.g. uint8 cast result returned as float32).
     let actual_dtype_code: i64 = msg_send![array, dataType];
     let actual_elem = ml_dtype_code_element_size(actual_dtype_code as i32).unwrap_or(4);
+
+    // int4/uint4 outputs are produced as int32 (the proxy). Read the int32 values and
+    // re-pack them two-per-byte into the sub-byte layout the host tensor expects.
+    if matches!(descriptor.data_type, DataType::Int4 | DataType::Uint4) {
+        let ptr: *const u8 = {
+            let p: *mut c_void = msg_send![array, dataPointer];
+            if p.is_null() {
+                return Err(GraphError::CoremlRuntimeFailed {
+                    reason: "output MLMultiArray has no backing buffer for int4/uint4".to_string(),
+                });
+            }
+            p as *const u8
+        };
+        let shape_ns: *mut Object = msg_send![array, shape];
+        let shape = unsafe { nsarray_to_i64_vec(shape_ns)? };
+        let strides_ns: *mut Object = msg_send![array, strides];
+        let strides = unsafe { nsarray_to_i64_vec(strides_ns)? };
+        let raw = if is_contiguous(&shape, &strides) {
+            unsafe { std::slice::from_raw_parts(ptr, count.saturating_mul(actual_elem)) }.to_vec()
+        } else {
+            unsafe { gather_strided_bytes(ptr, &shape, &strides, actual_elem) }
+        };
+        // Float codes (Float32 = 32/0x10020, Float16 = 16/0x10010) must be read as
+        // floats; int codes (Int32 = 3/0x20020) as integers. NOTE: 0x20020 (131104) is
+        // Int32, not Float32 — do not route it through normalize_dtype_code here.
+        let is_float = matches!(actual_dtype_code as i32, 32 | 65568 | 16 | 65552);
+        let ints: Vec<i32> = if is_float {
+            raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i32)
+                .collect()
+        } else {
+            raw.chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let packed = if matches!(descriptor.data_type, DataType::Int4) {
+            crate::graph::pack_int4(&ints)
+        } else {
+            let u: Vec<u8> = ints.iter().map(|&v| v as u8).collect();
+            crate::graph::pack_uint4(&u)
+        };
+        return Ok(packed);
+    }
+
     let expected_elem = descriptor.data_type.bytes_per_element();
 
     let ptr: *const u8 = {

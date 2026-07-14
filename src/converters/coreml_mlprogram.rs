@@ -451,13 +451,10 @@ impl CoremlMlProgramConverter {
     }
 
     /// MIL type used for an operand's value *inside* the graph. CoreML MIL has no
-    /// int64/uint32/uint64 tensor type, so those are represented as int32 (a proxy);
-    /// the model interface and executor reconcile the width/sign at the boundary.
+    /// int4/uint4/int64/uint32/uint64 tensor type, so those are represented as int32 (a
+    /// proxy); the model interface and executor reconcile width/sign/packing at the boundary.
     fn graph_value_mil_type(data_type: &DataType) -> Result<i32, GraphError> {
-        if matches!(
-            data_type,
-            DataType::Uint32 | DataType::Int64 | DataType::Uint64
-        ) {
+        if Self::is_wide_int(data_type) {
             Ok(crate::protos::coreml::mil_spec::DataType::Int32 as i32)
         } else {
             Self::mil_data_type(data_type)
@@ -465,11 +462,15 @@ impl CoremlMlProgramConverter {
     }
 
     /// Whether a WebNN type has no native MIL tensor representation and is proxied
-    /// through int32 inside the graph.
+    /// through int32 inside the graph (int4/uint4 sub-byte, and int64/uint32/uint64).
     fn is_wide_int(data_type: &DataType) -> bool {
         matches!(
             data_type,
-            DataType::Uint32 | DataType::Int64 | DataType::Uint64
+            DataType::Int4
+                | DataType::Uint4
+                | DataType::Uint32
+                | DataType::Int64
+                | DataType::Uint64
         )
     }
 
@@ -662,6 +663,39 @@ impl CoremlMlProgramConverter {
                     .data
                     .chunks_exact(8)
                     .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .collect();
+                TensorValue {
+                    value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
+                        values,
+                    })),
+                }
+            }
+            crate::graph::DataType::Int4 => {
+                // int4 is packed two values per byte; unpack (sign-extended) to int32.
+                let count: usize = operand
+                    .descriptor
+                    .static_or_max_shape()
+                    .iter()
+                    .map(|&d| d as usize)
+                    .product();
+                let values = crate::graph::unpack_int4(&constant_data.data, count);
+                TensorValue {
+                    value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
+                        values,
+                    })),
+                }
+            }
+            crate::graph::DataType::Uint4 => {
+                // uint4 is packed two values per byte; unpack to int32.
+                let count: usize = operand
+                    .descriptor
+                    .static_or_max_shape()
+                    .iter()
+                    .map(|&d| d as usize)
+                    .product();
+                let values: Vec<i32> = crate::graph::unpack_uint4(&constant_data.data, count)
+                    .into_iter()
+                    .map(|v| v as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -1518,11 +1552,10 @@ impl CoremlMlProgramConverter {
             return false;
         };
         let quant_dt = quant_op.descriptor.data_type.clone();
-        if matches!(quant_dt, DataType::Int4 | DataType::Uint4) {
-            return false;
-        }
         if tensor_op.descriptor.shape.is_empty() {
-            return false;
+            // Scalars normally use the native rank-0 fast path, but int4/uint4 have no
+            // native quantize/dequantize at all, so decompose them even when scalar.
+            return matches!(quant_dt, DataType::Int4 | DataType::Uint4);
         }
         let tensor_shape = tensor_op.descriptor.static_or_max_shape();
         let scale_shape = scale_op.descriptor.static_or_max_shape();
@@ -1995,7 +2028,11 @@ impl CoremlMlProgramConverter {
                 format: "coreml_mlprogram".to_string(),
                 reason: format!("dequantize scale operand {} not found", scale_id),
             })?;
-        let input_shape = input_op.descriptor.static_or_max_shape();
+        let input_shape: Vec<u32> = if input_op.descriptor.shape.is_empty() {
+            vec![1]
+        } else {
+            input_op.descriptor.static_or_max_shape()
+        };
         let scale_shape = scale_op.descriptor.static_or_max_shape();
 
         // Output MIL dtype is the (float) scale/output type.
@@ -2169,7 +2206,11 @@ impl CoremlMlProgramConverter {
                 format: "coreml_mlprogram".to_string(),
                 reason: format!("quantize output operand {} not found", output_id),
             })?;
-        let input_shape = input_op.descriptor.static_or_max_shape();
+        let input_shape: Vec<u32> = if input_op.descriptor.shape.is_empty() {
+            vec![1]
+        } else {
+            input_op.descriptor.static_or_max_shape()
+        };
         let scale_shape = scale_op.descriptor.static_or_max_shape();
         let quant_dt = output_op.descriptor.data_type.clone();
 
@@ -2178,7 +2219,10 @@ impl CoremlMlProgramConverter {
         // can't represent) and clip dtype-mismatch errors.
         let float_dtype = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
         let (output_name, output_type) = Self::create_output_value(graph, output_id, overrides)?;
-        let out_int_str = Self::cast_dtype_string_for_graph_type(&quant_dt)?;
+        // The quantized output is represented in the graph as its native MIL int type
+        // (int8/uint8) or, for the sub-byte/wide proxies (int4/uint4/...), as int32; the
+        // executor packs/narrows it to the true width on readback.
+        let out_int_str = Self::int_back_cast_dtype(&quant_dt)?;
 
         let (interleaved_input, interleaved_scale) =
             Self::qdq_interleave_shapes(&input_shape, &scale_shape)?;
@@ -2304,13 +2348,14 @@ impl CoremlMlProgramConverter {
             round_name
         };
 
-        // 5. clamp to the quantized type's range (int8/uint8; int32 needs no clamp).
+        // 5. clamp to the quantized type's range (int32 spans the proxy and needs no clamp).
         let clamped_name = match quant_dt {
-            DataType::Int8 | DataType::Uint8 => {
-                let (qmin, qmax) = if matches!(quant_dt, DataType::Uint8) {
-                    (0.0f32, 255.0f32)
-                } else {
-                    (-128.0f32, 127.0f32)
+            DataType::Int8 | DataType::Uint8 | DataType::Int4 | DataType::Uint4 => {
+                let (qmin, qmax) = match quant_dt {
+                    DataType::Uint8 => (0.0f32, 255.0f32),
+                    DataType::Int4 => (-8.0f32, 7.0f32),
+                    DataType::Uint4 => (0.0f32, 15.0f32),
+                    _ => (-128.0f32, 127.0f32),
                 };
                 let clip_name = format!("{}_q_clip", output_name);
                 let clip_type = Self::value_type_for_static_shape(
@@ -4671,13 +4716,10 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         format: "coreml_mlprogram".to_string(),
                         reason: format!("Input operand {} not found", input_id),
                     })?;
-            // int64/uint32/uint64 have no MIL tensor type; represent them internally
-            // as int32 (a proxy). The fp32 model input is cast to int32 here; the
-            // executor delivers the original integer values widened to float32.
-            let is_wide_int = matches!(
-                operand.descriptor.data_type,
-                DataType::Uint32 | DataType::Int64 | DataType::Uint64
-            );
+            // int4/uint4/int64/uint32/uint64 have no MIL tensor type; represent them
+            // internally as int32 (a proxy). The fp32 model input is cast to int32 here;
+            // the executor delivers the original integer values widened to float32.
+            let is_wide_int = Self::is_wide_int(&operand.descriptor.data_type);
             let graph_mil_type = if is_wide_int {
                 crate::protos::coreml::mil_spec::DataType::Int32 as i32
             } else {
@@ -9093,7 +9135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_int4_data_type_rejected() {
+    fn test_int4_data_type_supported() {
         let mut graph = GraphInfo {
             input_operands: vec![0],
             output_operands: vec![1],
@@ -9135,23 +9177,14 @@ mod tests {
             OperatorOptions::default(),
         ));
 
-        // Convert should fail with Int4
+        // int4 is now supported via the int32 proxy; conversion should succeed.
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph);
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            crate::error::GraphError::ConversionFailed { format, reason } => {
-                assert_eq!(format, "coreml");
-                assert!(reason.contains("int4/uint4"));
-                assert!(reason.contains("not supported"));
-            }
-            _ => panic!("Expected ConversionFailed error"),
-        }
+        assert!(result.is_ok(), "int4 should convert: {:?}", result.err());
     }
 
     #[test]
-    fn test_uint4_data_type_rejected() {
+    fn test_uint4_data_type_supported() {
         let mut graph = GraphInfo {
             input_operands: vec![],
             output_operands: vec![1],
@@ -9197,23 +9230,14 @@ mod tests {
             OperatorOptions::default(),
         ));
 
-        // Convert should fail with Uint4
+        // uint4 is now supported via the int32 proxy; conversion should succeed.
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph);
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            crate::error::GraphError::ConversionFailed { format, reason } => {
-                assert_eq!(format, "coreml");
-                assert!(reason.contains("int4/uint4"));
-                assert!(reason.contains("not supported"));
-            }
-            _ => panic!("Expected ConversionFailed error"),
-        }
+        assert!(result.is_ok(), "uint4 should convert: {:?}", result.err());
     }
 
     #[test]
-    fn test_int4_output_rejected() {
+    fn test_int4_output_supported() {
         let mut graph = GraphInfo {
             input_operands: vec![0],
             output_operands: vec![1],
@@ -9255,14 +9279,18 @@ mod tests {
             OperatorOptions::default(),
         ));
 
-        // Convert should fail
+        // int4 output is now supported via the int32 proxy; conversion should succeed.
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "int4 output should convert: {:?}",
+            result.err()
+        );
     }
 
     #[test]
-    fn test_uint4_input_rejected() {
+    fn test_uint4_input_supported() {
         let mut graph = GraphInfo {
             input_operands: vec![0],
             output_operands: vec![1],
@@ -9304,10 +9332,14 @@ mod tests {
             OperatorOptions::default(),
         ));
 
-        // Convert should fail
+        // uint4 input is now supported via the int32 proxy; conversion should succeed.
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "uint4 input should convert: {:?}",
+            result.err()
+        );
     }
 
     #[test]
