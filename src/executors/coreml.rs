@@ -589,7 +589,7 @@ unsafe fn fill_multiarray_from_bytes(
                 reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
             });
         }
-        let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, count * 4);
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, count * 4) };
         for (i, f) in floats.iter().enumerate() {
             dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
         }
@@ -628,7 +628,7 @@ unsafe fn fill_multiarray_from_bytes(
         }
         // Convert src bytes (dtype) → array bytes (canonical_code).
         let converted = convert_input_bytes(src, dtype, canonical_code, count);
-        let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, count * array_elem);
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, count * array_elem) };
         dst.copy_from_slice(&converted);
         return Ok(());
     }

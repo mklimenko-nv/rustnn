@@ -1992,10 +1992,10 @@ impl CoremlMlProgramConverter {
         let (pi_off, po_off, pf_off) = (0u32, h, 2 * h);
         let p = |s: &str| format!("{}_{}", prefix, s);
         let gate = |block: &mut Block,
-                        off: u32,
-                        act: &str,
-                        tag: &str,
-                        peep: Option<(u32, &str)>|
+                    off: u32,
+                    act: &str,
+                    tag: &str,
+                    peep: Option<(u32, &str)>|
          -> String {
             let wg = Self::rnn_slice(
                 block,
@@ -2793,10 +2793,10 @@ impl CoremlMlProgramConverter {
 
         // gate = activation(X·Wg^T + bg + H·Rg^T + rbg [+ pg ⊙ cstate])
         let gate = |block: &mut Block,
-                        off: u32,
-                        act: &str,
-                        tag: &str,
-                        peep: Option<(u32, &str)>|
+                    off: u32,
+                    act: &str,
+                    tag: &str,
+                    peep: Option<(u32, &str)>|
          -> String {
             let wg = Self::rnn_slice(
                 block,
