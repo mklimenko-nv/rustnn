@@ -6306,6 +6306,116 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     | "reducelogsumexp"
                     | "reducesumsquare"
             );
+            // WebNN reduce with an explicit empty `axes` list reduces over NO
+            // dimensions: the output shape equals the input shape, but the
+            // per-op element transform still applies (reduceL1 -> abs,
+            // reduceL2 -> abs, reduceLogSum -> log, reduceSumSquare -> square,
+            // reduceLogSumExp -> identity, etc.). CoreML's reduce with an
+            // omitted `axes` reduces ALL dimensions, so we instead append a
+            // singleton axis and reduce over it: reducing a one-element window
+            // yields exactly the WebNN empty-axes semantics for every reduce.
+            if is_reduce_op {
+                let axes_explicitly_empty = match op {
+                    Operation::ReduceSum { options, .. }
+                    | Operation::ReduceMean { options, .. }
+                    | Operation::ReduceMax { options, .. }
+                    | Operation::ReduceMin { options, .. }
+                    | Operation::ReduceProduct { options, .. }
+                    | Operation::ReduceL1 { options, .. }
+                    | Operation::ReduceL2 { options, .. }
+                    | Operation::ReduceLogSum { options, .. }
+                    | Operation::ReduceLogSumExp { options, .. }
+                    | Operation::ReduceSumSquare { options, .. } => options
+                        .as_ref()
+                        .and_then(|o| o.axes.as_ref())
+                        .map(|a| a.is_empty())
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if axes_explicitly_empty {
+                    let input_id = op.input_operands().first().copied().ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("reduce op '{}' has no input operand", op.op_type()),
+                        }
+                    })?;
+                    let output_id =
+                        op.output_operand()
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!(
+                                    "reduce op '{}' has no output operand",
+                                    op.op_type()
+                                ),
+                            })?;
+                    let input_op = graph_info.operand(input_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("Input operand {} not found", input_id),
+                        }
+                    })?;
+                    let mil_dtype = Self::mil_data_type(&input_op.descriptor.data_type)?;
+
+                    // Reshape input to [input_shape..., 1] and reduce over the new axis.
+                    let mut reshaped_shape_vals = input_op.descriptor.static_or_max_shape();
+                    reshaped_shape_vals.push(1);
+                    let reduce_axis = (reshaped_shape_vals.len() - 1) as u32;
+                    let mut reshaped_dims = input_op.descriptor.shape.clone();
+                    reshaped_dims.push(GraphDimension::Static(1));
+
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        input_id,
+                        &operand_name_overrides,
+                    );
+                    let (output_name, output_type) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+
+                    let reshaped_name = format!("{}_emptyaxes_rs", output_name);
+                    let reshaped_type = Self::create_named_value_type(
+                        reshaped_name.clone(),
+                        mil_dtype,
+                        &reshaped_dims,
+                        false,
+                    );
+                    let mut reshape_inputs: HashMap<String, Argument> = HashMap::new();
+                    reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                    reshape_inputs.insert(
+                        "shape".to_string(),
+                        Self::create_immediate_int_array(&reshaped_shape_vals),
+                    );
+                    main_block.operations.push(Self::create_mil_operation(
+                        "reshape",
+                        reshape_inputs,
+                        vec![reshaped_type],
+                    ));
+
+                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                    let mut reduce_inputs: HashMap<String, Argument> = HashMap::new();
+                    reduce_inputs
+                        .insert("x".to_string(), Self::create_name_argument(reshaped_name));
+                    reduce_inputs.insert(
+                        "axes".to_string(),
+                        Self::create_immediate_int_array(&[reduce_axis]),
+                    );
+                    reduce_inputs
+                        .insert("keep_dims".to_string(), Self::create_immediate_bool(false));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_op_type,
+                        reduce_inputs,
+                        vec![output_type],
+                    ));
+
+                    // Flush deferred transposes for this output.
+                    if let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                    {
+                        main_block.operations.extend(pending_ops);
+                        operand_name_overrides.insert(output_id, transposed_name);
+                    }
+                    continue;
+                }
+            }
             if is_reduce_op {
                 let maybe_0d_input = op.input_operands().first().and_then(|&id| {
                     graph_info
