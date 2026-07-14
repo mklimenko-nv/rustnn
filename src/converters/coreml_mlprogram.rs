@@ -530,10 +530,9 @@ impl CoremlMlProgramConverter {
 
                 if !is_scalar {
                     // Non-scalar Float16: add to weight file and return BlobFileValue
-                    let element_count = constant_data.data.len() / 2; // 2 bytes per f16
                     let offset = weight_builder.add_weight(
                         operand_id,
-                        element_count,
+                        super::weight_file_builder::blob_data_type::FLOAT16,
                         &constant_data.data,
                     )?;
 
@@ -5765,11 +5764,9 @@ mod tests {
 
         let graph = create_graph_with_float16_constant(s(&[3]), data.clone());
 
-        // Convert the graph
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph).unwrap();
 
-        // Verify weights_data is present
         assert!(
             result.weights_data.is_some(),
             "Non-scalar Float16 should use weight file"
@@ -5777,37 +5774,32 @@ mod tests {
 
         let weights = result.weights_data.unwrap();
 
-        // Verify weight file structure
-        // Expected structure:
-        // [0-3]: sentinel (0xDEADBEEF)
-        // [4-11]: count (3)
-        // [12-17]: data (6 bytes)
-        // [18-63]: padding (46 bytes)
-        assert_eq!(weights.len(), 64, "Weight file should be 64-byte aligned");
+        // v2 file layout:
+        // [0-63]    64-byte global header: count(u32)=1, version(u32)=2, 56 zero bytes
+        // [64-127]  64-byte WeightMetadata: sentinel, FLOAT16 type, size_in_bytes=6, payload_offset=128, zeros
+        // [128-133] 6 bytes payload
+        // [134-191] padding → total 192 bytes
 
-        // Verify sentinel
-        let sentinel = u32::from_le_bytes([weights[0], weights[1], weights[2], weights[3]]);
-        assert_eq!(sentinel, 0xDEADBEEF, "Sentinel should be 0xDEADBEEF");
+        // Global header
+        assert_eq!(&weights[0..4], &1u32.to_le_bytes(), "Entry count = 1");
+        assert_eq!(&weights[4..8], &2u32.to_le_bytes(), "File version = 2");
 
-        // Verify count
-        let count = u64::from_le_bytes([
-            weights[4],
-            weights[5],
-            weights[6],
-            weights[7],
-            weights[8],
-            weights[9],
-            weights[10],
-            weights[11],
-        ]);
-        assert_eq!(count, 3, "Element count should be 3");
-
-        // Verify data
+        // WeightMetadata at offset 64
+        assert_eq!(&weights[64..68], &0xDEADBEEFu32.to_le_bytes(), "Sentinel");
         assert_eq!(
-            &weights[12..18],
-            &data[..],
-            "Weight data should match input"
+            &weights[68..72],
+            &1u32.to_le_bytes(), // FLOAT16 = 1
+            "BlobDataType::FLOAT16"
         );
+        assert_eq!(&weights[72..80], &6u64.to_le_bytes(), "size_in_bytes = 6");
+        assert_eq!(
+            &weights[80..88],
+            &128u64.to_le_bytes(),
+            "payload at offset 128"
+        );
+
+        // Payload
+        assert_eq!(&weights[128..134], &data[..], "payload data");
     }
 
     #[test]
@@ -5822,11 +5814,9 @@ mod tests {
 
         let graph = create_graph_with_float16_constant(s(&[2, 2]), data.clone());
 
-        // Convert the graph
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph).unwrap();
 
-        // Verify weights_data is present
         assert!(
             result.weights_data.is_some(),
             "2D Float16 constant should use weight file"
@@ -5834,18 +5824,10 @@ mod tests {
 
         let weights = result.weights_data.unwrap();
 
-        // Verify count matches 2x2 = 4 elements
-        let count = u64::from_le_bytes([
-            weights[4],
-            weights[5],
-            weights[6],
-            weights[7],
-            weights[8],
-            weights[9],
-            weights[10],
-            weights[11],
-        ]);
-        assert_eq!(count, 4, "Element count should be 4");
+        // size_in_bytes = 8 (4 elements × 2 bytes each), located at [72..80] of metadata block
+        assert_eq!(&weights[72..80], &8u64.to_le_bytes(), "size_in_bytes = 8");
+        // Payload at offset 128
+        assert_eq!(&weights[128..136], &data[..], "payload data");
     }
 
     #[test]
@@ -5931,23 +5913,32 @@ mod tests {
 
         let weights = result.weights_data.unwrap();
 
-        // Should have two entries:
-        // Entry 1: offset 0, 64 bytes
-        // Entry 2: offset 64, 64 bytes
-        // Total: 128 bytes
+        // v2 layout for two 2-element Float16 constants (4 bytes each):
+        // [0-63]    global header (count=2, version=2, zeros)
+        // [64-127]  metadata1 (sentinel, FLOAT16, size=4, payload_offset=128, zeros)
+        // [128-131] payload1 (4 bytes), padded to [192]
+        // [192-255] metadata2 (sentinel, FLOAT16, size=4, payload_offset=256, zeros)
+        // [256-259] payload2 (4 bytes), padded to [320]
+        // Total: 320 bytes
+        assert_eq!(weights.len(), 320, "Two Float16 constants layout");
+
+        // Global header
+        assert_eq!(&weights[0..4], &2u32.to_le_bytes(), "Entry count = 2");
+        assert_eq!(&weights[4..8], &2u32.to_le_bytes(), "File version = 2");
+
+        // First entry sentinel at offset 64
         assert_eq!(
-            weights.len(),
-            128,
-            "Two Float16 constants should result in 128-byte weight file"
+            &weights[64..68],
+            &0xDEADBEEFu32.to_le_bytes(),
+            "First sentinel"
         );
 
-        // Verify first entry sentinel at offset 0
-        let sentinel1 = u32::from_le_bytes([weights[0], weights[1], weights[2], weights[3]]);
-        assert_eq!(sentinel1, 0xDEADBEEF, "First entry sentinel");
-
-        // Verify second entry sentinel at offset 64
-        let sentinel2 = u32::from_le_bytes([weights[64], weights[65], weights[66], weights[67]]);
-        assert_eq!(sentinel2, 0xDEADBEEF, "Second entry sentinel");
+        // Second entry sentinel at offset 192
+        assert_eq!(
+            &weights[192..196],
+            &0xDEADBEEFu32.to_le_bytes(),
+            "Second sentinel"
+        );
     }
 
     #[test]
