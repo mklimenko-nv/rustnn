@@ -72,6 +72,17 @@ fn convert_zp_bytes(src: &[u8], src_dtype: &DataType, tgt_dtype: &DataType) -> V
             }
             out
         }
+        // Uint32 → Int32: same 4 bytes, just reinterpreted as signed.
+        (DataType::Uint32, DataType::Int32) => src.to_vec(),
+        // Int64 → Int32: take the lower 4 bytes of each 8-byte element.
+        (DataType::Int64, DataType::Int32) => {
+            let count = src.len() / 8;
+            let mut out = Vec::with_capacity(count * 4);
+            for i in 0..count {
+                out.extend_from_slice(&src[i * 8..i * 8 + 4]);
+            }
+            out
+        }
         _ => src.to_vec(),
     }
 }
@@ -1897,12 +1908,19 @@ impl CoremlMlProgramConverter {
                         );
                     } else {
                         // window_dimensions is None or empty: infer kernel_sizes from input shape.
-                        // For NCHW (guaranteed above), shape = [N, C, H, W], spatial dims at [2], [3].
+                        // Layout determines which dims are H and W:
+                        //   NCHW → [N, C, H, W]: H=dim2, W=dim3
+                        //   NHWC → [N, H, W, C]: H=dim1, W=dim2
+                        let is_nhwc = opts.layout.eq_ignore_ascii_case("nhwc");
                         if let Some(&input_id) = op.input_operands().first() {
                             if let Some(input_op) = graph.operand(input_id) {
                                 let shape = input_op.descriptor.static_or_max_shape();
                                 if shape.len() >= 4 {
-                                    let kernel_sizes = vec![shape[2], shape[3]];
+                                    let kernel_sizes = if is_nhwc {
+                                        vec![shape[1], shape[2]]
+                                    } else {
+                                        vec![shape[2], shape[3]]
+                                    };
                                     inputs.insert(
                                         "kernel_sizes".to_string(),
                                         Self::create_immediate_int_array(&kernel_sizes),
@@ -2956,6 +2974,25 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 let target = DataType::Int8;
                                 zp_id_to_dtype.insert(input_id, target);
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Gather/GatherElements: CoreML only accepts int32 (or smaller) for indices.
+        // If indices are a constant with uint32 or int64 type, coerce them to int32.
+        for op in &graph_info.operations {
+            let op_lower = op.op_type().to_lowercase();
+            if op_lower == "gather" || op_lower == "gatherelements" {
+                if let Some(&idx_id) = op.input_operands().get(1) {
+                    if let Some(idx_op) = graph_info.operand(idx_id) {
+                        if matches!(
+                            idx_op.descriptor.data_type,
+                            DataType::Uint32 | DataType::Int64
+                        ) && idx_op.kind == crate::graph::OperandKind::Constant
+                        {
+                            zp_id_to_dtype.insert(idx_id, DataType::Int32);
                         }
                     }
                 }
@@ -5350,17 +5387,39 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     .map(|inp| {
                         matches!(
                             inp.descriptor.data_type,
-                            DataType::Int8 | DataType::Uint8 | DataType::Int32
+                            DataType::Int8
+                                | DataType::Uint8
+                                | DataType::Int32
+                                | DataType::Uint32
+                                | DataType::Int64
                         )
                     })
                     .unwrap_or(false);
-                let output_is_int64 = output_operand.descriptor.data_type == DataType::Int64;
+                // CoreML argMax/argMin always outputs int32. When WebNN declares the output as
+                // int64 or uint32 (unsupported by CoreML cast), proxy through int32.
+                let output_needs_int32_proxy = matches!(
+                    output_operand.descriptor.data_type,
+                    DataType::Int64 | DataType::Uint32
+                );
 
-                if input_needs_float_cast || output_is_int64 {
+                if input_needs_float_cast || output_needs_int32_proxy {
                     let (output_name, output_type) =
                         Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
 
-                    // Optional: cast integer input to float32
+                    // When the WebNN output type is unsupported by CoreML, produce int32 output
+                    // directly instead of casting to an unsupported type.
+                    let final_output_type = if output_needs_int32_proxy {
+                        Self::create_value_with_mil_type(
+                            graph_info,
+                            output_id,
+                            output_name.clone(),
+                            MilDataType::Int32 as i32,
+                        )?
+                    } else {
+                        output_type.clone()
+                    };
+
+                    // Optional: cast integer/unsupported input type to float32
                     let mut input_names =
                         Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
                     if input_needs_float_cast {
@@ -5386,32 +5445,445 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         }
                     }
 
-                    // Apply argmax/argmin (CoreML always produces int32)
-                    let int32_name = format!("{}_int32", output_name);
-                    let int32_type = Self::create_value_with_mil_type(
-                        graph_info,
-                        output_id,
-                        int32_name.clone(),
-                        MilDataType::Int32 as i32,
-                    )?;
-                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
-                    let arg_op = self.convert_operation_with_input_names_and_outputs(
-                        graph_info,
-                        op,
-                        &input_names,
-                        vec![int32_type],
-                        mil_op_type,
-                    )?;
-                    main_block.operations.push(arg_op);
-
-                    // Cast int32 to the declared output type
-                    let final_dtype = if output_is_int64 { "int64" } else { "int32" };
-                    main_block.operations.push(Self::create_cast_operation(
-                        int32_name,
-                        output_type,
-                        final_dtype,
-                    ));
+                    if output_needs_int32_proxy {
+                        // Emit argmax/argmin directly with int32 output (no cast needed).
+                        let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                        let arg_op = self.convert_operation_with_input_names_and_outputs(
+                            graph_info,
+                            op,
+                            &input_names,
+                            vec![final_output_type],
+                            mil_op_type,
+                        )?;
+                        main_block.operations.push(arg_op);
+                    } else {
+                        // Apply argmax/argmin (CoreML always produces int32), then cast to int32.
+                        let int32_name = format!("{}_int32", output_name);
+                        let int32_type = Self::create_value_with_mil_type(
+                            graph_info,
+                            output_id,
+                            int32_name.clone(),
+                            MilDataType::Int32 as i32,
+                        )?;
+                        let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                        let arg_op = self.convert_operation_with_input_names_and_outputs(
+                            graph_info,
+                            op,
+                            &input_names,
+                            vec![int32_type],
+                            mil_op_type,
+                        )?;
+                        main_block.operations.push(arg_op);
+                        main_block.operations.push(Self::create_cast_operation(
+                            int32_name,
+                            output_type,
+                            "int32",
+                        ));
+                    }
                     continue;
+                }
+            }
+
+            // Gather: cast uint32/int64 indices to int32 (CoreML gather only accepts int32 and smaller).
+            if op_type_lower == "gather" {
+                use crate::protos::coreml::mil_spec::DataType as MilDataType;
+                if let Operation::Gather { .. } = op {
+                    let indices_id = op.input_operands().get(1).copied();
+                    if let Some(idx_id) = indices_id {
+                        if let Some(idx_op) = graph_info.operand(idx_id) {
+                            let needs_cast = matches!(
+                                idx_op.descriptor.data_type,
+                                DataType::Int64 | DataType::Uint32
+                            );
+                            if needs_cast {
+                                let output_id = op.output_operand().ok_or_else(|| {
+                                    GraphError::ConversionFailed {
+                                        format: "coreml_mlprogram".to_string(),
+                                        reason: "gather has no output".to_string(),
+                                    }
+                                })?;
+                                let (output_name, output_type) = Self::create_output_value(
+                                    graph_info,
+                                    output_id,
+                                    &operand_name_overrides,
+                                )?;
+                                let data_name = Self::output_name_for_operand(
+                                    graph_info,
+                                    op.input_operands()[0],
+                                    &operand_name_overrides,
+                                );
+                                let idx_name = Self::output_name_for_operand(
+                                    graph_info,
+                                    idx_id,
+                                    &operand_name_overrides,
+                                );
+                                let casted_idx_name = format!("{}_idx_i32", output_name);
+                                let casted_idx_type = Self::create_value_with_mil_type(
+                                    graph_info,
+                                    idx_id,
+                                    casted_idx_name.clone(),
+                                    MilDataType::Int32 as i32,
+                                )?;
+                                main_block.operations.push(Self::create_cast_operation(
+                                    idx_name,
+                                    casted_idx_type,
+                                    "int32",
+                                ));
+                                let axis = if let Operation::Gather { options, .. } = op {
+                                    options.as_ref().map(|o| o.axis).unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                let mut gather_inputs: HashMap<String, Argument> = HashMap::new();
+                                gather_inputs
+                                    .insert("x".to_string(), Self::create_name_argument(data_name));
+                                gather_inputs.insert(
+                                    "indices".to_string(),
+                                    Self::create_name_argument(casted_idx_name),
+                                );
+                                gather_inputs
+                                    .insert("axis".to_string(), Self::create_immediate_int(axis));
+                                gather_inputs.insert(
+                                    "validate_indices".to_string(),
+                                    Self::create_immediate_bool(false),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    mil_ops::GATHER,
+                                    gather_inputs,
+                                    vec![output_type],
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // BatchNormalization decomposition: when mean/variance are runtime inputs (non-constant)
+            // or when axis != 1 (NHWC or other non-standard layouts), CoreML's native batch_norm
+            // cannot be used. Decompose into element-wise ops:
+            //   normalized = (x - mean) / sqrt(variance + epsilon)
+            //   output = scale * normalized + bias  (if scale/bias present)
+            // Mean/variance may need reshaping for broadcasting when axis is not the last dimension.
+            if op_type_lower == "batchnormalization" {
+                if let Operation::BatchNormalization { options, .. } = op {
+                    let mean_id = op.input_operands().get(1).copied();
+                    let variance_id = op.input_operands().get(2).copied();
+                    let scale_id = options.as_ref().and_then(|o| o.scale);
+                    let bias_id = options.as_ref().and_then(|o| o.bias);
+                    let epsilon = options.as_ref().map(|o| o.epsilon as f32).unwrap_or(1e-5);
+                    let axis = options.as_ref().map(|o| o.axis as usize).unwrap_or(1);
+
+                    let mean_is_nonconstant = mean_id
+                        .and_then(|id| graph_info.operand(id))
+                        .map(|o| o.kind != crate::graph::OperandKind::Constant)
+                        .unwrap_or(false);
+
+                    let input_id = op.input_operands().first().copied();
+                    let input_operand = input_id.and_then(|id| graph_info.operand(id));
+                    let input_rank = input_operand.map(|o| o.descriptor.shape.len()).unwrap_or(0);
+
+                    // Use decomposition when mean is non-constant or axis is non-standard (not 1).
+                    // For axis==1 with constant mean, the native batch_norm path (fallthrough) works.
+                    let use_decomposition = mean_is_nonconstant || (axis != 1 && input_rank >= 2);
+
+                    if use_decomposition {
+                        if let (Some(input_id), Some(mean_id_v), Some(variance_id_v)) =
+                            (input_id, mean_id, variance_id)
+                        {
+                            let output_id = op.output_operand().ok_or_else(|| {
+                                GraphError::ConversionFailed {
+                                    format: "coreml_mlprogram".to_string(),
+                                    reason: "batchNorm has no output".to_string(),
+                                }
+                            })?;
+                            let (output_name, output_type) = Self::create_output_value(
+                                graph_info,
+                                output_id,
+                                &operand_name_overrides,
+                            )?;
+                            let input_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let mean_name = Self::output_name_for_operand(
+                                graph_info,
+                                mean_id_v,
+                                &operand_name_overrides,
+                            );
+                            let var_name = Self::output_name_for_operand(
+                                graph_info,
+                                variance_id_v,
+                                &operand_name_overrides,
+                            );
+
+                            let inp_op = graph_info.operand(input_id).ok_or_else(|| {
+                                GraphError::ConversionFailed {
+                                    format: "coreml_mlprogram".to_string(),
+                                    reason: format!("batchNorm input {} not found", input_id),
+                                }
+                            })?;
+                            let dtype = Self::mil_data_type(&inp_op.descriptor.data_type)?;
+                            let is_f16 = inp_op.descriptor.data_type == DataType::Float16;
+
+                            // When axis is not the last dimension, reshape mean/variance for
+                            // correct broadcasting: [C] → [1, C, 1, 1, ...] with 1s elsewhere.
+                            let (mean_for_sub, var_for_div) = if axis
+                                != input_rank.saturating_sub(1)
+                                && input_rank > 1
+                            {
+                                let c_size = inp_op
+                                    .descriptor
+                                    .shape
+                                    .get(axis)
+                                    .map(|d| match d {
+                                        GraphDimension::Static(v) => *v,
+                                        GraphDimension::Dynamic(d) => d.max_size,
+                                    })
+                                    .unwrap_or(1);
+                                let mut bcast_shape = vec![1u32; input_rank];
+                                bcast_shape[axis] = c_size;
+                                let bcast_dims: Vec<Dimension> = bcast_shape
+                                    .iter()
+                                    .map(|&d| Dimension {
+                                        dimension: Some(dimension::Dimension::Constant(
+                                            dimension::ConstantDimension { size: d as u64 },
+                                        )),
+                                    })
+                                    .collect();
+
+                                let mean_rs_name = format!("{}_bn_mean_rs", output_name);
+                                let mean_rs_type = NamedValueType {
+                                    name: mean_rs_name.clone(),
+                                    r#type: Some(ValueType {
+                                        r#type: Some(
+                                            crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                                TensorType {
+                                                    rank: input_rank as i64,
+                                                    data_type: dtype,
+                                                    dimensions: bcast_dims.clone(),
+                                                    attributes: HashMap::new(),
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                };
+                                let mut rs_in: HashMap<String, Argument> = HashMap::new();
+                                rs_in.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(mean_name.clone()),
+                                );
+                                rs_in.insert(
+                                    "shape".to_string(),
+                                    Self::create_immediate_int_array(&bcast_shape),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    "reshape",
+                                    rs_in,
+                                    vec![mean_rs_type],
+                                ));
+
+                                let var_rs_name = format!("{}_bn_var_rs", output_name);
+                                let var_rs_type = NamedValueType {
+                                    name: var_rs_name.clone(),
+                                    r#type: Some(ValueType {
+                                        r#type: Some(
+                                            crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                                TensorType {
+                                                    rank: input_rank as i64,
+                                                    data_type: dtype,
+                                                    dimensions: bcast_dims,
+                                                    attributes: HashMap::new(),
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                };
+                                let mut rs_var: HashMap<String, Argument> = HashMap::new();
+                                rs_var.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(var_name.clone()),
+                                );
+                                rs_var.insert(
+                                    "shape".to_string(),
+                                    Self::create_immediate_int_array(&bcast_shape),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    "reshape",
+                                    rs_var,
+                                    vec![var_rs_type],
+                                ));
+                                (mean_rs_name, var_rs_name)
+                            } else {
+                                (mean_name, var_name)
+                            };
+
+                            // Build an intermediate value type matching the output shape.
+                            let out_shape = &inp_op.descriptor.shape;
+                            let out_dims = Self::mil_dimensions_from_graph_shape(out_shape, false);
+                            let make_intermediate = |name: String| {
+                                NamedValueType {
+                                name,
+                                r#type: Some(ValueType {
+                                    r#type: Some(
+                                        crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                            TensorType {
+                                                rank: out_dims.len() as i64,
+                                                data_type: dtype,
+                                                dimensions: out_dims.clone(),
+                                                attributes: HashMap::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                            }
+                            };
+
+                            // x_minus_mean = x - mean
+                            let x_minus_mean = format!("{}_bn_xmm", output_name);
+                            let mut sub_in: HashMap<String, Argument> = HashMap::new();
+                            sub_in.insert("x".to_string(), Self::create_name_argument(input_name));
+                            sub_in
+                                .insert("y".to_string(), Self::create_name_argument(mean_for_sub));
+                            main_block.operations.push(Self::create_mil_operation(
+                                "sub",
+                                sub_in,
+                                vec![make_intermediate(x_minus_mean.clone())],
+                            ));
+
+                            // var_plus_eps = variance + epsilon
+                            // variance has shape [C], result is also [C]
+                            let var_op = graph_info.operand(variance_id_v).ok_or_else(|| {
+                                GraphError::ConversionFailed {
+                                    format: "coreml_mlprogram".to_string(),
+                                    reason: format!(
+                                        "batchNorm variance {} not found",
+                                        variance_id_v
+                                    ),
+                                }
+                            })?;
+                            let var_shape = &var_op.descriptor.shape;
+                            let var_dims = Self::mil_dimensions_from_graph_shape(var_shape, false);
+                            let make_var_type = |name: String| {
+                                NamedValueType {
+                                name,
+                                r#type: Some(ValueType {
+                                    r#type: Some(
+                                        crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                            TensorType {
+                                                rank: var_dims.len() as i64,
+                                                data_type: dtype,
+                                                dimensions: var_dims.clone(),
+                                                attributes: HashMap::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                            }
+                            };
+                            let var_eps_name = format!("{}_bn_veps", output_name);
+                            let eps_arg = if is_f16 {
+                                Self::create_immediate_float16(epsilon)
+                            } else {
+                                Self::create_immediate_float(epsilon)
+                            };
+                            let mut veps_in: HashMap<String, Argument> = HashMap::new();
+                            veps_in.insert(
+                                "x".to_string(),
+                                Self::create_name_argument(var_for_div.clone()),
+                            );
+                            veps_in.insert("y".to_string(), eps_arg);
+                            main_block.operations.push(Self::create_mil_operation(
+                                "add",
+                                veps_in,
+                                vec![make_var_type(var_eps_name.clone())],
+                            ));
+
+                            // std = sqrt(var_plus_eps)
+                            let std_name = format!("{}_bn_std", output_name);
+                            let mut sqrt_in: HashMap<String, Argument> = HashMap::new();
+                            sqrt_in
+                                .insert("x".to_string(), Self::create_name_argument(var_eps_name));
+                            main_block.operations.push(Self::create_mil_operation(
+                                "sqrt",
+                                sqrt_in,
+                                vec![make_var_type(std_name.clone())],
+                            ));
+
+                            // normalized = x_minus_mean / std
+                            let normed_name = format!("{}_bn_normed", output_name);
+                            let mut div_in: HashMap<String, Argument> = HashMap::new();
+                            div_in
+                                .insert("x".to_string(), Self::create_name_argument(x_minus_mean));
+                            div_in.insert("y".to_string(), Self::create_name_argument(std_name));
+                            main_block.operations.push(Self::create_mil_operation(
+                                "real_div",
+                                div_in,
+                                vec![make_intermediate(normed_name.clone())],
+                            ));
+
+                            // Apply scale (gamma) and bias (beta) if present
+                            let after_scale = if let Some(sc_id) = scale_id {
+                                let sc_name = Self::output_name_for_operand(
+                                    graph_info,
+                                    sc_id,
+                                    &operand_name_overrides,
+                                );
+                                let scaled_name = format!("{}_bn_scaled", output_name);
+                                let mut mul_in: HashMap<String, Argument> = HashMap::new();
+                                mul_in.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(normed_name),
+                                );
+                                mul_in.insert("y".to_string(), Self::create_name_argument(sc_name));
+                                main_block.operations.push(Self::create_mil_operation(
+                                    "mul",
+                                    mul_in,
+                                    vec![make_intermediate(scaled_name.clone())],
+                                ));
+                                scaled_name
+                            } else {
+                                normed_name
+                            };
+
+                            let final_name = if let Some(bi_id) = bias_id {
+                                let bi_name = Self::output_name_for_operand(
+                                    graph_info,
+                                    bi_id,
+                                    &operand_name_overrides,
+                                );
+                                let biased_name = output_name.clone();
+                                let mut add_in: HashMap<String, Argument> = HashMap::new();
+                                add_in.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(after_scale),
+                                );
+                                add_in.insert("y".to_string(), Self::create_name_argument(bi_name));
+                                main_block.operations.push(Self::create_mil_operation(
+                                    "add",
+                                    add_in,
+                                    vec![output_type],
+                                ));
+                                biased_name
+                            } else {
+                                // No bias: rename final intermediate to output name via identity
+                                let mut id_in: HashMap<String, Argument> = HashMap::new();
+                                id_in.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(after_scale),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    "identity",
+                                    id_in,
+                                    vec![output_type],
+                                ));
+                                output_name.clone()
+                            };
+                            let _ = final_name;
+                            continue;
+                        }
+                    }
                 }
             }
 
