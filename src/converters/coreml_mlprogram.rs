@@ -1535,6 +1535,105 @@ impl CoremlMlProgramConverter {
         Self::create_named_value_type(name, dtype, &dims, false)
     }
 
+    /// Map a WebNN recurrent-network activation name to its MIL op.
+    fn rnn_activation_op(name: &str) -> Result<&'static str, GraphError> {
+        Ok(match name.to_lowercase().as_str() {
+            "relu" => mil_ops::RELU,
+            "tanh" => mil_ops::TANH,
+            "sigmoid" => mil_ops::SIGMOID,
+            other => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!("unsupported RNN activation '{}'", other),
+                });
+            }
+        })
+    }
+
+    /// Emit `out = x . y^T` (MIL matmul with transpose_y). Returns `out_name`.
+    fn rnn_matmul_ty(
+        block: &mut Block,
+        x: &str,
+        y: &str,
+        out_name: String,
+        dtype: i32,
+        out_shape: &[u32],
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
+        inputs.insert("y".to_string(), Self::create_name_argument(y.to_string()));
+        inputs.insert(
+            "transpose_x".to_string(),
+            Self::create_immediate_bool(false),
+        );
+        inputs.insert("transpose_y".to_string(), Self::create_immediate_bool(true));
+        let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, out_shape);
+        block.operations.push(Self::create_mil_operation(
+            mil_ops::MATMUL,
+            inputs,
+            vec![ty],
+        ));
+        out_name
+    }
+
+    /// Emit an elementwise binary op `out = f(x, y)`. Returns `out_name`.
+    fn rnn_binary(
+        block: &mut Block,
+        mil_op: &str,
+        x: &str,
+        y: &str,
+        out_name: String,
+        dtype: i32,
+        shape: &[u32],
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
+        inputs.insert("y".to_string(), Self::create_name_argument(y.to_string()));
+        let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
+        block
+            .operations
+            .push(Self::create_mil_operation(mil_op, inputs, vec![ty]));
+        out_name
+    }
+
+    /// Emit an elementwise unary op `out = f(x)`. Returns `out_name`.
+    fn rnn_unary(
+        block: &mut Block,
+        mil_op: &str,
+        x: &str,
+        out_name: String,
+        dtype: i32,
+        shape: &[u32],
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
+        let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
+        block
+            .operations
+            .push(Self::create_mil_operation(mil_op, inputs, vec![ty]));
+        out_name
+    }
+
+    /// Emit `slice_by_size(x, begin, size)`. Returns `out_name`.
+    fn rnn_slice(
+        block: &mut Block,
+        x: &str,
+        begin: &[u32],
+        size: &[u32],
+        out_name: String,
+        dtype: i32,
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
+        inputs.insert("begin".to_string(), Self::create_immediate_int_array(begin));
+        inputs.insert("size".to_string(), Self::create_immediate_int_array(size));
+        let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, size);
+        block
+            .operations
+            .push(Self::create_mil_operation(mil_ops::SLICE, inputs, vec![ty]));
+        out_name
+    }
+
     /// Compute reshape targets that make a block-wise quantization scale broadcast against
     /// the tensor. Each axis `i` where `1 < scale[i] < input[i]` is split into
     /// `[scale[i], input[i]/scale[i]]` for the tensor and `[scale[i], 1]` for the scale;
@@ -1983,6 +2082,360 @@ impl CoremlMlProgramConverter {
             output_type,
             out_int_str,
         ));
+        Ok(())
+    }
+
+    /// Lower a WebNN `gruCell` (single time step) into primitive MIL ops.
+    ///
+    /// For gate order z (update), r (reset), n (new) with per-gate weight/recurrence rows:
+    ///   z = f0(X·Wz^T + bz + H·Rz^T + rbz)
+    ///   r = f0(X·Wr^T + br + H·Rr^T + rbr)
+    ///   n = f1(X·Wn^T + bn + (r ⊙ H)·Rn^T + rbn)            (reset_after = false)
+    ///   n = f1(X·Wn^T + bn + r ⊙ (H·Rn^T + rbn))            (reset_after = true)
+    ///   Hnew = (1 - z) ⊙ n + z ⊙ H = n + z ⊙ (H - n)
+    /// Default activations f0=sigmoid, f1=tanh; default layout "zrn".
+    fn emit_gru_cell_decomposition(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let (input_id, weight_id, rec_id, hidden_id, hidden_size, opts) = match op {
+            Operation::GruCell {
+                input,
+                weight,
+                recurrence,
+                hidden_state,
+                hidden_size,
+                options,
+                ..
+            } => (
+                *input,
+                *weight,
+                *recurrence,
+                *hidden_state,
+                *hidden_size,
+                options.as_ref(),
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "emit_gru_cell_decomposition called on non-gruCell op".to_string(),
+                });
+            }
+        };
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "gruCell has no output operand".to_string(),
+            })?;
+        let input_op = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "gruCell input operand not found".to_string(),
+            })?;
+        let dtype = Self::mil_data_type(&input_op.descriptor.data_type)?;
+        let in_shape = input_op.descriptor.static_or_max_shape();
+        let b = in_shape[0];
+        let i = in_shape[1];
+        let h = hidden_size;
+        let bh = [b, h];
+
+        let x_name = Self::output_name_for_operand(graph, input_id, overrides);
+        let w_name = Self::output_name_for_operand(graph, weight_id, overrides);
+        let r_name = Self::output_name_for_operand(graph, rec_id, overrides);
+        let hid_name = Self::output_name_for_operand(graph, hidden_id, overrides);
+        let bias_name = opts
+            .and_then(|o| o.bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let rbias_name = opts
+            .and_then(|o| o.recurrent_bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let reset_after = opts.map(|o| o.reset_after).unwrap_or(false);
+        let layout = opts
+            .map(|o| o.layout.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("zrn");
+        let acts: Vec<String> = opts
+            .and_then(|o| o.activations.clone())
+            .unwrap_or_else(|| vec!["sigmoid".to_string(), "tanh".to_string()]);
+        let act0 = Self::rnn_activation_op(&acts[0])?;
+        let act1 = Self::rnn_activation_op(acts.get(1).map(|s| s.as_str()).unwrap_or("tanh"))?;
+
+        // Row offsets of each gate within the 3*hidden weight/recurrence tensors.
+        let (z_off, r_off, n_off) = match layout {
+            "rzn" => (h, 0, 2 * h),
+            _ => (0, h, 2 * h),
+        };
+
+        let (output_name, output_type) = Self::create_output_value(graph, output_id, overrides)?;
+        let p = |s: &str| format!("{}_{}", output_name, s);
+
+        // Compute a "reset/update"-style gate: activation(X·Wg^T + bg + H·Rg^T + rbg).
+        let mut gate = |block: &mut Block, off: u32, act: &str, tag: &str| -> String {
+            let wg = Self::rnn_slice(
+                block,
+                &w_name,
+                &[off, 0],
+                &[h, i],
+                p(&format!("w{tag}")),
+                dtype,
+            );
+            let mut xw =
+                Self::rnn_matmul_ty(block, &x_name, &wg, p(&format!("xw{tag}")), dtype, &bh);
+            if let Some(bn) = &bias_name {
+                let bg = Self::rnn_slice(block, bn, &[off], &[h], p(&format!("b{tag}")), dtype);
+                xw = Self::rnn_binary(block, "add", &xw, &bg, p(&format!("xwb{tag}")), dtype, &bh);
+            }
+            let rg = Self::rnn_slice(
+                block,
+                &r_name,
+                &[off, 0],
+                &[h, h],
+                p(&format!("r{tag}")),
+                dtype,
+            );
+            let mut hr =
+                Self::rnn_matmul_ty(block, &hid_name, &rg, p(&format!("hr{tag}")), dtype, &bh);
+            if let Some(rbn) = &rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[off], &[h], p(&format!("rb{tag}")), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p(&format!("hrb{tag}")), dtype, &bh);
+            }
+            let pre = Self::rnn_binary(block, "add", &xw, &hr, p(&format!("pre{tag}")), dtype, &bh);
+            Self::rnn_unary(block, act, &pre, p(&format!("g{tag}")), dtype, &bh)
+        };
+
+        let z = gate(block, z_off, act0, "z");
+        let r = gate(block, r_off, act0, "r");
+
+        // New gate n, whose recurrent term depends on reset_after.
+        let wn = Self::rnn_slice(block, &w_name, &[n_off, 0], &[h, i], p("wn"), dtype);
+        let mut xwn = Self::rnn_matmul_ty(block, &x_name, &wn, p("xwn"), dtype, &bh);
+        if let Some(bn) = &bias_name {
+            let bg = Self::rnn_slice(block, bn, &[n_off], &[h], p("bn"), dtype);
+            xwn = Self::rnn_binary(block, "add", &xwn, &bg, p("xwbn"), dtype, &bh);
+        }
+        let rn = Self::rnn_slice(block, &r_name, &[n_off, 0], &[h, h], p("rn"), dtype);
+        let hrn = if reset_after {
+            // r ⊙ (H·Rn^T + rbn)
+            let mut hr = Self::rnn_matmul_ty(block, &hid_name, &rn, p("hrn"), dtype, &bh);
+            if let Some(rbn) = &rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[n_off], &[h], p("rbn"), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p("hrbn"), dtype, &bh);
+            }
+            Self::rnn_binary(block, "mul", &r, &hr, p("rhn"), dtype, &bh)
+        } else {
+            // (r ⊙ H)·Rn^T + rbn
+            let rh = Self::rnn_binary(block, "mul", &r, &hid_name, p("rh"), dtype, &bh);
+            let mut hr = Self::rnn_matmul_ty(block, &rh, &rn, p("hrn"), dtype, &bh);
+            if let Some(rbn) = &rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[n_off], &[h], p("rbn"), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p("hrbn"), dtype, &bh);
+            }
+            hr
+        };
+        let npre = Self::rnn_binary(block, "add", &xwn, &hrn, p("npre"), dtype, &bh);
+        let n = Self::rnn_unary(block, act1, &npre, p("n"), dtype, &bh);
+
+        // Hnew = n + z ⊙ (H - n)
+        let hsubn = Self::rnn_binary(block, "sub", &hid_name, &n, p("hsubn"), dtype, &bh);
+        let zmul = Self::rnn_binary(block, "mul", &z, &hsubn, p("zmul"), dtype, &bh);
+        let mut add_inputs = HashMap::new();
+        add_inputs.insert("x".to_string(), Self::create_name_argument(n));
+        add_inputs.insert("y".to_string(), Self::create_name_argument(zmul));
+        block.operations.push(Self::create_mil_operation(
+            "add",
+            add_inputs,
+            vec![output_type],
+        ));
+        Ok(())
+    }
+
+    /// Lower a WebNN `lstmCell` (single time step) into primitive MIL ops.
+    ///
+    /// Gates i (input), o (output), f (forget), g (cell); optional peephole weights
+    /// [pi, po, pf]:
+    ///   i = f0(X·Wi^T + bi + H·Ri^T + rbi + pi ⊙ C)
+    ///   f = f0(X·Wf^T + bf + H·Rf^T + rbf + pf ⊙ C)
+    ///   g = f1(X·Wg^T + bg + H·Rg^T + rbg)
+    ///   Cnew = f ⊙ C + i ⊙ g
+    ///   o = f0(X·Wo^T + bo + H·Ro^T + rbo + po ⊙ Cnew)
+    ///   Hnew = o ⊙ f2(Cnew)
+    /// Default activations f0=sigmoid, f1=f2=tanh; default gate layout "iofg".
+    /// Outputs are [Hnew, Cnew].
+    fn emit_lstm_cell_decomposition(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let (input_id, weight_id, rec_id, hidden_id, cell_id, hidden_size, opts) = match op {
+            Operation::LstmCell {
+                input,
+                weight,
+                recurrence,
+                hidden_state,
+                cell_state,
+                hidden_size,
+                options,
+                ..
+            } => (
+                *input,
+                *weight,
+                *recurrence,
+                *hidden_state,
+                *cell_state,
+                *hidden_size,
+                options.as_ref(),
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "emit_lstm_cell_decomposition called on non-lstmCell op".to_string(),
+                });
+            }
+        };
+        let out_ids = op.output_operands();
+        if out_ids.len() < 2 {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "lstmCell requires two outputs (hidden, cell)".to_string(),
+            });
+        }
+        let (out_h_id, out_c_id) = (out_ids[0], out_ids[1]);
+        let input_op = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "lstmCell input operand not found".to_string(),
+            })?;
+        let dtype = Self::mil_data_type(&input_op.descriptor.data_type)?;
+        let in_shape = input_op.descriptor.static_or_max_shape();
+        let i = in_shape[1];
+        let h = hidden_size;
+        let bh = [in_shape[0], h];
+
+        let x_name = Self::output_name_for_operand(graph, input_id, overrides);
+        let w_name = Self::output_name_for_operand(graph, weight_id, overrides);
+        let r_name = Self::output_name_for_operand(graph, rec_id, overrides);
+        let hid_name = Self::output_name_for_operand(graph, hidden_id, overrides);
+        let cell_name = Self::output_name_for_operand(graph, cell_id, overrides);
+        let bias_name = opts
+            .and_then(|o| o.bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let rbias_name = opts
+            .and_then(|o| o.recurrent_bias)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let peephole_name = opts
+            .and_then(|o| o.peephole_weight)
+            .map(|id| Self::output_name_for_operand(graph, id, overrides));
+        let layout = opts
+            .map(|o| o.layout.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("iofg");
+        let acts: Vec<String> = opts.and_then(|o| o.activations.clone()).unwrap_or_else(|| {
+            vec![
+                "sigmoid".to_string(),
+                "tanh".to_string(),
+                "tanh".to_string(),
+            ]
+        });
+        let f0 = Self::rnn_activation_op(&acts[0])?;
+        let f1 = Self::rnn_activation_op(acts.get(1).map(|s| s.as_str()).unwrap_or("tanh"))?;
+        let f2 = Self::rnn_activation_op(acts.get(2).map(|s| s.as_str()).unwrap_or("tanh"))?;
+
+        // Gate row offsets within the 4*hidden weight/recurrence tensors.
+        let (i_off, o_off, f_off, g_off) = match layout {
+            "ifgo" => (0, 3 * h, h, 2 * h),
+            _ => (0, h, 2 * h, 3 * h),
+        };
+        // Peephole weights are ordered [i, o, f].
+        let (pi_off, po_off, pf_off) = (0u32, h, 2 * h);
+
+        let (h_name, h_type) = Self::create_output_value(graph, out_h_id, overrides)?;
+        let (c_name, c_type) = Self::create_output_value(graph, out_c_id, overrides)?;
+        let p = |s: &str| format!("{}_{}", h_name, s);
+
+        // gate = activation(X·Wg^T + bg + H·Rg^T + rbg [+ pg ⊙ cstate])
+        let mut gate = |block: &mut Block,
+                        off: u32,
+                        act: &str,
+                        tag: &str,
+                        peep: Option<(u32, &str)>|
+         -> String {
+            let wg = Self::rnn_slice(
+                block,
+                &w_name,
+                &[off, 0],
+                &[h, i],
+                p(&format!("w{tag}")),
+                dtype,
+            );
+            let mut xw =
+                Self::rnn_matmul_ty(block, &x_name, &wg, p(&format!("xw{tag}")), dtype, &bh);
+            if let Some(bn) = &bias_name {
+                let bg = Self::rnn_slice(block, bn, &[off], &[h], p(&format!("b{tag}")), dtype);
+                xw = Self::rnn_binary(block, "add", &xw, &bg, p(&format!("xwb{tag}")), dtype, &bh);
+            }
+            let rg = Self::rnn_slice(
+                block,
+                &r_name,
+                &[off, 0],
+                &[h, h],
+                p(&format!("r{tag}")),
+                dtype,
+            );
+            let mut hr =
+                Self::rnn_matmul_ty(block, &hid_name, &rg, p(&format!("hr{tag}")), dtype, &bh);
+            if let Some(rbn) = &rbias_name {
+                let rbg = Self::rnn_slice(block, rbn, &[off], &[h], p(&format!("rb{tag}")), dtype);
+                hr = Self::rnn_binary(block, "add", &hr, &rbg, p(&format!("hrb{tag}")), dtype, &bh);
+            }
+            let mut pre =
+                Self::rnn_binary(block, "add", &xw, &hr, p(&format!("pre{tag}")), dtype, &bh);
+            if let (Some((poff, cname)), Some(pw)) = (peep, &peephole_name) {
+                let pg = Self::rnn_slice(block, pw, &[poff], &[h], p(&format!("p{tag}")), dtype);
+                let pc =
+                    Self::rnn_binary(block, "mul", &pg, cname, p(&format!("pc{tag}")), dtype, &bh);
+                pre = Self::rnn_binary(
+                    block,
+                    "add",
+                    &pre,
+                    &pc,
+                    p(&format!("pre2{tag}")),
+                    dtype,
+                    &bh,
+                );
+            }
+            Self::rnn_unary(block, act, &pre, p(&format!("g{tag}")), dtype, &bh)
+        };
+
+        let cell_owned = cell_name.clone();
+        let gate_i = gate(block, i_off, f0, "i", Some((pi_off, &cell_owned)));
+        let gate_f = gate(block, f_off, f0, "f", Some((pf_off, &cell_owned)));
+        let gate_g = gate(block, g_off, f1, "g", None);
+
+        // Cnew = f ⊙ C + i ⊙ g  (emitted as the cell output).
+        let fc = Self::rnn_binary(block, "mul", &gate_f, &cell_name, p("fc"), dtype, &bh);
+        let ig = Self::rnn_binary(block, "mul", &gate_i, &gate_g, p("ig"), dtype, &bh);
+        let mut cnew_inputs = HashMap::new();
+        cnew_inputs.insert("x".to_string(), Self::create_name_argument(fc));
+        cnew_inputs.insert("y".to_string(), Self::create_name_argument(ig));
+        block
+            .operations
+            .push(Self::create_mil_operation("add", cnew_inputs, vec![c_type]));
+
+        // o depends on Cnew; Hnew = o ⊙ f2(Cnew).
+        let gate_o = gate(block, o_off, f0, "o", Some((po_off, &c_name)));
+        let tanh_c = Self::rnn_unary(block, f2, &c_name, p("tanhc"), dtype, &bh);
+        let mut h_inputs = HashMap::new();
+        h_inputs.insert("x".to_string(), Self::create_name_argument(gate_o));
+        h_inputs.insert("y".to_string(), Self::create_name_argument(tanh_c));
+        block
+            .operations
+            .push(Self::create_mil_operation("mul", h_inputs, vec![h_type]));
         Ok(())
     }
 
@@ -5791,6 +6244,28 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
             if op_type_lower == "quantizelinear" && Self::qdq_should_decompose(graph_info, op) {
                 Self::emit_quantize_decomposition(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                continue;
+            }
+
+            // Recurrent networks are decomposed into primitive MIL ops (matmul, add, mul,
+            // sub, activations) because CoreML's native lstm/gru don't match WebNN's option
+            // set (custom activations, layouts, peephole, reset_after, ...).
+            if op_type_lower == "grucell" {
+                Self::emit_gru_cell_decomposition(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                continue;
+            }
+            if op_type_lower == "lstmcell" {
+                Self::emit_lstm_cell_decomposition(
                     graph_info,
                     op,
                     &operand_name_overrides,
