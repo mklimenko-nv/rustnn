@@ -5714,10 +5714,47 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     vec![clipped_type],
                                 ));
 
+                                // WebNN saturates the clamp result to the output type's
+                                // range (a min/max bound outside the type range still yields
+                                // an in-range value); CoreML's int cast would wrap instead.
+                                // Clip to [type_min, type_max] before casting. (No-op when
+                                // the bounds already lie inside the type range.)
+                                let (sat_min, sat_max) = match int_dtype {
+                                    DataType::Int8 => (-128.0f32, 127.0f32),
+                                    DataType::Uint8 => (0.0f32, 255.0f32),
+                                    // int32 and the int32 proxies span the full int32 range.
+                                    _ => (i32::MIN as f32, i32::MAX as f32),
+                                };
+                                let sat_name = format!("{}_clamp_sat", output_name);
+                                let sat_type = Self::create_value_with_mil_type(
+                                    graph_info,
+                                    output_id,
+                                    sat_name.clone(),
+                                    crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                                )?;
+                                let mut sat_inputs = HashMap::new();
+                                sat_inputs.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(clipped_name),
+                                );
+                                sat_inputs.insert(
+                                    "alpha".to_string(),
+                                    Self::create_immediate_float(sat_min),
+                                );
+                                sat_inputs.insert(
+                                    "beta".to_string(),
+                                    Self::create_immediate_float(sat_max),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    mil_ops::CLIP,
+                                    sat_inputs,
+                                    vec![sat_type],
+                                ));
+
                                 // Cast back to the operand's internal int representation.
                                 let back_dtype = Self::int_back_cast_dtype(int_dtype)?;
                                 main_block.operations.push(Self::create_cast_operation(
-                                    clipped_name,
+                                    sat_name,
                                     output_type,
                                     back_dtype,
                                 ));
