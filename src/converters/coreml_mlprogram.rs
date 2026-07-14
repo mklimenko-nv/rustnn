@@ -2090,15 +2090,16 @@ impl CoremlMlProgramConverter {
                     if let Some(ax) = options.as_ref().and_then(|o| o.axes.as_ref()) {
                         ax.iter().map(|&u| u as i32).collect()
                     } else {
-                        // axes=None: default to last axis of the input operand
+                        // axes=None: WebNN defaults to all axes except the batch
+                        // dimension, i.e. the sequence [1, 2, ..., N-1].
                         let input_rank = op
                             .input_operands()
                             .first()
                             .and_then(|&id| graph.operand(id))
                             .map(|o| o.descriptor.shape.len())
                             .unwrap_or(1);
-                        if input_rank > 0 {
-                            vec![(input_rank as i32) - 1]
+                        if input_rank > 1 {
+                            (1..input_rank as i32).collect()
                         } else {
                             vec![0]
                         }
