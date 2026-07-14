@@ -204,7 +204,9 @@ mod mil_ops {
     pub const CAST: &str = "cast";
 
     // Scatter operations
-    pub const SCATTER_ELEMENTS: &str = "scatter";
+    // WebNN scatterElements (indices/updates share the data's rank, scattered along
+    // one axis) maps to MIL `scatter_along_axis`; MIL `scatter` expects rank-1 indices.
+    pub const SCATTER_ELEMENTS: &str = "scatter_along_axis";
     pub const SCATTER_ND: &str = "scatter_nd";
 
     // Tile operation
