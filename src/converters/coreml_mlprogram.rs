@@ -1532,16 +1532,23 @@ impl CoremlMlProgramConverter {
                     // an explicit axis. For per-tensor (scalar or single-element), omit axis.
                     // Note: single-element scales [1] are squeezed to scalar at constant emit
                     // time; emitting axis alongside a scalar scale causes a CoreML compile error.
+                    // Multi-dimensional scales are squeezed to 1D at emission time (all size-1
+                    // dimensions removed). Compute the effective squeezed length here so we can
+                    // detect the per-channel case even when the WebNN descriptor says rank > 1.
                     if let Some(scale_op) = graph.operand(*scale_id) {
                         let scale_shape = scale_op.descriptor.static_or_max_shape();
-                        let scale_len = scale_shape.first().copied().unwrap_or(0);
-                        let is_per_channel = scale_op.descriptor.shape.len() == 1 && scale_len > 1;
+                        // Effective shape after squeezing out all size-1 dims (mirrors the
+                        // constant emission pre-scan for scale_ids_to_squeeze).
+                        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
+                        let effective_rank = if squeezed.is_empty() { 0 } else { squeezed.len() };
+                        let effective_len = squeezed.first().copied().unwrap_or(scale_shape.first().copied().unwrap_or(0));
+                        let is_per_channel = effective_rank == 1 && effective_len > 1;
                         if is_per_channel {
                             let axis = graph.operand(*inp_id)
                                 .and_then(|inp| {
                                     inp.descriptor.static_or_max_shape()
                                         .iter()
-                                        .position(|&d| d == scale_len)
+                                        .position(|&d| d == effective_len)
                                         .map(|i| i as u32)
                                 })
                                 .unwrap_or(0);
@@ -2881,6 +2888,10 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
         // Create main block
         let mut main_block = Block::default();
+        // Tracks outputs that are proxied as int32 (e.g. argmin/argmax with int64 WebNN type).
+        // The final interface-cast loop uses this to cast to int32 rather than float32.
+        let mut int32_proxy_output_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for &input_id in &graph_info.input_operands {
             let operand =
@@ -5186,11 +5197,18 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
             // BatchNormalization with rank < 3: CoreML batch_norm requires rank >= 3.
             // Reshape input to 3D based on the axis parameter, apply batch_norm, reshape back.
+            // Skip when mean is non-constant — the decomposition path below handles that case.
             if op_type_lower == "batchnormalization" {
                 if let Some(&input_id) = op.input_operands().first() {
                     if let Some(input_op) = graph_info.operand(input_id) {
                         let input_rank = input_op.descriptor.shape.len();
-                        if input_rank < 3 {
+                        let mean_is_nonconstant_for_rank_check = op
+                            .input_operands()
+                            .get(1)
+                            .and_then(|&mid| graph_info.operand(mid))
+                            .map(|o| o.kind != crate::graph::OperandKind::Constant)
+                            .unwrap_or(false);
+                        if input_rank < 3 && !mean_is_nonconstant_for_rank_check {
                             let axis = match op {
                                 Operation::BatchNormalization { options, .. } => {
                                     options.as_ref().map(|o| o.axis as usize).unwrap_or(1)
@@ -5446,6 +5464,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     }
 
                     if output_needs_int32_proxy {
+                        // Track the INTERFACE output name (without _graph suffix) for the
+                        // final cast loop, which uses int32 instead of the default float32.
+                        int32_proxy_output_names.insert(operand_name(graph_info, output_id));
                         // Emit argmax/argmin directly with int32 output (no cast needed).
                         let mil_op_type = self.get_mil_op_type(op.op_type())?;
                         let arg_op = self.convert_operation_with_input_names_and_outputs(
@@ -5629,7 +5650,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                             // When axis is not the last dimension, reshape mean/variance for
                             // correct broadcasting: [C] → [1, C, 1, 1, ...] with 1s elsewhere.
-                            let (mean_for_sub, var_for_div) = if axis
+                            // Also return the effective var shape so downstream add/sqrt types match.
+                            let (mean_for_sub, var_for_div, effective_var_shape) = if axis
                                 != input_rank.saturating_sub(1)
                                 && input_rank > 1
                             {
@@ -5644,6 +5666,10 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     .unwrap_or(1);
                                 let mut bcast_shape = vec![1u32; input_rank];
                                 bcast_shape[axis] = c_size;
+                                let effective_var_shape: Vec<GraphDimension> = bcast_shape
+                                    .iter()
+                                    .map(|&d| GraphDimension::Static(d))
+                                    .collect();
                                 let bcast_dims: Vec<Dimension> = bcast_shape
                                     .iter()
                                     .map(|&d| Dimension {
@@ -5714,9 +5740,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     rs_var,
                                     vec![var_rs_type],
                                 ));
-                                (mean_rs_name, var_rs_name)
+                                (mean_rs_name, var_rs_name, effective_var_shape)
                             } else {
-                                (mean_name, var_name)
+                                let orig_var_shape = graph_info
+                                    .operand(variance_id_v)
+                                    .map(|o| o.descriptor.shape.clone())
+                                    .unwrap_or_default();
+                                (mean_name, var_name, orig_var_shape)
                             };
 
                             // Build an intermediate value type matching the output shape.
@@ -5753,18 +5783,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             ));
 
                             // var_plus_eps = variance + epsilon
-                            // variance has shape [C], result is also [C]
-                            let var_op = graph_info.operand(variance_id_v).ok_or_else(|| {
-                                GraphError::ConversionFailed {
-                                    format: "coreml_mlprogram".to_string(),
-                                    reason: format!(
-                                        "batchNorm variance {} not found",
-                                        variance_id_v
-                                    ),
-                                }
-                            })?;
-                            let var_shape = &var_op.descriptor.shape;
-                            let var_dims = Self::mil_dimensions_from_graph_shape(var_shape, false);
+                            // Use effective_var_shape (may be reshaped to bcast_shape) for type.
+                            let var_dims =
+                                Self::mil_dimensions_from_graph_shape(&effective_var_shape, false);
                             let make_var_type = |name: String| {
                                 NamedValueType {
                                 name,
@@ -6465,17 +6486,25 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 Self::output_name_for_operand(graph_info, output_id, &operand_name_overrides);
             let graph_mil_type = Self::mil_data_type(&operand.descriptor.data_type)?;
             let interface_mil_type = Self::interface_mil_data_type(&operand.descriptor.data_type);
-            if graph_mil_type != interface_mil_type {
+            // For argmin/argmax int32 proxy outputs, use int32 at the interface (not float32).
+            // The executor zero-extends int32 → int64 when the WebNN descriptor is int64.
+            let effective_interface_type = if int32_proxy_output_names.contains(&output_name) {
+                use crate::protos::coreml::mil_spec::DataType as MilDt;
+                MilDt::Int32 as i32
+            } else {
+                interface_mil_type
+            };
+            if graph_mil_type != effective_interface_type {
                 let output_type = Self::create_value_with_mil_type(
                     graph_info,
                     output_id,
                     output_name.clone(),
-                    interface_mil_type,
+                    effective_interface_type,
                 )?;
                 main_block.operations.push(Self::create_cast_operation(
                     graph_output_name,
                     output_type,
-                    Self::cast_dtype_string_for_mil_type(interface_mil_type)?,
+                    Self::cast_dtype_string_for_mil_type(effective_interface_type)?,
                 ));
             }
             main_block.outputs.push(output_name);
@@ -6518,9 +6547,30 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         for &output_id in &graph_info.output_operands {
             if let Some(operand) = graph_info.operand(output_id) {
                 let output_name = operand_name(graph_info, output_id);
+                // For int32 proxy outputs (e.g. argmin/argmax with int64 WebNN type),
+                // use Int32 at the model interface so it matches the function's emit type.
+                let feature_type = if int32_proxy_output_names.contains(&output_name) {
+                    use crate::protos::coreml::specification::{
+                        ArrayFeatureType, FeatureType, feature_type,
+                    };
+                    let mut af = ArrayFeatureType {
+                        data_type: crate::protos::coreml::specification::array_feature_type::ArrayDataType::Int32 as i32,
+                        ..Default::default()
+                    };
+                    let shape = operand.descriptor.static_or_max_shape();
+                    for &d in &shape {
+                        af.shape.push(d as i64);
+                    }
+                    FeatureType {
+                        r#type: Some(feature_type::Type::MultiArrayType(af)),
+                        is_optional: false,
+                    }
+                } else {
+                    Self::create_feature_type(&operand.descriptor)?
+                };
                 output_descriptions.push(FeatureDescription {
                     name: output_name,
-                    r#type: Some(Self::create_feature_type(&operand.descriptor)?),
+                    r#type: Some(feature_type),
                     ..Default::default()
                 });
             }
