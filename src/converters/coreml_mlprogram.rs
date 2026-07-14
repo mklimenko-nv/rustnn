@@ -2909,7 +2909,18 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         format: "coreml_mlprogram".to_string(),
                         reason: format!("Input operand {} not found", input_id),
                     })?;
-            let graph_mil_type = Self::mil_data_type(&operand.descriptor.data_type)?;
+            // int64/uint32/uint64 have no MIL tensor type; represent them internally
+            // as int32 (a proxy). The fp32 model input is cast to int32 here; the
+            // executor delivers the original integer values widened to float32.
+            let is_wide_int = matches!(
+                operand.descriptor.data_type,
+                DataType::Uint32 | DataType::Int64 | DataType::Uint64
+            );
+            let graph_mil_type = if is_wide_int {
+                crate::protos::coreml::mil_spec::DataType::Int32 as i32
+            } else {
+                Self::mil_data_type(&operand.descriptor.data_type)?
+            };
             let interface_mil_type = Self::interface_mil_data_type(&operand.descriptor.data_type);
             if graph_mil_type != interface_mil_type {
                 let input_name = operand_name(graph_info, input_id);
@@ -2921,10 +2932,15 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     graph_input_name,
                     graph_mil_type,
                 )?;
+                let cast_str = if is_wide_int {
+                    "int32"
+                } else {
+                    Self::cast_dtype_string_for_graph_type(&operand.descriptor.data_type)?
+                };
                 main_block.operations.push(Self::create_cast_operation(
                     input_name,
                     graph_input_type,
-                    Self::cast_dtype_string_for_graph_type(&operand.descriptor.data_type)?,
+                    cast_str,
                 ));
             }
         }
@@ -5442,6 +5458,52 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             continue;
                         }
                     }
+                }
+            }
+
+            // cast targeting int64/uint32/uint64: CoreML MIL has no such tensor type.
+            // Emit the cast to int32 and expose the output as an int32 proxy at the
+            // model interface (the executor widens int32 -> int64/uint64 on readback,
+            // or reinterprets int32 -> uint32 for same-width types).
+            if op_type_lower == "cast" {
+                use crate::protos::coreml::mil_spec::DataType as MilDataType;
+                let output_id =
+                    op.output_operand()
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: "cast operation has no output operand".to_string(),
+                        })?;
+                let out_dt = graph_info
+                    .operand(output_id)
+                    .map(|o| o.descriptor.data_type.clone());
+                if matches!(
+                    out_dt,
+                    Some(DataType::Uint32 | DataType::Int64 | DataType::Uint64)
+                ) {
+                    let input_names =
+                        Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                    let (output_name, _) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                    // Track the INTERFACE output name so the final cast loop and the model
+                    // feature description expose this output as int32 rather than float32.
+                    int32_proxy_output_names.insert(operand_name(graph_info, output_id));
+                    let out_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        output_id,
+                        output_name,
+                        MilDataType::Int32 as i32,
+                    )?;
+                    let mut inputs: HashMap<String, Argument> = HashMap::new();
+                    if let Some(first) = input_names.first() {
+                        inputs.insert("x".to_string(), Self::create_argument(first));
+                    }
+                    inputs.insert("dtype".to_string(), Self::create_immediate_string("int32"));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::CAST,
+                        inputs,
+                        vec![out_type],
+                    ));
+                    continue;
                 }
             }
 

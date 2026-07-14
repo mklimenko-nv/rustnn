@@ -580,8 +580,13 @@ unsafe fn fill_multiarray_from_bytes(
     // condition exposed as Float32 by CoreML), convert the source bytes to the
     // required element size before writing.
     let canonical_code = normalize_dtype_code(array_code);
+    // A different element size always needs conversion. So does a same-width
+    // dtype mismatch: uint32 (4 bytes) promoted into an fp32 (4 bytes) array must
+    // be converted by value, not copied as raw bits.
+    let same_width_mismatch =
+        canonical_code == 32 && !matches!(dtype, DataType::Float32 | DataType::Int32);
     if let Some(array_elem) = ml_dtype_code_element_size(canonical_code)
-        && array_elem != elem
+        && (array_elem != elem || same_width_mismatch)
     {
         if count == 0 {
             return Ok(());
@@ -632,9 +637,27 @@ fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count:
             }
             out
         }
-        (DataType::Int32 | DataType::Uint32, 32) => {
+        (DataType::Int32, 32) => {
             // int32 as float32 bits (reinterpret, same size — shouldn't normally happen)
             src.to_vec()
+        }
+        (DataType::Uint32, 32) => {
+            // uint32 → float32 by value (the interface promotes uint32 to float32).
+            let src_u32 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u32, count) };
+            let mut out = Vec::with_capacity(count * 4);
+            for &v in src_u32 {
+                out.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            out
+        }
+        (DataType::Uint64, 32) => {
+            // uint64 → float32 by value (the interface promotes uint64 to float32).
+            let src_u64 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u64, count) };
+            let mut out = Vec::with_capacity(count * 4);
+            for &v in src_u64 {
+                out.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            out
         }
         (DataType::Float32, 16) => {
             // float32 → float16
