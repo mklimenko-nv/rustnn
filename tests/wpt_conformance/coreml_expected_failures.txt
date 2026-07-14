@@ -29,8 +29,6 @@ coreml::mlNumber::cast_BigInt_to_uint64
 coreml::mlNumber::cast_BigInt_to_uint64_overflow
 coreml::mlNumber::cast_BigInt_to_uint64_underflow
 coreml::mlNumber::cast_float_to_integer
-coreml::mlNumber::cast_float_to_integer_overflows
-coreml::mlNumber::cast_float_to_integer_underflows
 coreml::neg::neg_int64_4D_tensor
 coreml::pad::pad_float16_4D_tensor_options_mode__edge_
 coreml::pad::pad_float16_4D_tensor_options_mode__reflection_
