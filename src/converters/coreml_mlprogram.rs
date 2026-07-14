@@ -703,15 +703,6 @@ impl CoremlMlProgramConverter {
                     })),
                 }
             }
-            _ => {
-                return Err(GraphError::ConversionFailed {
-                    format: "coreml_mlprogram".to_string(),
-                    reason: format!(
-                        "Unsupported constant data type: {:?}",
-                        operand.descriptor.data_type
-                    ),
-                });
-            }
         };
 
         // Create immediate value
@@ -1906,7 +1897,7 @@ impl CoremlMlProgramConverter {
             _ => (0, h, 2 * h),
         };
         let p = |s: &str| format!("{}_{}", prefix, s);
-        let mut gate = |block: &mut Block, off: u32, act: &str, tag: &str| -> String {
+        let gate = |block: &mut Block, off: u32, act: &str, tag: &str| -> String {
             let wg = Self::rnn_slice(
                 block,
                 w_name,
@@ -2000,7 +1991,7 @@ impl CoremlMlProgramConverter {
         };
         let (pi_off, po_off, pf_off) = (0u32, h, 2 * h);
         let p = |s: &str| format!("{}_{}", prefix, s);
-        let mut gate = |block: &mut Block,
+        let gate = |block: &mut Block,
                         off: u32,
                         act: &str,
                         tag: &str,
@@ -2616,7 +2607,7 @@ impl CoremlMlProgramConverter {
         let p = |s: &str| format!("{}_{}", output_name, s);
 
         // Compute a "reset/update"-style gate: activation(X·Wg^T + bg + H·Rg^T + rbg).
-        let mut gate = |block: &mut Block, off: u32, act: &str, tag: &str| -> String {
+        let gate = |block: &mut Block, off: u32, act: &str, tag: &str| -> String {
             let wg = Self::rnn_slice(
                 block,
                 &w_name,
@@ -2801,7 +2792,7 @@ impl CoremlMlProgramConverter {
         let p = |s: &str| format!("{}_{}", h_name, s);
 
         // gate = activation(X·Wg^T + bg + H·Rg^T + rbg [+ pg ⊙ cstate])
-        let mut gate = |block: &mut Block,
+        let gate = |block: &mut Block,
                         off: u32,
                         act: &str,
                         tag: &str,
