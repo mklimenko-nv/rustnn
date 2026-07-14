@@ -204,6 +204,17 @@ mod mil_ops {
 
     // Clamp operation
     pub const CLIP: &str = "clip";
+
+    // NaN and infinity detection operations
+    pub const IS_NAN: &str = "is_nan";
+    pub const IS_INF: &str = "is_inf";
+
+    // Gather N-dimensional
+    pub const GATHER_ND: &str = "gather_nd";
+
+    // Upsample/resample operations
+    pub const UPSAMPLE_NEAREST_NEIGHBOR: &str = "upsample_nearest_neighbor";
+    pub const UPSAMPLE_BILINEAR: &str = "upsample_bilinear";
 }
 
 // Default epsilon value used by several CoreML operations for numerical stability.
@@ -561,9 +572,20 @@ impl CoremlMlProgramConverter {
                     values: constant_data.data.clone().into(),
                 })),
             },
-            crate::graph::DataType::Uint32
-            | crate::graph::DataType::Int64
-            | crate::graph::DataType::Uint64 => TensorValue {
+            crate::graph::DataType::Int64 => {
+                // Reinterpret raw bytes as Vec<i64> using little-endian byte order.
+                let data = &constant_data.data;
+                let values: Vec<i64> = data
+                    .chunks_exact(8)
+                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                TensorValue {
+                    value: Some(tensor_value::Value::LongInts(
+                        tensor_value::RepeatedLongInts { values },
+                    )),
+                }
+            }
+            crate::graph::DataType::Uint32 | crate::graph::DataType::Uint64 => TensorValue {
                 value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
                     values: constant_data.data.clone().into(),
                 })),
@@ -1290,6 +1312,13 @@ impl CoremlMlProgramConverter {
             // Clamp operation
             "clamp" => mil_ops::CLIP,
 
+            // NaN and infinity detection
+            "isnan" => mil_ops::IS_NAN,
+            "isinfinite" => mil_ops::IS_INF,
+
+            // Gather N-dimensional
+            "gathernd" => mil_ops::GATHER_ND,
+
             _ => {
                 return Err(GraphError::ConversionFailed {
                     format: "coreml_mlprogram".to_string(),
@@ -1485,7 +1514,7 @@ impl CoremlMlProgramConverter {
                                         .position(|&d| d == scale_len)
                                         .map(|i| i as u32)
                                 })
-                                .unwrap_or(1);
+                                .unwrap_or(0);
                             inputs.insert("axis".to_string(), Self::create_immediate_int(axis));
                         }
                     }
@@ -1856,6 +1885,21 @@ impl CoremlMlProgramConverter {
                             "kernel_sizes".to_string(),
                             Self::create_immediate_int_array(window_dimensions),
                         );
+                    } else {
+                        // window_dimensions is None or empty: infer kernel_sizes from input shape.
+                        // For NCHW (guaranteed above), shape = [N, C, H, W], spatial dims at [2], [3].
+                        if let Some(&input_id) = op.input_operands().first() {
+                            if let Some(input_op) = graph.operand(input_id) {
+                                let shape = input_op.descriptor.static_or_max_shape();
+                                if shape.len() >= 4 {
+                                    let kernel_sizes = vec![shape[2], shape[3]];
+                                    inputs.insert(
+                                        "kernel_sizes".to_string(),
+                                        Self::create_immediate_int_array(&kernel_sizes),
+                                    );
+                                }
+                            }
+                        }
                     }
                     let strides = if opts.strides.is_empty() {
                         vec![1u32, 1]
@@ -1886,10 +1930,11 @@ impl CoremlMlProgramConverter {
                             Self::create_immediate_string("custom"),
                         );
                     } else {
-                        // CoreML avg_pool/max_pool requires explicit pad even when zero.
+                        // CoreML avg_pool/max_pool requires pad to be exactly 4 elements
+                        // (2 * spatial_rank) even when all zeros.
                         inputs.insert(
                             "pad".to_string(),
-                            Self::create_immediate_int_array(&[0u32; 0]),
+                            Self::create_immediate_int_array(&[0u32, 0, 0, 0]),
                         );
                         inputs.insert(
                             "pad_type".to_string(),
@@ -1897,9 +1942,23 @@ impl CoremlMlProgramConverter {
                         );
                     }
                 } else {
+                    // No opts: infer kernel_sizes from input shape (NCHW: spatial dims at [2], [3]).
+                    if let Some(&input_id) = op.input_operands().first() {
+                        if let Some(input_op) = graph.operand(input_id) {
+                            let shape = input_op.descriptor.static_or_max_shape();
+                            if shape.len() >= 4 {
+                                let kernel_sizes = vec![shape[2], shape[3]];
+                                inputs.insert(
+                                    "kernel_sizes".to_string(),
+                                    Self::create_immediate_int_array(&kernel_sizes),
+                                );
+                            }
+                        }
+                    }
+                    // CoreML requires pad to be exactly 4 elements even when all zeros.
                     inputs.insert(
                         "pad".to_string(),
-                        Self::create_immediate_int_array(&[0u32; 0]),
+                        Self::create_immediate_int_array(&[0u32, 0, 0, 0]),
                     );
                     inputs.insert(
                         "pad_type".to_string(),
@@ -2433,6 +2492,10 @@ impl CoremlMlProgramConverter {
                         Self::create_argument(&input_names[2]),
                     );
                     inputs.insert("mode".to_string(), Self::create_immediate_string("update"));
+                    inputs.insert(
+                        "validate_indices".to_string(),
+                        Self::create_immediate_bool(false),
+                    );
                 }
 
             Operation::Tile { repetitions, .. } => {
@@ -2587,6 +2650,42 @@ impl CoremlMlProgramConverter {
                         Self::create_immediate_bool(opts.keep_dimensions),
                     );
                 }
+            }
+
+            Operation::GatherND { input, indices, .. } => {
+                // CoreML gather_nd crashes (SIGABRT) on rank-5+ inputs; guard against it.
+                if let Some(input_op) = graph.operand(*input) {
+                    if input_op.descriptor.shape.len() > 4 {
+                        return Err(GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!(
+                                "CoreML gather_nd does not support input rank > 4; got rank {}",
+                                input_op.descriptor.shape.len()
+                            ),
+                        });
+                    }
+                }
+                // gather_nd: x (data), indices, validate_indices (required by CoreML)
+                inputs.insert(
+                    "x".to_string(),
+                    Self::create_argument(&operand_name(graph, *input)),
+                );
+                inputs.insert(
+                    "indices".to_string(),
+                    Self::create_argument(&operand_name(graph, *indices)),
+                );
+                inputs.insert(
+                    "validate_indices".to_string(),
+                    Self::create_immediate_bool(false),
+                );
+            }
+
+            // isNaN and isInfinite: single input 'x'
+            Operation::IsNaN { input, .. } | Operation::IsInfinite { input, .. } => {
+                inputs.insert(
+                    "x".to_string(),
+                    Self::create_argument(&operand_name(graph, *input)),
+                );
             }
 
             _ => {}
@@ -3100,6 +3199,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     | "logicalor"
                     | "logicalxor"
                     | "notequal"
+                    | "isnan"
+                    | "isinfinite"
             ) {
                 use crate::protos::coreml::mil_spec::DataType as MilDataType;
 
@@ -3201,6 +3302,74 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     main_block.operations.push(Self::create_mil_operation(
                         mil_ops::LOGICAL_NOT,
                         not_inputs,
+                        vec![bool_output_type],
+                    ));
+                } else if op_type_lower == "isnan" {
+                    // isNaN(x): NaN is the only value where x != x. Use equal(x,x) then not().
+                    let input_name = input_names.first().cloned().unwrap_or_default();
+                    let eq_name = format!("{}_isnan_eq", output_name);
+                    let eq_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        output_id,
+                        eq_name.clone(),
+                        MilDataType::Bool as i32,
+                    )?;
+                    let mut eq_inputs = HashMap::new();
+                    eq_inputs.insert(
+                        "x".to_string(),
+                        Self::create_name_argument(input_name.clone()),
+                    );
+                    eq_inputs.insert("y".to_string(), Self::create_name_argument(input_name));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::EQUAL,
+                        eq_inputs,
+                        vec![eq_type],
+                    ));
+                    let mut not_inputs = HashMap::new();
+                    not_inputs.insert("x".to_string(), Self::create_name_argument(eq_name));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::LOGICAL_NOT,
+                        not_inputs,
+                        vec![bool_output_type],
+                    ));
+                } else if op_type_lower == "isinfinite" {
+                    // isInfinite(x): abs(x) > f32::MAX is true only for ±inf; NaN > anything = false.
+                    let input_name = input_names.first().cloned().unwrap_or_default();
+                    let abs_name = format!("{}_isinf_abs", output_name);
+                    // Determine input dtype for abs output type
+                    let input_dtype = op
+                        .input_operands()
+                        .first()
+                        .and_then(|&id| graph_info.operand(id))
+                        .map(|o| &o.descriptor.data_type)
+                        .cloned()
+                        .unwrap_or(DataType::Float32);
+                    let abs_mil_dtype = Self::mil_data_type(&input_dtype)?;
+                    let abs_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        output_id,
+                        abs_name.clone(),
+                        abs_mil_dtype,
+                    )?;
+                    let mut abs_inputs = HashMap::new();
+                    abs_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::ABS,
+                        abs_inputs,
+                        vec![abs_type],
+                    ));
+                    // f32::MAX is the largest finite float32; the only float32 > f32::MAX is +inf.
+                    let max_val = if input_dtype == DataType::Float16 {
+                        65504.0_f32 // f16::MAX
+                    } else {
+                        f32::MAX
+                    };
+                    let mut gt_inputs = HashMap::new();
+                    gt_inputs.insert("x".to_string(), Self::create_name_argument(abs_name));
+                    gt_inputs.insert("y".to_string(), Self::create_immediate_float(max_val));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::GREATER,
+                        gt_inputs,
                         vec![bool_output_type],
                     ));
                 } else {
@@ -4181,6 +4350,128 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         continue;
                     }
                 }
+            }
+
+            // Special handling for resample2d: lower to CoreML upsample ops.
+            // Only handles 4D NCHW inputs (default WebNN layout) with scales or sizes.
+            if op_type_lower == "resample2d" {
+                if op.input_operands().is_empty() || op.output_operand().is_none() {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".to_string(),
+                        reason: "resample2d requires input and output operand".to_string(),
+                    });
+                }
+
+                let input_id = op.input_operands()[0];
+                let output_id = op.output_operand().unwrap();
+
+                let input_operand =
+                    graph_info
+                        .operand(input_id)
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("resample2d input operand {input_id} not found"),
+                        })?;
+
+                let opts = match op {
+                    Operation::Resample2d { options, .. } => options.clone().unwrap_or_default(),
+                    _ => Default::default(),
+                };
+
+                let input_shape = input_operand.descriptor.static_or_max_shape();
+                if input_shape.len() < 4 {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".to_string(),
+                        reason: format!(
+                            "resample2d requires 4D NCHW input, got {}D",
+                            input_shape.len()
+                        ),
+                    });
+                }
+
+                // Determine scale factors for height (dim 2) and width (dim 3).
+                let (scale_h, scale_w) = if !opts.scales.is_empty() {
+                    let sh = if opts.scales.len() > 0 {
+                        opts.scales[0]
+                    } else {
+                        1.0
+                    };
+                    let sw = if opts.scales.len() > 1 {
+                        opts.scales[1]
+                    } else {
+                        1.0
+                    };
+                    (sh, sw)
+                } else if let Some(sizes) = &opts.sizes {
+                    if sizes.len() >= 2 {
+                        let input_h = input_shape[2] as f32;
+                        let input_w = input_shape[3] as f32;
+                        if input_h == 0.0 || input_w == 0.0 {
+                            return Err(GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: "resample2d: input spatial dimensions are zero".to_string(),
+                            });
+                        }
+                        (sizes[0] as f32 / input_h, sizes[1] as f32 / input_w)
+                    } else {
+                        (1.0, 1.0)
+                    }
+                } else {
+                    (1.0, 1.0)
+                };
+
+                let mode = if opts.mode.is_empty() {
+                    "nearest-neighbor"
+                } else {
+                    opts.mode.as_str()
+                };
+
+                let mil_op_name = if mode.eq_ignore_ascii_case("linear") {
+                    mil_ops::UPSAMPLE_BILINEAR
+                } else {
+                    mil_ops::UPSAMPLE_NEAREST_NEIGHBOR
+                };
+
+                let input_name =
+                    Self::output_name_for_operand(graph_info, input_id, &operand_name_overrides);
+                let (output_name, output_type) =
+                    Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                let _ = output_name;
+
+                let mut resample_inputs: HashMap<String, Argument> = HashMap::new();
+                resample_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                resample_inputs.insert(
+                    "scale_factor_height".to_string(),
+                    Self::create_immediate_float(scale_h),
+                );
+                resample_inputs.insert(
+                    "scale_factor_width".to_string(),
+                    Self::create_immediate_float(scale_w),
+                );
+                if mode.eq_ignore_ascii_case("linear") {
+                    resample_inputs.insert(
+                        "align_corners".to_string(),
+                        Self::create_immediate_bool(false),
+                    );
+                    resample_inputs.insert(
+                        "half_pixel_centers".to_string(),
+                        Self::create_immediate_bool(false),
+                    );
+                }
+
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_op_name,
+                    resample_inputs,
+                    vec![output_type],
+                ));
+
+                // Flush deferred transposes for this output
+                if let Some((pending_ops, transposed_name)) = deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
+                continue;
             }
 
             let mil_op =
