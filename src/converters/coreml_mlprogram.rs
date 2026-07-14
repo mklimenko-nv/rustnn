@@ -112,6 +112,7 @@ mod mil_ops {
     pub const CONV_TRANSPOSE: &str = "conv_transpose";
     pub const AVG_POOL: &str = "avg_pool";
     pub const MAX_POOL: &str = "max_pool";
+    pub const L2_POOL: &str = "l2_pool";
     pub const GLOBAL_AVG_POOL: &str = "reduce_mean"; // Global pooling via reduction
     pub const GLOBAL_MAX_POOL: &str = "reduce_max"; // Global pooling via reduction
 
@@ -1237,6 +1238,7 @@ impl CoremlMlProgramConverter {
             "convtranspose2d" => mil_ops::CONV_TRANSPOSE,
             "averagepool2d" => mil_ops::AVG_POOL,
             "maxpool2d" => mil_ops::MAX_POOL,
+            "l2pool2d" => mil_ops::L2_POOL,
             "globalaveragepool" => mil_ops::GLOBAL_AVG_POOL,
             "globalmaxpool" => mil_ops::GLOBAL_MAX_POOL,
 
@@ -1850,6 +1852,9 @@ impl CoremlMlProgramConverter {
                 options: pool_opts, ..
             }
             | Operation::MaxPool2d {
+                options: pool_opts, ..
+            }
+            | Operation::L2Pool2d {
                 options: pool_opts, ..
             } => {
                 // NHWC pooling is handled by emitting NHWC→NCHW transpose wrappers in the
@@ -6201,10 +6206,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             // Special handling for averagePool2d / maxPool2d with NHWC layout.
             // CoreML pooling only supports NCHW, so we wrap with transpose ops:
             //   transpose(NHWC→NCHW), pool(NCHW), transpose(NCHW→NHWC).
-            if op_type_lower == "averagepool2d" || op_type_lower == "maxpool2d" {
+            if op_type_lower == "averagepool2d"
+                || op_type_lower == "maxpool2d"
+                || op_type_lower == "l2pool2d"
+            {
                 let pool_layout = match op {
                     Operation::AveragePool2d { options, .. }
-                    | Operation::MaxPool2d { options, .. } => {
+                    | Operation::MaxPool2d { options, .. }
+                    | Operation::L2Pool2d { options, .. } => {
                         options.as_ref().map(|o| o.layout.as_str()).unwrap_or("")
                     }
                     _ => "",
