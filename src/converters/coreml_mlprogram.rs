@@ -1501,11 +1501,15 @@ impl CoremlMlProgramConverter {
                             Self::create_argument(&input_names[2]),
                         );
                     }
-                    // When scale is rank-1 (per-channel), CoreML requires an explicit axis.
-                    // Find which dimension of the input tensor the scale elements correspond to.
+                    // When scale is truly per-channel (rank-1 with >1 elements), CoreML requires
+                    // an explicit axis. For per-tensor (scalar or single-element), omit axis.
+                    // Note: single-element scales [1] are squeezed to scalar at constant emit
+                    // time; emitting axis alongside a scalar scale causes a CoreML compile error.
                     if let Some(scale_op) = graph.operand(*scale_id) {
-                        if scale_op.descriptor.shape.len() == 1 {
-                            let scale_len = scale_op.descriptor.static_or_max_shape().first().copied().unwrap_or(0);
+                        let scale_shape = scale_op.descriptor.static_or_max_shape();
+                        let scale_len = scale_shape.first().copied().unwrap_or(0);
+                        let is_per_channel = scale_op.descriptor.shape.len() == 1 && scale_len > 1;
+                        if is_per_channel {
                             let axis = graph.operand(*inp_id)
                                 .and_then(|inp| {
                                     inp.descriptor.static_or_max_shape()
@@ -2859,19 +2863,28 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             if matches!(op_lower.as_str(), "quantizelinear" | "dequantizelinear") {
                 let input_ids = op.input_operands();
                 // Squeeze shape for both scale (index 1) and zero_point (index 2).
+                // CoreML interprets a rank-1 scale as per-channel; for per-tensor semantics,
+                // scale/zp must be scalar. Squeeze rank > 1 AND rank-1 with single element [1].
                 for &param_idx in &[1usize, 2usize] {
                     if let Some(&param_id) = input_ids.get(param_idx) {
                         if let Some(param_operand) = graph_info.operand(param_id) {
-                            if param_operand.descriptor.shape.len() > 1 {
+                            let shape = &param_operand.descriptor.shape;
+                            let needs_sq = shape.len() > 1
+                                || (shape.len() == 1
+                                    && matches!(shape[0], GraphDimension::Static(1)));
+                            if needs_sq {
                                 scale_ids_to_squeeze.insert(param_id);
                             }
                         }
                     }
                 }
                 // Determine the expected zero_point data type.
-                // For quantize: zp type = output type.
-                // For dequantize: zp type = input type.
-                let zp_expected_type = if op_lower == "quantizelinear" {
+                // For quantize: zp type = output type (the quantized representation).
+                // For dequantize: zp type = input type (the quantized representation).
+                // CoreML only accepts int8 or uint8 for zero_point; coerce anything else
+                // (e.g. Int32 from some WebNN graphs) to the nearest compatible type.
+                // convert_zp_bytes handles Int32→Int8 and Int32→Uint8 byte reinterpretation.
+                let zp_webnn_type = if op_lower == "quantizelinear" {
                     op.output_operand()
                         .and_then(|id| graph_info.operand(id))
                         .map(|o| o.descriptor.data_type.clone())
@@ -2882,8 +2895,25 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         .and_then(|&id| graph_info.operand(id))
                         .map(|o| o.descriptor.data_type.clone())
                 };
+                let zp_expected_type = zp_webnn_type.map(|dt| match dt {
+                    DataType::Uint8 => DataType::Uint8,
+                    _ => DataType::Int8,
+                });
                 if let (Some(&zp_id), Some(expected_dt)) = (input_ids.get(2), zp_expected_type) {
                     zp_id_to_dtype.insert(zp_id, expected_dt);
+                }
+                // For dequantize, CoreML also requires the INPUT (index 0) to be int8 or uint8.
+                // If the input is a constant Int32 tensor, coerce its bytes to int8/uint8 so
+                // CoreML accepts it. Non-constant Int32 inputs are handled with a cast op below.
+                if op_lower == "dequantizelinear" {
+                    if let Some(&input_id) = input_ids.first() {
+                        if let Some(input_op) = graph_info.operand(input_id) {
+                            if matches!(input_op.descriptor.data_type, DataType::Int32) {
+                                let target = DataType::Int8;
+                                zp_id_to_dtype.insert(input_id, target);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5153,6 +5183,102 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         output_type,
                         final_dtype,
                     ));
+                    continue;
+                }
+            }
+
+            // Special handling for conv2d / convTranspose2d with NHWC layout.
+            // CoreML conv requires NCHW. The pre-scan (above) has already transposed input and
+            // filter operands to NCHW and recorded the overrides. Here we run the conv op with
+            // an intermediate NCHW output name, then post-transpose to restore NHWC.
+            if op_type_lower == "conv2d" || op_type_lower == "convtranspose2d" {
+                let conv_layout = match op {
+                    Operation::Conv2d { options, .. } => options
+                        .as_ref()
+                        .map(|o| o.input_layout.as_str())
+                        .unwrap_or(""),
+                    Operation::ConvTranspose2d { options, .. } => options
+                        .as_ref()
+                        .map(|o| o.input_layout.as_str())
+                        .unwrap_or(""),
+                    _ => "",
+                };
+                if conv_layout.eq_ignore_ascii_case("nhwc") {
+                    let output_id =
+                        op.output_operand()
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("{} op has no output operand", op.op_type()),
+                            })?;
+                    let output_operand = graph_info.operand(output_id).ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("conv2d output operand {} not found", output_id),
+                        }
+                    })?;
+
+                    let (output_name, output_type) =
+                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                    let dtype = Self::mil_data_type(&output_operand.descriptor.data_type)?;
+
+                    // Intermediate NCHW output: permute NHWC [N,H',W',C'] → [N,C',H',W']
+                    let nchw_perm = [0u32, 3, 1, 2];
+                    let nchw_out_shape =
+                        Self::permute_graph_shape(&output_operand.descriptor.shape, &nchw_perm);
+                    let nchw_out_dims =
+                        Self::mil_dimensions_from_graph_shape(&nchw_out_shape, false);
+                    let nchw_out_name = format!("{}_nchw_out", output_name);
+                    let nchw_out_type = NamedValueType {
+                        name: nchw_out_name.clone(),
+                        r#type: Some(ValueType {
+                            r#type: Some(
+                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                    TensorType {
+                                        rank: nchw_out_dims.len() as i64,
+                                        data_type: dtype,
+                                        dimensions: nchw_out_dims,
+                                        attributes: HashMap::new(),
+                                    },
+                                ),
+                            ),
+                        }),
+                    };
+
+                    // Run conv with NCHW-transposed inputs (set up by pre-scan) and NCHW output
+                    let input_names =
+                        Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                    let conv_op = self.convert_operation_with_input_names_and_outputs(
+                        graph_info,
+                        op,
+                        &input_names,
+                        vec![nchw_out_type],
+                        mil_op_type,
+                    )?;
+                    main_block.operations.push(conv_op);
+
+                    // Post-transpose: NCHW [N,C',H',W'] → NHWC [N,H',W',C'], perm=[0,2,3,1]
+                    let post_perm = [0u32, 2, 3, 1];
+                    let mut post_tp_inputs: HashMap<String, Argument> = HashMap::new();
+                    post_tp_inputs
+                        .insert("x".to_string(), Self::create_name_argument(nchw_out_name));
+                    post_tp_inputs.insert(
+                        "perm".to_string(),
+                        Self::create_immediate_int_array(&post_perm),
+                    );
+                    main_block.operations.push(Self::create_mil_operation(
+                        "transpose",
+                        post_tp_inputs,
+                        vec![output_type],
+                    ));
+
+                    // Flush deferred transposes for this output
+                    if let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                    {
+                        main_block.operations.extend(pending_ops);
+                        operand_name_overrides.insert(output_id, transposed_name);
+                    }
                     continue;
                 }
             }
