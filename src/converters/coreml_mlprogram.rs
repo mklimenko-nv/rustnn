@@ -3745,6 +3745,166 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            // Relu with integer input: CoreML relu only accepts float (fp32/fp16).
+            // Cast int → fp32, apply relu, cast back.
+            if op_type_lower == "relu" {
+                if let (Some(&input_id), Some(output_id)) =
+                    (op.input_operands().first(), op.output_operand())
+                {
+                    if let Some(input_op) = graph_info.operand(input_id) {
+                        let int_dtype = input_op.descriptor.data_type.clone();
+                        let is_castable_int = matches!(
+                            int_dtype,
+                            DataType::Int8 | DataType::Uint8 | DataType::Int32
+                        );
+                        if is_castable_int {
+                            let int_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let (output_name, output_type) = Self::create_output_value(
+                                graph_info,
+                                output_id,
+                                &operand_name_overrides,
+                            )?;
+                            let float_name = format!("{}_relu_float", output_name);
+                            let float_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                output_id,
+                                float_name.clone(),
+                                crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                            )?;
+                            main_block
+                                .operations
+                                .push(Self::create_cast_operation(int_name, float_type, "fp32"));
+                            let relu_name = format!("{}_relu_result", output_name);
+                            let relu_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                output_id,
+                                relu_name.clone(),
+                                crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                            )?;
+                            let mut relu_inputs = HashMap::new();
+                            relu_inputs
+                                .insert("x".to_string(), Self::create_name_argument(float_name));
+                            main_block.operations.push(Self::create_mil_operation(
+                                mil_ops::RELU,
+                                relu_inputs,
+                                vec![relu_type],
+                            ));
+                            let back_dtype = Self::cast_dtype_string_for_graph_type(&int_dtype)?;
+                            main_block.operations.push(Self::create_cast_operation(
+                                relu_name,
+                                output_type,
+                                back_dtype,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Pad with integer input: CoreML pad only accepts float (fp32/fp16).
+            // Cast int → fp32, apply pad with float constant_val, cast back.
+            if op_type_lower == "pad" {
+                if let (Some(&input_id), Some(output_id)) =
+                    (op.input_operands().first(), op.output_operand())
+                {
+                    if let Some(input_op) = graph_info.operand(input_id) {
+                        let int_dtype = input_op.descriptor.data_type.clone();
+                        let is_castable_int = matches!(
+                            int_dtype,
+                            DataType::Int8 | DataType::Uint8 | DataType::Int32
+                        );
+                        if is_castable_int {
+                            let (beginning_padding, ending_padding, options) = match op {
+                                Operation::Pad {
+                                    beginning_padding,
+                                    ending_padding,
+                                    options,
+                                    ..
+                                } => (beginning_padding, ending_padding, options.as_ref()),
+                                _ => {
+                                    continue;
+                                }
+                            };
+                            let int_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let (output_name, output_type) = Self::create_output_value(
+                                graph_info,
+                                output_id,
+                                &operand_name_overrides,
+                            )?;
+                            // Cast input to float32
+                            let float_name = format!("{}_pad_float", output_name);
+                            let float_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                input_id,
+                                float_name.clone(),
+                                crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                            )?;
+                            main_block
+                                .operations
+                                .push(Self::create_cast_operation(int_name, float_type, "fp32"));
+                            // Build pad inputs with float32 constant_val
+                            let pad_vec: Vec<u32> = beginning_padding
+                                .iter()
+                                .zip(ending_padding.iter())
+                                .flat_map(|(a, b)| [*a, *b])
+                                .collect();
+                            let webnn_mode = options.map(|o| o.mode.as_str()).unwrap_or("constant");
+                            let coreml_mode = match webnn_mode {
+                                "edge" => "replicate",
+                                "reflection" | "symmetric" => "reflect",
+                                _ => "constant",
+                            };
+                            let constant_val = options
+                                .and_then(|o| Self::parse_mlnumber_f64(o.value.as_ref()))
+                                .unwrap_or(0.0);
+                            let padded_name = format!("{}_pad_padded", output_name);
+                            let padded_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                output_id,
+                                padded_name.clone(),
+                                crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                            )?;
+                            let mut pad_inputs = HashMap::new();
+                            pad_inputs
+                                .insert("x".to_string(), Self::create_name_argument(float_name));
+                            pad_inputs.insert(
+                                "pad".to_string(),
+                                Self::create_immediate_int_array(&pad_vec),
+                            );
+                            pad_inputs.insert(
+                                "mode".to_string(),
+                                Self::create_immediate_string(coreml_mode),
+                            );
+                            pad_inputs.insert(
+                                "constant_val".to_string(),
+                                Self::create_immediate_float(constant_val as f32),
+                            );
+                            main_block.operations.push(Self::create_mil_operation(
+                                mil_ops::PAD,
+                                pad_inputs,
+                                vec![padded_type],
+                            ));
+                            // Cast back to the original int type
+                            let back_dtype = Self::cast_dtype_string_for_graph_type(&int_dtype)?;
+                            main_block.operations.push(Self::create_cast_operation(
+                                padded_name,
+                                output_type,
+                                back_dtype,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Special handling for hardswish (decompose into hardsigmoid + mul)
             // Following Chromium: hardswish = x * hardsigmoid(x, alpha=1/6, beta=0.5)
             // Note: op_type is "hardSwish" but we normalize to lowercase
@@ -4652,8 +4812,265 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 continue;
             }
 
-            // Special handling for argmax/argmin: CoreML outputs int32 but WebNN declares int64.
-            // Emit with int32 intermediate output and cast to int64 when needed.
+            // Dequantize/quantize with rank-0 (scalar) input: CoreML requires rank >= 1.
+            // Reshape [] → [1] before the op. The output type from create_output_value already
+            // promotes 0D to [1] (scalar_as_one_dim=true), so no reshape back is needed.
+            if op_type_lower == "dequantizelinear" || op_type_lower == "quantizelinear" {
+                if let Some(&input_id) = op.input_operands().first() {
+                    if let Some(input_op) = graph_info.operand(input_id) {
+                        if input_op.descriptor.shape.is_empty() {
+                            let input_mil_type =
+                                Self::mil_data_type(&input_op.descriptor.data_type)?;
+                            let input_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let output_id = op.output_operand().ok_or_else(|| {
+                                GraphError::ConversionFailed {
+                                    format: "coreml_mlprogram".to_string(),
+                                    reason: format!(
+                                        "dequantize/quantize op '{}' has no output",
+                                        op.op_type()
+                                    ),
+                                }
+                            })?;
+                            let output_name = Self::output_name_for_operand(
+                                graph_info,
+                                output_id,
+                                &operand_name_overrides,
+                            );
+                            // Reshape [] → [1]
+                            let reshaped_name = format!("{}_dq_in_1d", output_name);
+                            let reshaped_type = NamedValueType {
+                                name: reshaped_name.clone(),
+                                r#type: Some(ValueType {
+                                    r#type: Some(
+                                        crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                            TensorType {
+                                                rank: 1,
+                                                data_type: input_mil_type,
+                                                dimensions: vec![Dimension {
+                                                    dimension: Some(
+                                                        dimension::Dimension::Constant(
+                                                            dimension::ConstantDimension { size: 1 },
+                                                        ),
+                                                    ),
+                                                }],
+                                                attributes: HashMap::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                            };
+                            let mut reshape_inputs = HashMap::new();
+                            reshape_inputs
+                                .insert("x".to_string(), Self::create_name_argument(input_name));
+                            reshape_inputs.insert(
+                                "shape".to_string(),
+                                Self::create_immediate_int_array(&[1u32]),
+                            );
+                            main_block.operations.push(Self::create_mil_operation(
+                                "reshape",
+                                reshape_inputs,
+                                vec![reshaped_type],
+                            ));
+                            // Apply dequantize/quantize with the [1] input override
+                            let mut overrides_with_1d = operand_name_overrides.clone();
+                            overrides_with_1d.insert(input_id, reshaped_name);
+                            let mil_op = self.convert_operation_with_overrides(
+                                graph_info,
+                                op,
+                                &overrides_with_1d,
+                            )?;
+                            main_block.operations.push(mil_op);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // BatchNormalization with rank < 3: CoreML batch_norm requires rank >= 3.
+            // Reshape input to 3D based on the axis parameter, apply batch_norm, reshape back.
+            if op_type_lower == "batchnormalization" {
+                if let Some(&input_id) = op.input_operands().first() {
+                    if let Some(input_op) = graph_info.operand(input_id) {
+                        let input_rank = input_op.descriptor.shape.len();
+                        if input_rank < 3 {
+                            let axis = match op {
+                                Operation::BatchNormalization { options, .. } => {
+                                    options.as_ref().map(|o| o.axis as usize).unwrap_or(1)
+                                }
+                                _ => 1,
+                            };
+                            let output_id = op.output_operand().ok_or_else(|| {
+                                GraphError::ConversionFailed {
+                                    format: "coreml_mlprogram".to_string(),
+                                    reason: format!("batchNorm op has no output operand"),
+                                }
+                            })?;
+                            let (output_name, output_type) = Self::create_output_value(
+                                graph_info,
+                                output_id,
+                                &operand_name_overrides,
+                            )?;
+                            let input_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let input_dtype = Self::mil_data_type(&input_op.descriptor.data_type)?;
+
+                            // Compute 3D shape: [batch_dims_product, C, spatial_dims_product]
+                            let shape = &input_op.descriptor.shape;
+                            let batch_size: u32 = shape[..axis]
+                                .iter()
+                                .map(|d| match d {
+                                    GraphDimension::Static(v) => *v,
+                                    GraphDimension::Dynamic(d) => d.max_size,
+                                })
+                                .product::<u32>()
+                                .max(1);
+                            let channel_size: u32 = if axis < shape.len() {
+                                match &shape[axis] {
+                                    GraphDimension::Static(v) => *v,
+                                    GraphDimension::Dynamic(d) => d.max_size,
+                                }
+                            } else {
+                                1
+                            };
+                            let spatial_size: u32 = shape[axis + 1..]
+                                .iter()
+                                .map(|d| match d {
+                                    GraphDimension::Static(v) => *v,
+                                    GraphDimension::Dynamic(d) => d.max_size,
+                                })
+                                .product::<u32>()
+                                .max(1);
+                            let shape_3d = [batch_size, channel_size, spatial_size];
+
+                            // Reshape input to 3D
+                            let reshaped_input_name = format!("{}_bn_in_3d", output_name);
+                            let reshaped_input_type = NamedValueType {
+                                name: reshaped_input_name.clone(),
+                                r#type: Some(ValueType {
+                                    r#type: Some(
+                                        crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                            TensorType {
+                                                rank: 3,
+                                                data_type: input_dtype,
+                                                dimensions: shape_3d
+                                                    .iter()
+                                                    .map(|&d| Dimension {
+                                                        dimension: Some(
+                                                            dimension::Dimension::Constant(
+                                                                dimension::ConstantDimension {
+                                                                    size: d as u64,
+                                                                },
+                                                            ),
+                                                        ),
+                                                    })
+                                                    .collect(),
+                                                attributes: HashMap::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                            };
+                            let mut reshape_in_inputs = HashMap::new();
+                            reshape_in_inputs
+                                .insert("x".to_string(), Self::create_name_argument(input_name));
+                            reshape_in_inputs.insert(
+                                "shape".to_string(),
+                                Self::create_immediate_int_array(&shape_3d),
+                            );
+                            main_block.operations.push(Self::create_mil_operation(
+                                "reshape",
+                                reshape_in_inputs,
+                                vec![reshaped_input_type],
+                            ));
+
+                            // Apply batch_norm on the 3D tensor
+                            let bn_result_name = format!("{}_bn_out_3d", output_name);
+                            let bn_result_type = NamedValueType {
+                                name: bn_result_name.clone(),
+                                r#type: Some(ValueType {
+                                    r#type: Some(
+                                        crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                            TensorType {
+                                                rank: 3,
+                                                data_type: input_dtype,
+                                                dimensions: shape_3d
+                                                    .iter()
+                                                    .map(|&d| Dimension {
+                                                        dimension: Some(
+                                                            dimension::Dimension::Constant(
+                                                                dimension::ConstantDimension {
+                                                                    size: d as u64,
+                                                                },
+                                                            ),
+                                                        ),
+                                                    })
+                                                    .collect(),
+                                                attributes: HashMap::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                            };
+                            let mut overrides_with_3d = operand_name_overrides.clone();
+                            overrides_with_3d.insert(input_id, reshaped_input_name);
+                            let bn_op = self.convert_operation_with_input_names_and_outputs(
+                                graph_info,
+                                op,
+                                &Self::input_names_for_operation(
+                                    graph_info,
+                                    op,
+                                    &overrides_with_3d,
+                                ),
+                                vec![bn_result_type],
+                                self.get_mil_op_type(op.op_type())?,
+                            )?;
+                            main_block.operations.push(bn_op);
+
+                            // Reshape 3D result back to original output shape
+                            let orig_output_shape: Vec<u32> = graph_info
+                                .operand(output_id)
+                                .map(|o| {
+                                    o.descriptor
+                                        .shape
+                                        .iter()
+                                        .map(|d| match d {
+                                            GraphDimension::Static(v) => *v,
+                                            GraphDimension::Dynamic(d) => d.max_size,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let mut reshape_out_inputs = HashMap::new();
+                            reshape_out_inputs.insert(
+                                "x".to_string(),
+                                Self::create_name_argument(bn_result_name),
+                            );
+                            reshape_out_inputs.insert(
+                                "shape".to_string(),
+                                Self::create_immediate_int_array(&orig_output_shape),
+                            );
+                            main_block.operations.push(Self::create_mil_operation(
+                                "reshape",
+                                reshape_out_inputs,
+                                vec![output_type],
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // ArgMax/ArgMin: handle both int input types and int64 output type.
+            // CoreML reduce_argmax/reduce_argmin only accepts float input and produces int32.
+            // For int8/uint8/int32 inputs: cast to float32 first.
+            // For int64 output: cast the int32 result to int64.
             if op_type_lower == "argmax" || op_type_lower == "argmin" {
                 use crate::protos::coreml::mil_spec::DataType as MilDataType;
                 let output_id =
@@ -4669,9 +5086,50 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             format: "coreml_mlprogram".to_string(),
                             reason: format!("Output operand {} not found", output_id),
                         })?;
-                if output_operand.descriptor.data_type == DataType::Int64 {
+
+                let int_input_id = op.input_operands().first().copied();
+                let input_needs_float_cast = int_input_id
+                    .and_then(|id| graph_info.operand(id))
+                    .map(|inp| {
+                        matches!(
+                            inp.descriptor.data_type,
+                            DataType::Int8 | DataType::Uint8 | DataType::Int32
+                        )
+                    })
+                    .unwrap_or(false);
+                let output_is_int64 = output_operand.descriptor.data_type == DataType::Int64;
+
+                if input_needs_float_cast || output_is_int64 {
                     let (output_name, output_type) =
                         Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+
+                    // Optional: cast integer input to float32
+                    let mut input_names =
+                        Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                    if input_needs_float_cast {
+                        if let Some(input_id) = int_input_id {
+                            let orig_name = Self::output_name_for_operand(
+                                graph_info,
+                                input_id,
+                                &operand_name_overrides,
+                            );
+                            let float_name = format!("{}_arg_float", output_name);
+                            let float_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                input_id,
+                                float_name.clone(),
+                                MilDataType::Float32 as i32,
+                            )?;
+                            main_block
+                                .operations
+                                .push(Self::create_cast_operation(orig_name, float_type, "fp32"));
+                            if !input_names.is_empty() {
+                                input_names[0] = float_name;
+                            }
+                        }
+                    }
+
+                    // Apply argmax/argmin (CoreML always produces int32)
                     let int32_name = format!("{}_int32", output_name);
                     let int32_type = Self::create_value_with_mil_type(
                         graph_info,
@@ -4680,8 +5138,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         MilDataType::Int32 as i32,
                     )?;
                     let mil_op_type = self.get_mil_op_type(op.op_type())?;
-                    let input_names =
-                        Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
                     let arg_op = self.convert_operation_with_input_names_and_outputs(
                         graph_info,
                         op,
@@ -4690,10 +5146,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         mil_op_type,
                     )?;
                     main_block.operations.push(arg_op);
+
+                    // Cast int32 to the declared output type
+                    let final_dtype = if output_is_int64 { "int64" } else { "int32" };
                     main_block.operations.push(Self::create_cast_operation(
                         int32_name,
                         output_type,
-                        "int64",
+                        final_dtype,
                     ));
                     continue;
                 }
