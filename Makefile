@@ -109,7 +109,7 @@ test-wpt-litert:
 	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
 
 test-wpt-coreml:
-	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml
 
 test-wpt-coreml-report:
 	@mkdir -p reports
