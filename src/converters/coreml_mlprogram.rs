@@ -1901,11 +1901,14 @@ impl CoremlMlProgramConverter {
                     Self::create_immediate_bool(ceil_mode),
                 );
 
-                // Only average pooling accepts this parameter.
+                // Only average pooling accepts this parameter. WebNN averagePool2d
+                // averages over the true window size, excluding padded elements from
+                // the divisor (a boundary window covering N real elements divides by
+                // N, not by the full kernel area).
                 if matches!(&op, Operation::AveragePool2d { .. }) {
                     inputs.insert(
                         "exclude_padding_from_average".to_string(),
-                        Self::create_immediate_bool(false),
+                        Self::create_immediate_bool(true),
                     );
                 }
 
