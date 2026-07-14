@@ -384,7 +384,7 @@ impl CoremlMlProgramConverter {
             graph,
             operand_id,
             name.clone(),
-            Self::mil_data_type(
+            Self::graph_value_mil_type(
                 &graph
                     .operand(operand_id)
                     .ok_or_else(|| GraphError::ConversionFailed {
@@ -448,6 +448,49 @@ impl CoremlMlProgramConverter {
         }
     }
 
+    /// MIL type used for an operand's value *inside* the graph. CoreML MIL has no
+    /// int64/uint32/uint64 tensor type, so those are represented as int32 (a proxy);
+    /// the model interface and executor reconcile the width/sign at the boundary.
+    fn graph_value_mil_type(data_type: &DataType) -> Result<i32, GraphError> {
+        if matches!(
+            data_type,
+            DataType::Uint32 | DataType::Int64 | DataType::Uint64
+        ) {
+            Ok(crate::protos::coreml::mil_spec::DataType::Int32 as i32)
+        } else {
+            Self::mil_data_type(data_type)
+        }
+    }
+
+    /// Whether a WebNN type has no native MIL tensor representation and is proxied
+    /// through int32 inside the graph.
+    fn is_wide_int(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Uint32 | DataType::Int64 | DataType::Uint64
+        )
+    }
+
+    /// Whether an integer op that runs through fp32 can round-trip this input type
+    /// back to a MIL-representable integer (int8/uint8/int32 natively, or int32 for
+    /// the wide-int proxies).
+    fn is_castable_int(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Int8 | DataType::Uint8 | DataType::Int32
+        ) || Self::is_wide_int(data_type)
+    }
+
+    /// The MIL cast dtype string used to convert an fp32 intermediate back to an
+    /// operand's internal integer representation (int32 for the wide-int proxies).
+    fn int_back_cast_dtype(data_type: &DataType) -> Result<&'static str, GraphError> {
+        if Self::is_wide_int(data_type) {
+            Ok("int32")
+        } else {
+            Self::cast_dtype_string_for_graph_type(data_type)
+        }
+    }
+
     /// Convert WebNN DataType to MIL DataType
     fn mil_data_type(data_type: &DataType) -> Result<i32, GraphError> {
         use crate::protos::coreml::mil_spec::DataType as MilDataType;
@@ -482,7 +525,8 @@ impl CoremlMlProgramConverter {
         use crate::protos::coreml::mil_spec::{TensorValue, Value, tensor_value, value};
 
         let name = operand_name(graph, operand_id);
-        let dtype = Self::mil_data_type(&operand.descriptor.data_type)?;
+        // int64/uint32/uint64 constants have no MIL tensor type; emit them as int32.
+        let dtype = Self::graph_value_mil_type(&operand.descriptor.data_type)?;
         // Keep WebNN scalar constants at rank 0. Promoting them to [1] breaks
         // MIL ops such as `quantize` that distinguish scalars from vectors.
         let output_type =
@@ -585,23 +629,44 @@ impl CoremlMlProgramConverter {
                 })),
             },
             crate::graph::DataType::Int64 => {
-                // Reinterpret raw bytes as Vec<i64> using little-endian byte order.
-                let data = &constant_data.data;
-                let values: Vec<i64> = data
+                // int64 has no MIL tensor type; emit as int32 values (narrowing).
+                let values: Vec<i32> = constant_data
+                    .data
                     .chunks_exact(8)
-                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()) as i32)
                     .collect();
                 TensorValue {
-                    value: Some(tensor_value::Value::LongInts(
-                        tensor_value::RepeatedLongInts { values },
-                    )),
+                    value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
+                        values,
+                    })),
                 }
             }
-            crate::graph::DataType::Uint32 | crate::graph::DataType::Uint64 => TensorValue {
-                value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
-                    values: constant_data.data.clone().into(),
-                })),
-            },
+            crate::graph::DataType::Uint32 => {
+                // uint32 has no MIL tensor type; emit as int32 (bit-preserving).
+                let values: Vec<i32> = constant_data
+                    .data
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .collect();
+                TensorValue {
+                    value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
+                        values,
+                    })),
+                }
+            }
+            crate::graph::DataType::Uint64 => {
+                // uint64 has no MIL tensor type; emit as int32 (narrowing).
+                let values: Vec<i32> = constant_data
+                    .data
+                    .chunks_exact(8)
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .collect();
+                TensorValue {
+                    value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
+                        values,
+                    })),
+                }
+            }
             _ => {
                 return Err(GraphError::ConversionFailed {
                     format: "coreml_mlprogram".to_string(),
@@ -2865,9 +2930,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
         for &output_id in &graph_info.output_operands {
             if let Some(operand) = graph_info.operand(output_id) {
-                let graph_mil_type = Self::mil_data_type(&operand.descriptor.data_type)?;
-                let interface_mil_type =
-                    Self::interface_mil_data_type(&operand.descriptor.data_type);
+                let graph_mil_type = Self::graph_value_mil_type(&operand.descriptor.data_type)?;
+                // Wide ints (int64/uint32/uint64) are int32 both inside the graph and
+                // at the interface (an int32 proxy), so they need no boundary cast.
+                let interface_mil_type = if Self::is_wide_int(&operand.descriptor.data_type) {
+                    crate::protos::coreml::mil_spec::DataType::Int32 as i32
+                } else {
+                    Self::interface_mil_data_type(&operand.descriptor.data_type)
+                };
                 if graph_mil_type != interface_mil_type {
                     let output_name = operand_name(graph_info, output_id);
                     operand_name_overrides.insert(output_id, format!("{}_graph", output_name));
@@ -3663,10 +3733,10 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     if let (Some(input_id), Some(output_id)) = (input_id, output_id_opt) {
                         if let Some(input_op) = graph_info.operand(input_id) {
                             let int_dtype = &input_op.descriptor.data_type;
-                            let is_castable_int = matches!(
-                                int_dtype,
-                                DataType::Int8 | DataType::Uint8 | DataType::Int32
-                            );
+                            // Skip the fp32 clip path for equal bounds; that degenerate
+                            // case is lowered separately (CoreML clip rejects alpha == beta).
+                            let is_castable_int =
+                                Self::is_castable_int(int_dtype) && min_value != max_value;
                             if is_castable_int {
                                 let int_name = Self::output_name_for_operand(
                                     graph_info,
@@ -3718,8 +3788,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     vec![clipped_type],
                                 ));
 
-                                // Cast back to the original int type
-                                let back_dtype = Self::cast_dtype_string_for_graph_type(int_dtype)?;
+                                // Cast back to the operand's internal int representation.
+                                let back_dtype = Self::int_back_cast_dtype(int_dtype)?;
                                 main_block.operations.push(Self::create_cast_operation(
                                     clipped_name,
                                     output_type,
@@ -4025,10 +4095,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 {
                     if let Some(input_op) = graph_info.operand(input_id) {
                         let int_dtype = input_op.descriptor.data_type.clone();
-                        let is_castable_int = matches!(
-                            int_dtype,
-                            DataType::Int8 | DataType::Uint8 | DataType::Int32
-                        );
+                        let is_castable_int = Self::is_castable_int(&int_dtype);
                         if is_castable_int {
                             let int_name = Self::output_name_for_operand(
                                 graph_info,
@@ -4065,7 +4132,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 relu_inputs,
                                 vec![relu_type],
                             ));
-                            let back_dtype = Self::cast_dtype_string_for_graph_type(&int_dtype)?;
+                            let back_dtype = Self::int_back_cast_dtype(&int_dtype)?;
                             main_block.operations.push(Self::create_cast_operation(
                                 relu_name,
                                 output_type,
@@ -4604,7 +4671,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         }
                     })?;
 
-                let input_name = operand_name(graph_info, op.input_operands()[0]);
+                let input_name = Self::output_name_for_operand(
+                    graph_info,
+                    op.input_operands()[0],
+                    &operand_name_overrides,
+                );
 
                 // Create typed -1 constant matching input dtype. MIL `mul`
                 // preserves rank rather than broadcasting scalars, so when
@@ -4618,7 +4689,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 let neg_one_immediate = match input_operand.descriptor.data_type {
                     DataType::Float32 => Self::create_immediate_float_1d(-1.0f32),
                     DataType::Float16 => Self::create_immediate_float16(-1.0f32),
-                    DataType::Int32 => {
+                    // Int32 and the int32-proxied wide ints all multiply by an int32 -1.
+                    DataType::Int32 | DataType::Uint32 | DataType::Int64 | DataType::Uint64 => {
                         // create_immediate_int accepts u32 but converts to i32 internally
                         // We need to reimplement for -1 value
                         use crate::protos::coreml::mil_spec::{
@@ -4679,7 +4751,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     }
                 })?;
 
-                let output_dtype = Self::mil_data_type(&output_operand.descriptor.data_type)?;
+                let output_dtype =
+                    Self::graph_value_mil_type(&output_operand.descriptor.data_type)?;
                 // Use `scalar_as_one_dim: true` so a rank-0 output is promoted
                 // to `tensor<fp32, [1]>`, matching the rank of the mul's
                 // (promoted) input/multiplier. See comment on the mul input
@@ -6726,11 +6799,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             let output_name = operand_name(graph_info, output_id);
             let graph_output_name =
                 Self::output_name_for_operand(graph_info, output_id, &operand_name_overrides);
-            let graph_mil_type = Self::mil_data_type(&operand.descriptor.data_type)?;
+            let graph_mil_type = Self::graph_value_mil_type(&operand.descriptor.data_type)?;
             let interface_mil_type = Self::interface_mil_data_type(&operand.descriptor.data_type);
-            // For argmin/argmax int32 proxy outputs, use int32 at the interface (not float32).
-            // The executor zero-extends int32 → int64 when the WebNN descriptor is int64.
-            let effective_interface_type = if int32_proxy_output_names.contains(&output_name) {
+            // Wide ints and argmin/argmax proxy outputs use int32 at the interface
+            // (not float32); the executor widens int32 -> int64/uint64 on readback.
+            let effective_interface_type = if int32_proxy_output_names.contains(&output_name)
+                || Self::is_wide_int(&operand.descriptor.data_type)
+            {
                 use crate::protos::coreml::mil_spec::DataType as MilDt;
                 MilDt::Int32 as i32
             } else {
@@ -6789,9 +6864,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         for &output_id in &graph_info.output_operands {
             if let Some(operand) = graph_info.operand(output_id) {
                 let output_name = operand_name(graph_info, output_id);
-                // For int32 proxy outputs (e.g. argmin/argmax with int64 WebNN type),
-                // use Int32 at the model interface so it matches the function's emit type.
-                let feature_type = if int32_proxy_output_names.contains(&output_name) {
+                // For int32 proxy outputs (argmin/argmax, or any wide int64/uint32/uint64
+                // output) use Int32 at the model interface to match the function emit type.
+                let feature_type = if int32_proxy_output_names.contains(&output_name)
+                    || Self::is_wide_int(&operand.descriptor.data_type)
+                {
                     use crate::protos::coreml::specification::{
                         ArrayFeatureType, FeatureType, feature_type,
                     };
