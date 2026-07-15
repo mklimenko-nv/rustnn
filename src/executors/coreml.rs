@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::io::Write;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use block::ConcreteBlock;
 use objc::rc::autoreleasepool;
@@ -192,7 +192,10 @@ enum CoremlModelBacking {
     },
     OnDisk {
         compiled_dir: PathBuf,
-        temp_model: Option<PathBuf>,
+        /// Owns the temporary `.mlmodel`/`.mlpackage` source; removed on drop. Held
+        /// purely as a drop guard (never read directly).
+        #[allow(dead_code)]
+        temp_model: Option<TempModelSource>,
     },
 }
 
@@ -223,15 +226,10 @@ impl Drop for CompiledCoremlModel {
                     let _: () = msg_send![*weights_data, release];
                 }
             },
-            CoremlModelBacking::OnDisk {
-                compiled_dir,
-                temp_model,
-            } => {
+            CoremlModelBacking::OnDisk { compiled_dir, .. } => {
+                // The compiled `.mlmodelc` is produced by CoreML (not a tempfile handle),
+                // so remove it explicitly. `temp_model`, if any, cleans itself up on drop.
                 let _ = std::fs::remove_dir_all(compiled_dir);
-                if let Some(path) = temp_model {
-                    let _ = std::fs::remove_file(path);
-                    let _ = std::fs::remove_dir_all(path);
-                }
             }
         }
     }
@@ -359,10 +357,8 @@ fn compile_model_from_url(
         }
 
         let _ = std::fs::remove_dir_all(&compiled_dir);
-        if let Some(path) = &temp_model {
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_dir_all(path);
-        }
+        // `temp_model` removes its temp path when dropped at end of scope.
+        drop(temp_model);
         Err(GraphError::CoremlRuntimeFailed { reason: last_error })
     })
 }
@@ -1142,9 +1138,8 @@ fn run_impl_zeroed_with_weights(
             }
         }
 
-        if let Some(tmp) = temp_mlmodel {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        // The temporary source is removed when its handle drops.
+        drop(temp_mlmodel);
         if compiled_path.is_none() {
             let _ = std::fs::remove_dir_all(&compiled_path_buf);
         }
@@ -1324,9 +1319,8 @@ fn run_impl_with_inputs_with_weights(
             }
         }
 
-        if let Some(tmp) = temp_mlmodel {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        // The temporary source is removed when its handle drops.
+        drop(temp_mlmodel);
         // Only delete compiled model if not cached
         if cache_path.is_none() {
             let _ = std::fs::remove_dir_all(&compiled_path_buf);
@@ -1480,17 +1474,17 @@ unsafe fn extract_mlmultiarray_data(
 unsafe fn prepare_compiled_model(
     model_bytes: &[u8],
     cached_compiled: Option<&Path>,
-) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
+) -> Result<(*mut Object, PathBuf, Option<TempModelSource>), GraphError> {
     unsafe { prepare_compiled_model_with_weights(model_bytes, None, cached_compiled) }
 }
 
-pub unsafe fn prepare_compiled_model_with_weights(
+pub(crate) unsafe fn prepare_compiled_model_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
     cached_compiled: Option<&Path>,
-) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
+) -> Result<(*mut Object, PathBuf, Option<TempModelSource>), GraphError> {
     let temp_mlmodel = write_temp_model_with_weights(model_bytes, weights_data)?;
-    let url = unsafe { nsurl_from_path(&temp_mlmodel)? };
+    let url = unsafe { nsurl_from_path(temp_mlmodel.path())? };
     let mut compiled_url: *mut Object = ptr::null_mut();
     let mut error = [0u8; 1024];
     let status = unsafe {
@@ -1527,28 +1521,49 @@ pub unsafe fn prepare_compiled_model_with_weights(
 }
 
 #[allow(dead_code)]
-fn write_temp_model(model_bytes: &[u8]) -> Result<PathBuf, GraphError> {
+fn write_temp_model(model_bytes: &[u8]) -> Result<TempModelSource, GraphError> {
     write_temp_model_with_weights(model_bytes, None)
 }
 
-/// Write a CoreML model to a temporary file, optionally creating an .mlpackage with weights
+/// An on-disk model source (`.mlmodel` file or `.mlpackage` directory) that CoreML
+/// compiles from. The underlying temp path is created with a random, `O_EXCL`-guarded
+/// name via `tempfile` and is deleted when this handle drops (RAII), so there is no
+/// cross-process collision or symlink/TOCTOU exposure and cleanup survives panics.
+pub(crate) enum TempModelSource {
+    /// A `.mlpackage` directory (used when the model has external weights).
+    Package(tempfile::TempDir),
+    /// A single `.mlmodel` file.
+    Model(tempfile::TempPath),
+}
+
+impl TempModelSource {
+    fn path(&self) -> &Path {
+        match self {
+            TempModelSource::Package(dir) => dir.path(),
+            TempModelSource::Model(path) => path,
+        }
+    }
+}
+
+/// Write a CoreML model to a temporary path, creating an `.mlpackage` when weights are
+/// present. The returned [`TempModelSource`] owns the temp path and removes it on drop.
 fn write_temp_model_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
-) -> Result<PathBuf, GraphError> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    // A process-wide counter keeps temp paths unique even when two models are
-    // compiled within the same millisecond (the timestamp alone collides).
-    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let ts = format!("{ts}_{seq}");
+) -> Result<TempModelSource, GraphError> {
+    let map_io = |err: std::io::Error| GraphError::CoremlRuntimeFailed {
+        reason: format!("failed to write temporary CoreML model: {err}"),
+    };
 
     if let Some(weights) = weights_data {
-        // Create .mlpackage directory structure with weights
-        let package_path = std::env::temp_dir().join(format!("rustnn_coreml_{ts}.mlpackage"));
+        // Create .mlpackage directory structure with weights. The random directory
+        // name keeps the `.mlpackage` suffix so CoreML recognizes it as a package.
+        let package = tempfile::Builder::new()
+            .prefix("rustnn_coreml_")
+            .suffix(".mlpackage")
+            .tempdir()
+            .map_err(map_io)?;
+        let package_path = package.path();
         let data_dir = package_path.join("Data").join("com.apple.CoreML");
         let weights_dir = data_dir.join("weights");
 
@@ -1596,12 +1611,18 @@ fn write_temp_model_with_weights(
         std::fs::write(&manifest_path, manifest)
             .map_err(|err| GraphError::export(&manifest_path, err))?;
 
-        Ok(package_path)
+        Ok(TempModelSource::Package(package))
     } else {
-        // No weights: write single .mlmodel file as before
-        let path = std::env::temp_dir().join(format!("rustnn_coreml_{ts}.mlmodel"));
-        std::fs::write(&path, model_bytes).map_err(|err| GraphError::export(&path, err))?;
-        Ok(path)
+        // No weights: write a single .mlmodel file with a random, exclusively-created
+        // name. Convert to a closed `TempPath` so CoreML can open it by path.
+        let mut file = tempfile::Builder::new()
+            .prefix("rustnn_coreml_")
+            .suffix(".mlmodel")
+            .tempfile()
+            .map_err(map_io)?;
+        file.write_all(model_bytes).map_err(map_io)?;
+        file.flush().map_err(map_io)?;
+        Ok(TempModelSource::Model(file.into_temp_path()))
     }
 }
 
@@ -1928,4 +1949,72 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod temp_model_tests {
+    use super::{TempModelSource, write_temp_model_with_weights};
+
+    #[test]
+    fn bare_model_writes_mlmodel_file_and_cleans_up_on_drop() {
+        let bytes = b"fake-mlmodel-protobuf";
+        let source = write_temp_model_with_weights(bytes, None).expect("write temp model");
+        let path = source.path().to_path_buf();
+
+        assert!(matches!(&source, TempModelSource::Model(_)));
+        assert!(path.is_file(), "expected a file at {path:?}");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("mlmodel"));
+        assert!(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rustnn_coreml_")),
+            "unexpected temp name: {path:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // Dropping the handle removes the temp file (RAII cleanup).
+        drop(source);
+        assert!(
+            !path.exists(),
+            "temp file should be removed on drop: {path:?}"
+        );
+    }
+
+    #[test]
+    fn model_with_weights_writes_mlpackage_and_cleans_up_on_drop() {
+        let model = b"fake-mlmodel";
+        let weights = b"\x00\x01\x02\x03weights-blob";
+        let source =
+            write_temp_model_with_weights(model, Some(weights)).expect("write temp package");
+        let dir = source.path().to_path_buf();
+
+        assert!(matches!(&source, TempModelSource::Package(_)));
+        assert!(dir.is_dir(), "expected an .mlpackage dir at {dir:?}");
+        assert_eq!(dir.extension().and_then(|e| e.to_str()), Some("mlpackage"));
+
+        let model_path = dir.join("Data/com.apple.CoreML/model.mlmodel");
+        let weights_path = dir.join("Data/com.apple.CoreML/weights/weights.bin");
+        let manifest_path = dir.join("Manifest.json");
+        assert_eq!(std::fs::read(&model_path).unwrap(), model);
+        assert_eq!(std::fs::read(&weights_path).unwrap(), weights);
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(manifest.contains("rootModelIdentifier"));
+        assert!(manifest.contains("com.apple.CoreML/model.mlmodel"));
+
+        // Dropping the handle removes the whole package directory (RAII cleanup).
+        drop(source);
+        assert!(
+            !dir.exists(),
+            "temp package should be removed on drop: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn temp_paths_are_unique_across_calls() {
+        // Randomized names must not collide even for identical content compiled
+        // back-to-back (the old millisecond+counter scheme could).
+        let a = write_temp_model_with_weights(b"same", None).unwrap();
+        let b = write_temp_model_with_weights(b"same", None).unwrap();
+        assert_ne!(a.path(), b.path(), "temp names must be unique");
+    }
 }
