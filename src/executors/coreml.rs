@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::io::Write;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use block::ConcreteBlock;
 use objc::rc::autoreleasepool;
@@ -192,7 +192,10 @@ enum CoremlModelBacking {
     },
     OnDisk {
         compiled_dir: PathBuf,
-        temp_model: Option<PathBuf>,
+        /// Owns the temporary `.mlmodel`/`.mlpackage` source; removed on drop. Held
+        /// purely as a drop guard (never read directly).
+        #[allow(dead_code)]
+        temp_model: Option<TempModelSource>,
     },
 }
 
@@ -223,15 +226,10 @@ impl Drop for CompiledCoremlModel {
                     let _: () = msg_send![*weights_data, release];
                 }
             },
-            CoremlModelBacking::OnDisk {
-                compiled_dir,
-                temp_model,
-            } => {
+            CoremlModelBacking::OnDisk { compiled_dir, .. } => {
+                // The compiled `.mlmodelc` is produced by CoreML (not a tempfile handle),
+                // so remove it explicitly. `temp_model`, if any, cleans itself up on drop.
                 let _ = std::fs::remove_dir_all(compiled_dir);
-                if let Some(path) = temp_model {
-                    let _ = std::fs::remove_file(path);
-                    let _ = std::fs::remove_dir_all(path);
-                }
             }
         }
     }
@@ -359,10 +357,8 @@ fn compile_model_from_url(
         }
 
         let _ = std::fs::remove_dir_all(&compiled_dir);
-        if let Some(path) = &temp_model {
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_dir_all(path);
-        }
+        // `temp_model` removes its temp path when dropped at end of scope.
+        drop(temp_model);
         Err(GraphError::CoremlRuntimeFailed { reason: last_error })
     })
 }
@@ -566,6 +562,35 @@ unsafe fn fill_multiarray_from_bytes(
     let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
         reason: format!("invalid element count: {count_obj}"),
     })?;
+    // int4/uint4 inputs arrive packed two-per-byte and are exposed as float32 at the
+    // model boundary; unpack the nibbles and write them into the float32 array.
+    if matches!(dtype, DataType::Int4 | DataType::Uint4) {
+        if count == 0 {
+            return Ok(());
+        }
+        let floats: Vec<f32> = if matches!(dtype, DataType::Int4) {
+            crate::graph::unpack_int4(src, count)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        } else {
+            crate::graph::unpack_uint4(src, count)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        };
+        let ptr: *mut c_void = msg_send![array, dataPointer];
+        if ptr.is_null() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
+            });
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, count * 4) };
+        for (i, f) in floats.iter().enumerate() {
+            dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        return Ok(());
+    }
     let elem = dtype.bytes_per_element();
     let expected = count.saturating_mul(elem);
     if src.len() != expected {
@@ -576,19 +601,32 @@ unsafe fn fill_multiarray_from_bytes(
             ),
         });
     }
-    // A raw byte copy is only valid when our source layout matches the array CoreML
-    // allocated. When the model boundary promotes the type (e.g. a WebNN int64 input
-    // exposed as Float32), the element sizes differ and copying `src` verbatim would
-    // overrun the array buffer -- fail cleanly instead of corrupting memory.
-    if let Some(array_elem) = ml_dtype_code_element_size(array_code)
-        && array_elem != elem
+    // When the model boundary promotes the input type (e.g. a WebNN uint8 boolean
+    // condition exposed as Float32 by CoreML), convert the source bytes to the
+    // required element size before writing.
+    let canonical_code = normalize_dtype_code(array_code);
+    // A different element size always needs conversion. So does a same-width
+    // dtype mismatch: uint32 (4 bytes) promoted into an fp32 (4 bytes) array must
+    // be converted by value, not copied as raw bits.
+    let same_width_mismatch =
+        canonical_code == 32 && !matches!(dtype, DataType::Float32 | DataType::Int32);
+    if let Some(array_elem) = ml_dtype_code_element_size(canonical_code)
+        && (array_elem != elem || same_width_mismatch)
     {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: format!(
-                "input dtype mismatch: model expects {array_elem}-byte elements (code {array_code}), \
-                 but input is {dtype:?} ({elem}-byte); type conversion is not supported for this input"
-            ),
-        });
+        if count == 0 {
+            return Ok(());
+        }
+        let ptr: *mut c_void = msg_send![array, dataPointer];
+        if ptr.is_null() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
+            });
+        }
+        // Convert src bytes (dtype) → array bytes (canonical_code).
+        let converted = convert_input_bytes(src, dtype, canonical_code, count);
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, count * array_elem) };
+        dst.copy_from_slice(&converted);
+        return Ok(());
     }
     if expected == 0 {
         return Ok(());
@@ -603,10 +641,90 @@ unsafe fn fill_multiarray_from_bytes(
     Ok(())
 }
 
+/// Convert input bytes from `src_dtype` to a buffer compatible with `target_code`.
+/// Used when CoreML promotes an input type (e.g. uint8 boolean → float32).
+fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count: usize) -> Vec<u8> {
+    match (src_dtype, target_code) {
+        (DataType::Uint8, 32) => {
+            // uint8/bool → float32: 0→0.0, 1→1.0 (also used for boolean condition inputs)
+            let mut out = Vec::with_capacity(count * 4);
+            for &b in src.iter().take(count) {
+                out.extend_from_slice(&(b as f32).to_le_bytes());
+            }
+            out
+        }
+        (DataType::Int8, 32) => {
+            // int8 → float32: reinterpret the byte as signed so negatives are preserved
+            // (a raw `b as f32` would turn -128 into 128.0).
+            let mut out = Vec::with_capacity(count * 4);
+            for &b in src.iter().take(count) {
+                out.extend_from_slice(&((b as i8) as f32).to_le_bytes());
+            }
+            out
+        }
+        (DataType::Int32, 32) => {
+            // int32 as float32 bits (reinterpret, same size — shouldn't normally happen)
+            src.to_vec()
+        }
+        (DataType::Uint32, 32) => {
+            // uint32 → float32 by value (the interface promotes uint32 to float32).
+            let src_u32 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u32, count) };
+            let mut out = Vec::with_capacity(count * 4);
+            for &v in src_u32 {
+                out.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            out
+        }
+        (DataType::Uint64, 32) => {
+            // uint64 → float32 by value (the interface promotes uint64 to float32).
+            let src_u64 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u64, count) };
+            let mut out = Vec::with_capacity(count * 4);
+            for &v in src_u64 {
+                out.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            out
+        }
+        (DataType::Float32, 16) => {
+            // float32 → float16
+            let src_f32 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, count) };
+            let mut out = Vec::with_capacity(count * 2);
+            for &v in src_f32 {
+                out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+            }
+            out
+        }
+        (DataType::Float16, 32) => {
+            // float16 → float32
+            let src_f16 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, count) };
+            let mut out = Vec::with_capacity(count * 4);
+            for &bits in src_f16 {
+                out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
+            }
+            out
+        }
+        (DataType::Int64, 32) => {
+            // int64 → float32: used for int64 inputs promoted to float32 by CoreML
+            let src_i64 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const i64, count) };
+            let mut out = Vec::with_capacity(count * 4);
+            for &v in src_i64 {
+                out.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            out
+        }
+        _ => {
+            // Fallback: pass bytes as-is (may be wrong but avoids panic)
+            src.to_vec()
+        }
+    }
+}
+
 /// Extract a `MLMultiArray` into raw bytes laid out per the output descriptor's dtype.
 ///
 /// Handles non-contiguous layouts (e.g. 64-byte aligned outputs from the Apple
 /// Neural Engine) by gathering elements according to the array's strides.
+/// Also handles dtype mismatches: CoreML may return a different dtype than requested
+/// (e.g. float32 for a uint8-declared output from a comparison op). In that case the
+/// data is converted element-by-element to the expected dtype.
 unsafe fn extract_multiarray_bytes(
     array: *mut Object,
     descriptor: &OperandDescriptor,
@@ -615,7 +733,57 @@ unsafe fn extract_multiarray_bytes(
     let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
         reason: format!("invalid element count: {count_obj}"),
     })?;
-    let elem = descriptor.data_type.bytes_per_element();
+
+    // Query the actual data type code from the MLMultiArray — CoreML may promote
+    // the dtype (e.g. uint8 cast result returned as float32).
+    let actual_dtype_code: i64 = msg_send![array, dataType];
+    let actual_elem = ml_dtype_code_element_size(actual_dtype_code as i32).unwrap_or(4);
+
+    // int4/uint4 outputs are produced as int32 (the proxy). Read the int32 values and
+    // re-pack them two-per-byte into the sub-byte layout the host tensor expects.
+    if matches!(descriptor.data_type, DataType::Int4 | DataType::Uint4) {
+        let ptr: *const u8 = {
+            let p: *mut c_void = msg_send![array, dataPointer];
+            if p.is_null() {
+                return Err(GraphError::CoremlRuntimeFailed {
+                    reason: "output MLMultiArray has no backing buffer for int4/uint4".to_string(),
+                });
+            }
+            p as *const u8
+        };
+        let shape_ns: *mut Object = msg_send![array, shape];
+        let shape = unsafe { nsarray_to_i64_vec(shape_ns)? };
+        let strides_ns: *mut Object = msg_send![array, strides];
+        let strides = unsafe { nsarray_to_i64_vec(strides_ns)? };
+        let raw = if is_contiguous(&shape, &strides) {
+            unsafe { std::slice::from_raw_parts(ptr, count.saturating_mul(actual_elem)) }.to_vec()
+        } else {
+            unsafe { gather_strided_bytes(ptr, &shape, &strides, actual_elem) }
+        };
+        // Float codes (Float32 = 32/0x10020, Float16 = 16/0x10010) must be read as
+        // floats; int codes (Int32 = 3/0x20020) as integers. NOTE: 0x20020 (131104) is
+        // Int32, not Float32 — do not route it through normalize_dtype_code here.
+        let is_float = matches!(actual_dtype_code as i32, 32 | 65568 | 16 | 65552);
+        let ints: Vec<i32> = if is_float {
+            raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i32)
+                .collect()
+        } else {
+            raw.chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let packed = if matches!(descriptor.data_type, DataType::Int4) {
+            crate::graph::pack_int4(&ints)
+        } else {
+            let u: Vec<u8> = ints.iter().map(|&v| v as u8).collect();
+            crate::graph::pack_uint4(&u)
+        };
+        return Ok(packed);
+    }
+
+    let expected_elem = descriptor.data_type.bytes_per_element();
+
     let ptr: *const u8 = {
         let p: *mut c_void = msg_send![array, dataPointer];
         if p.is_null() {
@@ -634,13 +802,147 @@ unsafe fn extract_multiarray_bytes(
     let strides_nsarray: *mut Object = msg_send![array, strides];
     let strides = unsafe { nsarray_to_i64_vec(strides_nsarray)? };
 
-    if is_contiguous(&shape, &strides) {
-        let total = count.saturating_mul(elem);
+    // Read raw bytes using the ACTUAL element size from the MLMultiArray.
+    let actual_bytes = if is_contiguous(&shape, &strides) {
+        let total = count.saturating_mul(actual_elem);
         let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
-        return Ok(slice.to_vec());
+        slice.to_vec()
+    } else {
+        unsafe { gather_strided_bytes(ptr, &shape, &strides, actual_elem) }
+    };
+
+    if actual_elem == expected_elem {
+        return Ok(actual_bytes);
     }
 
-    Ok(unsafe { gather_strided_bytes(ptr, &shape, &strides, elem) })
+    // Dtype mismatch: convert from the actual dtype to the expected dtype.
+    Ok(convert_multiarray_bytes(
+        actual_bytes,
+        actual_dtype_code as i32,
+        descriptor.data_type,
+    ))
+}
+
+/// Normalize non-standard MLMultiArrayDataType codes to canonical ones.
+/// CoreML sometimes returns vendor-specific codes (e.g. 65568 for Float32).
+fn normalize_dtype_code(code: i32) -> i32 {
+    match code {
+        65600 | 4 => 4,            // Int64 / Double → treat as Int64
+        65568 | 131104 | 32 => 32, // Float32 variants
+        65552 | 16 => 16,          // Float16 variants
+        3 => 3,                    // Int32
+        1 => 1,                    // Int8
+        _ => code,
+    }
+}
+
+/// Convert a byte buffer from `actual_code` dtype to the `target` dtype.
+/// Used when CoreML promotes an output dtype (e.g. uint8 boolean result → float32).
+fn convert_multiarray_bytes(actual_bytes: Vec<u8>, actual_code: i32, target: DataType) -> Vec<u8> {
+    let canonical_code = normalize_dtype_code(actual_code);
+    let actual_elem = ml_dtype_code_element_size(canonical_code).unwrap_or(4);
+    let count = if actual_elem > 0 {
+        actual_bytes.len() / actual_elem
+    } else {
+        0
+    };
+
+    match canonical_code {
+        32 => {
+            // Source: Float32
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const f32, count) };
+            match target {
+                DataType::Uint8 => src.iter().map(|&v| v as u8).collect(),
+                // f32 -> int8: go through i8 so negatives keep their bit pattern
+                // (`v as u8` saturates a negative float to 0).
+                DataType::Int8 => src.iter().map(|&v| (v as i8) as u8).collect(),
+                DataType::Int32 | DataType::Uint32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Float16 => {
+                    let mut out = Vec::with_capacity(count * 2);
+                    for &v in src {
+                        out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+                    }
+                    out
+                }
+                _ => actual_bytes,
+            }
+        }
+        16 => {
+            // Source: Float16
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const u16, count) };
+            match target {
+                DataType::Uint8 => src
+                    .iter()
+                    .map(|&bits| half::f16::from_bits(bits).to_f32() as u8)
+                    .collect(),
+                // f16 -> int8: go through i8 so negatives keep their bit pattern.
+                DataType::Int8 => src
+                    .iter()
+                    .map(|&bits| (half::f16::from_bits(bits).to_f32() as i8) as u8)
+                    .collect(),
+                DataType::Float32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &bits in src {
+                        out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
+                    }
+                    out
+                }
+                _ => actual_bytes,
+            }
+        }
+        3 => {
+            // Source: Int32
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const i32, count) };
+            match target {
+                DataType::Float32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as f32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
+                _ => actual_bytes,
+            }
+        }
+        1 => {
+            // Source: Int8 — compatible byte layout with Uint8
+            actual_bytes
+        }
+        4 => {
+            // Source: Int64
+            let src =
+                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const i64, count) };
+            match target {
+                DataType::Int32 | DataType::Uint32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Float32 => {
+                    let mut out = Vec::with_capacity(count * 4);
+                    for &v in src {
+                        out.extend_from_slice(&(v as f32).to_le_bytes());
+                    }
+                    out
+                }
+                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
+                _ => actual_bytes,
+            }
+        }
+        _ => actual_bytes,
+    }
 }
 
 /// Whether `strides` (in elements) describe a C-contiguous layout for `shape`.
@@ -836,9 +1138,8 @@ fn run_impl_zeroed_with_weights(
             }
         }
 
-        if let Some(tmp) = temp_mlmodel {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        // The temporary source is removed when its handle drops.
+        drop(temp_mlmodel);
         if compiled_path.is_none() {
             let _ = std::fs::remove_dir_all(&compiled_path_buf);
         }
@@ -1018,9 +1319,8 @@ fn run_impl_with_inputs_with_weights(
             }
         }
 
-        if let Some(tmp) = temp_mlmodel {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        // The temporary source is removed when its handle drops.
+        drop(temp_mlmodel);
         // Only delete compiled model if not cached
         if cache_path.is_none() {
             let _ = std::fs::remove_dir_all(&compiled_path_buf);
@@ -1174,17 +1474,17 @@ unsafe fn extract_mlmultiarray_data(
 unsafe fn prepare_compiled_model(
     model_bytes: &[u8],
     cached_compiled: Option<&Path>,
-) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
+) -> Result<(*mut Object, PathBuf, Option<TempModelSource>), GraphError> {
     unsafe { prepare_compiled_model_with_weights(model_bytes, None, cached_compiled) }
 }
 
-pub unsafe fn prepare_compiled_model_with_weights(
+pub(crate) unsafe fn prepare_compiled_model_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
     cached_compiled: Option<&Path>,
-) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
+) -> Result<(*mut Object, PathBuf, Option<TempModelSource>), GraphError> {
     let temp_mlmodel = write_temp_model_with_weights(model_bytes, weights_data)?;
-    let url = unsafe { nsurl_from_path(&temp_mlmodel)? };
+    let url = unsafe { nsurl_from_path(temp_mlmodel.path())? };
     let mut compiled_url: *mut Object = ptr::null_mut();
     let mut error = [0u8; 1024];
     let status = unsafe {
@@ -1221,28 +1521,49 @@ pub unsafe fn prepare_compiled_model_with_weights(
 }
 
 #[allow(dead_code)]
-fn write_temp_model(model_bytes: &[u8]) -> Result<PathBuf, GraphError> {
+fn write_temp_model(model_bytes: &[u8]) -> Result<TempModelSource, GraphError> {
     write_temp_model_with_weights(model_bytes, None)
 }
 
-/// Write a CoreML model to a temporary file, optionally creating an .mlpackage with weights
+/// An on-disk model source (`.mlmodel` file or `.mlpackage` directory) that CoreML
+/// compiles from. The underlying temp path is created with a random, `O_EXCL`-guarded
+/// name via `tempfile` and is deleted when this handle drops (RAII), so there is no
+/// cross-process collision or symlink/TOCTOU exposure and cleanup survives panics.
+pub(crate) enum TempModelSource {
+    /// A `.mlpackage` directory (used when the model has external weights).
+    Package(tempfile::TempDir),
+    /// A single `.mlmodel` file.
+    Model(tempfile::TempPath),
+}
+
+impl TempModelSource {
+    fn path(&self) -> &Path {
+        match self {
+            TempModelSource::Package(dir) => dir.path(),
+            TempModelSource::Model(path) => path,
+        }
+    }
+}
+
+/// Write a CoreML model to a temporary path, creating an `.mlpackage` when weights are
+/// present. The returned [`TempModelSource`] owns the temp path and removes it on drop.
 fn write_temp_model_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
-) -> Result<PathBuf, GraphError> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    // A process-wide counter keeps temp paths unique even when two models are
-    // compiled within the same millisecond (the timestamp alone collides).
-    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let ts = format!("{ts}_{seq}");
+) -> Result<TempModelSource, GraphError> {
+    let map_io = |err: std::io::Error| GraphError::CoremlRuntimeFailed {
+        reason: format!("failed to write temporary CoreML model: {err}"),
+    };
 
     if let Some(weights) = weights_data {
-        // Create .mlpackage directory structure with weights
-        let package_path = std::env::temp_dir().join(format!("rustnn_coreml_{ts}.mlpackage"));
+        // Create .mlpackage directory structure with weights. The random directory
+        // name keeps the `.mlpackage` suffix so CoreML recognizes it as a package.
+        let package = tempfile::Builder::new()
+            .prefix("rustnn_coreml_")
+            .suffix(".mlpackage")
+            .tempdir()
+            .map_err(map_io)?;
+        let package_path = package.path();
         let data_dir = package_path.join("Data").join("com.apple.CoreML");
         let weights_dir = data_dir.join("weights");
 
@@ -1290,12 +1611,18 @@ fn write_temp_model_with_weights(
         std::fs::write(&manifest_path, manifest)
             .map_err(|err| GraphError::export(&manifest_path, err))?;
 
-        Ok(package_path)
+        Ok(TempModelSource::Package(package))
     } else {
-        // No weights: write single .mlmodel file as before
-        let path = std::env::temp_dir().join(format!("rustnn_coreml_{ts}.mlmodel"));
-        std::fs::write(&path, model_bytes).map_err(|err| GraphError::export(&path, err))?;
-        Ok(path)
+        // No weights: write a single .mlmodel file with a random, exclusively-created
+        // name. Convert to a closed `TempPath` so CoreML can open it by path.
+        let mut file = tempfile::Builder::new()
+            .prefix("rustnn_coreml_")
+            .suffix(".mlmodel")
+            .tempfile()
+            .map_err(map_io)?;
+        file.write_all(model_bytes).map_err(map_io)?;
+        file.flush().map_err(map_io)?;
+        Ok(TempModelSource::Model(file.into_temp_path()))
     }
 }
 
@@ -1622,4 +1949,72 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod temp_model_tests {
+    use super::{TempModelSource, write_temp_model_with_weights};
+
+    #[test]
+    fn bare_model_writes_mlmodel_file_and_cleans_up_on_drop() {
+        let bytes = b"fake-mlmodel-protobuf";
+        let source = write_temp_model_with_weights(bytes, None).expect("write temp model");
+        let path = source.path().to_path_buf();
+
+        assert!(matches!(&source, TempModelSource::Model(_)));
+        assert!(path.is_file(), "expected a file at {path:?}");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("mlmodel"));
+        assert!(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rustnn_coreml_")),
+            "unexpected temp name: {path:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // Dropping the handle removes the temp file (RAII cleanup).
+        drop(source);
+        assert!(
+            !path.exists(),
+            "temp file should be removed on drop: {path:?}"
+        );
+    }
+
+    #[test]
+    fn model_with_weights_writes_mlpackage_and_cleans_up_on_drop() {
+        let model = b"fake-mlmodel";
+        let weights = b"\x00\x01\x02\x03weights-blob";
+        let source =
+            write_temp_model_with_weights(model, Some(weights)).expect("write temp package");
+        let dir = source.path().to_path_buf();
+
+        assert!(matches!(&source, TempModelSource::Package(_)));
+        assert!(dir.is_dir(), "expected an .mlpackage dir at {dir:?}");
+        assert_eq!(dir.extension().and_then(|e| e.to_str()), Some("mlpackage"));
+
+        let model_path = dir.join("Data/com.apple.CoreML/model.mlmodel");
+        let weights_path = dir.join("Data/com.apple.CoreML/weights/weights.bin");
+        let manifest_path = dir.join("Manifest.json");
+        assert_eq!(std::fs::read(&model_path).unwrap(), model);
+        assert_eq!(std::fs::read(&weights_path).unwrap(), weights);
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(manifest.contains("rootModelIdentifier"));
+        assert!(manifest.contains("com.apple.CoreML/model.mlmodel"));
+
+        // Dropping the handle removes the whole package directory (RAII cleanup).
+        drop(source);
+        assert!(
+            !dir.exists(),
+            "temp package should be removed on drop: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn temp_paths_are_unique_across_calls() {
+        // Randomized names must not collide even for identical content compiled
+        // back-to-back (the old millisecond+counter scheme could).
+        let a = write_temp_model_with_weights(b"same", None).unwrap();
+        let b = write_temp_model_with_weights(b"same", None).unwrap();
+        assert_ne!(a.path(), b.path(), "temp names must be unique");
+    }
 }

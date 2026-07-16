@@ -271,7 +271,35 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                     source: format!("model did not produce output '{name}'").into(),
                 })?;
             let logical = tensor_byte_len(ml_tensor.descriptor());
-            if data.len() < logical {
+
+            // When the graph output type is int64/uint64 but CoreML produced int32
+            // bytes (argmin/argmax proxy, or a cast to int64/uint64), widen each
+            // 4-byte value to 8 bytes. int64 is sign-extended so negative results
+            // survive; uint64 is zero-extended.
+            use crate::operator_enums::MLOperandDataType;
+            let out_dt = ml_tensor.descriptor().data_type();
+            let expanded: Option<Vec<u8>> = if data.len() * 2 == logical
+                && matches!(out_dt, MLOperandDataType::Int64 | MLOperandDataType::Uint64)
+            {
+                let sign_extend = matches!(out_dt, MLOperandDataType::Int64);
+                let count = data.len() / 4;
+                let mut buf = vec![0u8; count * 8];
+                for i in 0..count {
+                    let v = i32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
+                    let widened: i64 = if sign_extend {
+                        v as i64
+                    } else {
+                        i64::from(v as u32)
+                    };
+                    buf[i * 8..i * 8 + 8].copy_from_slice(&widened.to_le_bytes());
+                }
+                Some(buf)
+            } else {
+                None
+            };
+            let effective = expanded.as_deref().unwrap_or(data.as_slice());
+
+            if effective.len() < logical {
                 return Err(Error::GraphDispatchError {
                     source: format!(
                         "output '{name}': CoreML produced {} bytes, descriptor expects {logical}",
@@ -290,7 +318,7 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                     .into(),
                 });
             }
-            dst[..logical].copy_from_slice(&data[..logical]);
+            dst[..logical].copy_from_slice(&effective[..logical]);
         }
         Ok(())
     }

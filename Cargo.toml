@@ -29,7 +29,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 [features]
 default = []
 dynamic-inputs = []
-coreml-runtime = ["objc", "block"]
+coreml-runtime = ["objc", "block", "dep:tempfile"]
 onnx-runtime = ["ort", "ndarray", "dep:tempfile"]
 trtx-runtime = ["trtx", "cudarc"]
 trtx-runtime-mock = ["trtx/mock", "cudarc"]

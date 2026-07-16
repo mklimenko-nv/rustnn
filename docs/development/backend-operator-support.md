@@ -24,76 +24,78 @@ Executor-level operator coverage follows converter coverage for this backend.
 
 - Converter source: `src/converters/coreml_mlprogram.rs`
 - Executor source: `src/executors/coreml.rs`
-- Converter operator count: **88**
-- Executor operator count: **88**
+- Converter operator count: **92**
+- Executor operator count: **92**
 
 ### Converter Operators
 
-- `abs`, `hardSigmoid`, `reducemin`
-- `add`, `hardSwish`, `reduceproduct`
-- `argMax`, `identity`, `reducesum`
-- `argMin`, `instanceNormalization`, `reducesumsquare`
-- `averagePool2d`, `layerNormalization`, `relu`
-- `batchNormalization`, `leakyRelu`, `reshape`
-- `cast`, `lesser`, `reverse`
-- `ceil`, `lesserOrEqual`, `roundEven`
-- `clamp`, `log`, `scatterElements`
-- `concat`, `logicalAnd`, `scatterND`
-- `conv2d`, `logicalNot`, `sigmoid`
-- `convTranspose2d`, `logicalOr`, `sign`
-- `cos`, `logicalXor`, `sin`
-- `cumulativeSum`, `matmul`, `slice`
-- `dequantizeLinear`, `max`, `softmax`
-- `div`, `maxPool2d`, `softplus`
-- `elu`, `min`, `softsign`
-- `equal`, `mul`, `split`
-- `erf`, `neg`, `sqrt`
-- `exp`, `pad`, `squeeze`
-- `expand`, `pow`, `sub`
-- `floor`, `prelu`, `tan`
-- `gather`, `quantizeLinear`, `tanh`
-- `gatherElements`, `reciprocal`, `tile`
-- `gelu`, `reducel1`, `transpose`
-- `gemm`, `reducel2`, `triangular`
-- `globalAveragePool`, `reducelogsum`, `unsqueeze`
-- `globalMaxPool`, `reducelogsumexp`, `where`
-- `greater`, `reducemax`
-- `greaterOrEqual`, `reducemean`
+- `abs`, `hardSigmoid`, `reducemax`
+- `add`, `hardSwish`, `reducemean`
+- `argMax`, `identity`, `reducemin`
+- `argMin`, `instanceNormalization`, `reduceproduct`
+- `averagePool2d`, `isInfinite`, `reducesum`
+- `batchNormalization`, `isNaN`, `reducesumsquare`
+- `cast`, `l2pool2d`, `relu`
+- `ceil`, `layerNormalization`, `reshape`
+- `clamp`, `leakyRelu`, `reverse`
+- `concat`, `lesser`, `roundEven`
+- `conv2d`, `lesserOrEqual`, `scatterElements`
+- `convTranspose2d`, `log`, `scatterND`
+- `cos`, `logicalAnd`, `sigmoid`
+- `cumulativeSum`, `logicalNot`, `sign`
+- `dequantizeLinear`, `logicalOr`, `sin`
+- `div`, `logicalXor`, `slice`
+- `elu`, `matmul`, `softmax`
+- `equal`, `max`, `softplus`
+- `erf`, `maxPool2d`, `softsign`
+- `exp`, `min`, `split`
+- `expand`, `mul`, `sqrt`
+- `floor`, `neg`, `squeeze`
+- `gather`, `pad`, `sub`
+- `gatherElements`, `pow`, `tan`
+- `gatherND`, `prelu`, `tanh`
+- `gelu`, `quantizeLinear`, `tile`
+- `gemm`, `reciprocal`, `transpose`
+- `globalAveragePool`, `reducel1`, `triangular`
+- `globalMaxPool`, `reducel2`, `unsqueeze`
+- `greater`, `reducelogsum`, `where`
+- `greaterOrEqual`, `reducelogsumexp`
 
 ### Executor Operators
 
 Executor-level operator coverage follows converter coverage for this backend.
 
-- `abs`, `hardSigmoid`, `reducemin`
-- `add`, `hardSwish`, `reduceproduct`
-- `argMax`, `identity`, `reducesum`
-- `argMin`, `instanceNormalization`, `reducesumsquare`
-- `averagePool2d`, `layerNormalization`, `relu`
-- `batchNormalization`, `leakyRelu`, `reshape`
-- `cast`, `lesser`, `reverse`
-- `ceil`, `lesserOrEqual`, `roundEven`
-- `clamp`, `log`, `scatterElements`
-- `concat`, `logicalAnd`, `scatterND`
-- `conv2d`, `logicalNot`, `sigmoid`
-- `convTranspose2d`, `logicalOr`, `sign`
-- `cos`, `logicalXor`, `sin`
-- `cumulativeSum`, `matmul`, `slice`
-- `dequantizeLinear`, `max`, `softmax`
-- `div`, `maxPool2d`, `softplus`
-- `elu`, `min`, `softsign`
-- `equal`, `mul`, `split`
-- `erf`, `neg`, `sqrt`
-- `exp`, `pad`, `squeeze`
-- `expand`, `pow`, `sub`
-- `floor`, `prelu`, `tan`
-- `gather`, `quantizeLinear`, `tanh`
-- `gatherElements`, `reciprocal`, `tile`
-- `gelu`, `reducel1`, `transpose`
-- `gemm`, `reducel2`, `triangular`
-- `globalAveragePool`, `reducelogsum`, `unsqueeze`
-- `globalMaxPool`, `reducelogsumexp`, `where`
-- `greater`, `reducemax`
-- `greaterOrEqual`, `reducemean`
+- `abs`, `hardSigmoid`, `reducemax`
+- `add`, `hardSwish`, `reducemean`
+- `argMax`, `identity`, `reducemin`
+- `argMin`, `instanceNormalization`, `reduceproduct`
+- `averagePool2d`, `isInfinite`, `reducesum`
+- `batchNormalization`, `isNaN`, `reducesumsquare`
+- `cast`, `l2pool2d`, `relu`
+- `ceil`, `layerNormalization`, `reshape`
+- `clamp`, `leakyRelu`, `reverse`
+- `concat`, `lesser`, `roundEven`
+- `conv2d`, `lesserOrEqual`, `scatterElements`
+- `convTranspose2d`, `log`, `scatterND`
+- `cos`, `logicalAnd`, `sigmoid`
+- `cumulativeSum`, `logicalNot`, `sign`
+- `dequantizeLinear`, `logicalOr`, `sin`
+- `div`, `logicalXor`, `slice`
+- `elu`, `matmul`, `softmax`
+- `equal`, `max`, `softplus`
+- `erf`, `maxPool2d`, `softsign`
+- `exp`, `min`, `split`
+- `expand`, `mul`, `sqrt`
+- `floor`, `neg`, `squeeze`
+- `gather`, `pad`, `sub`
+- `gatherElements`, `pow`, `tan`
+- `gatherND`, `prelu`, `tanh`
+- `gelu`, `quantizeLinear`, `tile`
+- `gemm`, `reciprocal`, `transpose`
+- `globalAveragePool`, `reducel1`, `triangular`
+- `globalMaxPool`, `reducel2`, `unsqueeze`
+- `greater`, `reducelogsum`, `where`
+- `greaterOrEqual`, `reducelogsumexp`
 
 ## TensorRT Backend
 
