@@ -18,12 +18,19 @@ use crate::backends::coreml::CoremlContext;
 use crate::backends::litert::LiteRtContext;
 use crate::backends::ort::OrtContext;
 use crate::backends::trtx::TrtxContext;
+use std::collections::BTreeMap;
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 pub use crate::mlcontextoptions::{
     CoremlOptions, LiteRtOptions, MLContextOptions, MLPowerPreference, OrtOptions, RustNNOptions,
     TrtxOptions,
 };
+
+/// <https://www.w3.org/TR/webnn/#typedefdef-mlnamedtensors>
+pub type MLNamedTensors<'names> = BTreeMap<&'names str, &'names MLTensor>;
+/// <https://www.w3.org/TR/webnn/#typedefdef-mlnamedoperands>
+pub type MLNamedOperands<'names> = BTreeMap<&'names str, MLOperand>;
+
 pub use crate::mlgraphbuilder::MLGraphBuilder;
 use crate::{
     backend_selection::{select_backend, select_backend_by_gpu},
@@ -64,8 +71,8 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
     fn dispatch(
         &mut self,
         graph: &mut MLGraph,
-        inputs: &HashMap<&str, &MLTensor>,
-        outputs: &HashMap<&str, &MLTensor>,
+        inputs: &MLNamedTensors,
+        outputs: &MLNamedTensors,
     ) -> Result<()>;
 }
 
@@ -148,12 +155,12 @@ impl Display for MLContextLostInfo {
     }
 }
 
-/// https://www.w3.org/TR/webnn/#api-mltensor
+/// <https://www.w3.org/TR/webnn/#api-mltensor>
 #[derive(Debug, Clone)]
 pub struct MLTensor {
     pub(crate) id: usize,
     pub(crate) constant: bool,
-    /// internal slots as per https://www.w3.org/TR/webnn/#api-mltensor
+    /// internal slots as per <https://www.w3.org/TR/webnn/#api-mltensor>
     pub(crate) descriptor: MLTensorDescriptor,
     //context: &'context MLContext, // todo, omit context?
     //// pending promises, need to be canceled when tensor is destroyed
@@ -224,8 +231,8 @@ impl<'context> MLGraph<'context> {
 
     fn verify_dispatch_bindings(
         &mut self,
-        inputs: &HashMap<&str, &MLTensor>,
-        outputs: &HashMap<&str, &MLTensor>,
+        inputs: &MLNamedTensors,
+        outputs: &MLNamedTensors,
     ) -> Result<()> {
         let input_shapes: HashMap<String, Vec<usize>> = inputs
             .iter()
@@ -531,8 +538,8 @@ impl<'context> MLContext<'context> {
     pub fn dispatch(
         &mut self,
         graph: &mut MLGraph,
-        inputs: &HashMap<&str, &MLTensor>,
-        outputs: &HashMap<&str, &MLTensor>,
+        inputs: &MLNamedTensors,
+        outputs: &MLNamedTensors,
     ) -> crate::error::Result<()> {
         debug!("Dispatch {graph:?}, inputs={inputs:?}, outputs={outputs:?}");
         //https://www.w3.org/TR/webnn/#dom-mlcontext-dispatch
@@ -734,9 +741,9 @@ webnn_graph "sample_graph" v1 {
         let desc = rw_tensor_desc([2, 2].to_vec());
 
         let tensor = context.create_tensor(&desc).unwrap();
-        let mut inputs = HashMap::new();
+        let mut inputs = MLNamedTensors::new();
         inputs.insert("lhs", &tensor);
-        let mut outputs = HashMap::new();
+        let mut outputs = MLNamedTensors::new();
         outputs.insert("sum", &tensor);
 
         let upload = vec![1.0f32, 2., 3., 4.];
@@ -762,8 +769,8 @@ webnn_graph "sample_graph" v1 {
         let desc = rw_tensor_desc([2, 2].to_vec());
         let input_tensor = context.create_tensor(&desc).unwrap();
         let output_tensor = context.create_tensor(&desc).unwrap();
-        let inputs = HashMap::from([("lhs", &input_tensor)]);
-        let outputs = HashMap::from([("sum", &output_tensor)]);
+        let inputs = MLNamedTensors::from([("lhs", &input_tensor)]);
+        let outputs = MLNamedTensors::from([("sum", &output_tensor)]);
 
         for upload in [
             vec![1.0f32, 2., 3., 4.],
@@ -790,9 +797,9 @@ webnn_graph "sample_graph" v1 {
 
         let desc = rw_tensor_desc([2, 2].to_vec());
         let tensor = context.create_tensor(&desc).unwrap();
-        let mut inputs = HashMap::new();
+        let mut inputs = MLNamedTensors::new();
         inputs.insert("invalid_input", &tensor);
-        let mut outputs = HashMap::new();
+        let mut outputs = MLNamedTensors::new();
         outputs.insert("sum", &tensor);
 
         let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
@@ -811,9 +818,9 @@ webnn_graph "sample_graph" v1 {
 
         let desc = rw_tensor_desc([2, 3].to_vec());
         let tensor = context.create_tensor(&desc).unwrap();
-        let mut inputs = HashMap::new();
+        let mut inputs = MLNamedTensors::new();
         inputs.insert("lhs", &tensor);
-        let mut outputs = HashMap::new();
+        let mut outputs = MLNamedTensors::new();
         outputs.insert("sum", &tensor);
 
         let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
@@ -835,9 +842,9 @@ webnn_graph "sample_graph" v1 {
         let out_desc = rw_tensor_desc([2, 3].to_vec());
         let input_tensor = context.create_tensor(&in_desc).unwrap();
         let output_tensor = context.create_tensor(&out_desc).unwrap();
-        let mut inputs = HashMap::new();
+        let mut inputs = MLNamedTensors::new();
         inputs.insert("lhs", &input_tensor);
-        let mut outputs = HashMap::new();
+        let mut outputs = MLNamedTensors::new();
         outputs.insert("sum", &output_tensor);
 
         let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
