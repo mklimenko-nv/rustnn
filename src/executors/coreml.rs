@@ -86,6 +86,19 @@ pub unsafe extern "C" fn rustnn_coreml_predict(
     1
 }
 
+/// Releases an owned (+1) Objective-C object when dropped (including on early
+/// `return`/`?`), balancing the retain transferred to us by the shim's
+/// `__bridge_retained` cast.
+struct ReleaseOnDrop(*mut Object);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.0, release];
+        }
+    }
+}
+
 fn shim_error_to_string(buffer: &[u8]) -> String {
     let end = buffer
         .iter()
@@ -559,6 +572,10 @@ pub(crate) fn run_coreml_bytes(
                 reason: format!("prediction failed: {}", shim_error_to_string(&error)),
             });
         }
+        // `rustnn_coreml_predict` (coreml_shim.mm) hands back `output_provider`
+        // already retained (`__bridge_retained`) -- we own this reference and
+        // must release it once we're done extracting outputs.
+        let _output_provider_guard = ReleaseOnDrop(output_provider);
 
         let mut result = HashMap::with_capacity(output_descriptors.len());
         for (name, descriptor) in output_descriptors {
@@ -1157,6 +1174,8 @@ fn run_impl_zeroed_with_weights(
                 });
                 continue;
             }
+            // The shim returns a retained provider; release it after collecting.
+            let _output_provider_guard = ReleaseOnDrop(output_provider);
 
             match collect_outputs(output_provider) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
@@ -1338,6 +1357,8 @@ fn run_impl_with_inputs_with_weights(
                 });
                 continue;
             }
+            // The shim returns a retained provider; release it after collecting.
+            let _output_provider_guard = ReleaseOnDrop(output_provider);
 
             match collect_outputs(output_provider) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
