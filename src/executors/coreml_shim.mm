@@ -88,8 +88,18 @@ int rustnn_coreml_load(void *compiled_url, void *config, void **out_model, char 
     }
 }
 
-// Run a prediction. On success `*out_provider` is a borrowed (autoreleased)
-// output feature provider valid for the caller's current autorelease pool.
+// Run a prediction. On success `*out_provider` is a RETAINED output feature
+// provider; the caller owns it and must release it when done.
+//
+// `-predictionFromFeatures:error:` returns its result at +0 (autoreleased);
+// under ARC, `out` (a strong local) picks up a retain for the duration of this
+// function and ARC releases it again when `out` goes out of scope at `return`.
+// A plain `__bridge` cast here does not add a matching retain of its own, so by
+// the time control returns to the caller the object can already be
+// deallocated -- reproduced 100% of the time in optimized (non-debug) builds as
+// a SIGSEGV (garbage receiver in `objc_msgSend`) on the very next use of
+// `*out_provider`. `__bridge_retained` performs the retain the caller needs to
+// keep the object alive past this function returning.
 int rustnn_coreml_predict(void *model, void *features, void **out_provider, char *err,
                           size_t err_len) {
     *out_provider = NULL;
@@ -103,7 +113,7 @@ int rustnn_coreml_predict(void *model, void *features, void **out_provider, char
                             nserr ? [nserr localizedDescription] : @"prediction returned nil");
             return 1;
         }
-        *out_provider = (__bridge void *)out;
+        *out_provider = (__bridge_retained void *)out;
         return 0;
     } @catch (NSException *e) {
         rustnn_copy_err(err, err_len,
