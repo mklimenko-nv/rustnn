@@ -9296,9 +9296,14 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         .static_or_max_shape()
                 });
 
-                // Get axes from typed options (unsqueeze). Typed options required.
+                // Get axes from typed options. Empty axes stay axes-less: for Squeeze that
+                // means "remove all unit dims" per ONNX semantics.
                 let axes_i64 = match &op {
                     Operation::Unsqueeze { options, .. } => options
+                        .as_ref()
+                        .filter(|o| !o.axes.is_empty())
+                        .map(|o| o.axes.iter().map(|&u| u as i64).collect::<Vec<i64>>()),
+                    Operation::Squeeze { options, .. } => options
                         .as_ref()
                         .filter(|o| !o.axes.is_empty())
                         .map(|o| o.axes.iter().map(|&u| u as i64).collect::<Vec<i64>>()),
@@ -11598,6 +11603,83 @@ mod tests {
             !gp.node.iter().any(|n| n.name.ends_with("_scalar_reshape")),
             "unsqueeze-tracked tensors should not be treated as scalars before expand",
         );
+    }
+
+    #[test]
+    fn test_squeeze_with_axes_emits_axes_input() {
+        // Regression: squeeze(input [1,2,1,3], axes=[2]) must export an ONNX Squeeze
+        // with an explicit axes input. An axes-less Squeeze removes ALL unit dims,
+        // silently changing the output shape from [1,2,3] to [2,3].
+        let operands = vec![
+            Operand {
+                kind: OperandKind::Input,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: vec![
+                        Dimension::Static(1),
+                        Dimension::Static(2),
+                        Dimension::Static(1),
+                        Dimension::Static(3),
+                    ],
+                    pending_permutation: vec![],
+                },
+                name: Some("input".to_string()),
+            },
+            Operand {
+                kind: OperandKind::Output,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: vec![
+                        Dimension::Static(1),
+                        Dimension::Static(2),
+                        Dimension::Static(3),
+                    ],
+                    pending_permutation: vec![],
+                },
+                name: Some("squeezed".to_string()),
+            },
+        ];
+
+        let operations = vec![Operation::Squeeze {
+            input: 0,
+            options: Some(crate::operator_options::MLSqueezeOptions {
+                label: String::new(),
+                axes: vec![2],
+            }),
+            outputs: vec![1],
+        }];
+
+        let graph = GraphInfo {
+            operands,
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations,
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let model =
+            ModelProto::decode(OnnxConverter.convert(&graph).unwrap().data.as_slice()).unwrap();
+        let gp = model.graph.unwrap();
+
+        let squeeze_node = gp
+            .node
+            .iter()
+            .find(|n| n.op_type == "Squeeze")
+            .expect("Squeeze node present");
+        assert_eq!(
+            squeeze_node.input.len(),
+            2,
+            "Squeeze with explicit axes must carry a second (axes) input, got {:?}",
+            squeeze_node.input
+        );
+        let axes_init = gp
+            .initializer
+            .iter()
+            .find(|t| t.name == squeeze_node.input[1])
+            .expect("axes initializer present");
+        assert_eq!(axes_init.int64_data, vec![2]);
     }
 
     #[cfg(feature = "dynamic-inputs")]
