@@ -5024,34 +5024,29 @@ impl crate::converters::GraphConverter for OnnxConverter {
                             Self::invalid_operand("where true input", *true_id, Some((op, idx)))
                         })?;
 
-                    let true_cast_name = format!("{}_true_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_true_{}", op_name, cast_counter),
-                        inputs[1].clone(),
-                        true_cast_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs[1] = true_cast_name;
+                    // target_type is the true input's dtype, so only the false input
+                    // may need a cast. Identity casts must be avoided: ORT's fp16
+                    // InsertedPrecisionFreeCast transform mishandles f16->f16 casts
+                    // feeding Where when optimizations are disabled.
+                    let false_operand = graph.operand(*false_id).ok_or_else(|| {
+                        Self::invalid_operand("where false input", *false_id, Some((op, idx)))
+                    })?;
 
-                    // Validate false operand exists for clearer converter errors.
-                    if graph.operand(*false_id).is_none() {
-                        return Err(Self::invalid_operand(
-                            "where false input",
-                            *false_id,
-                            Some((op, idx)),
+                    let false_type = type_overrides
+                        .get(false_id)
+                        .copied()
+                        .unwrap_or(false_operand.descriptor.data_type);
+                    if false_type != target_type {
+                        let false_cast_name = format!("{}_false_cast_{}", op_name, cast_counter);
+                        nodes.push(Self::create_cast_node(
+                            &format!("{}_cast_false_{}", op_name, cast_counter),
+                            inputs[2].clone(),
+                            false_cast_name.clone(),
+                            Self::data_type_code(target_type),
                         ));
+                        cast_counter += 1;
+                        inputs[2] = false_cast_name;
                     }
-
-                    let false_cast_name = format!("{}_false_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_false_{}", op_name, cast_counter),
-                        inputs[2].clone(),
-                        false_cast_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs[2] = false_cast_name;
 
                     if let Some(output_id) = op.output_operand() {
                         type_overrides.insert(output_id, target_type);
@@ -9662,37 +9657,37 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         .ok_or_else(|| {
                             Self::invalid_operand("where true input", true_id, Some((op, idx)))
                         })?;
-                    if graph.operand(false_id).is_none() {
-                        return Err(Self::invalid_operand(
-                            "where false input",
-                            false_id,
-                            Some((op, idx)),
-                        ));
-                    }
+                    let false_operand = graph.operand(false_id).ok_or_else(|| {
+                        Self::invalid_operand("where false input", false_id, Some((op, idx)))
+                    })?;
 
                     let target_type = true_type;
 
-                    let true_input_name = operand_name(graph, true_id);
-                    let true_cast_output_name = format!("{}_true_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_true_{}", op_name, cast_counter),
-                        true_input_name,
-                        true_cast_output_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs.push(true_cast_output_name);
+                    // target_type is the true input's dtype, so only the false input
+                    // may need a cast. Identity casts must be avoided: ORT's fp16
+                    // InsertedPrecisionFreeCast transform mishandles f16->f16 casts
+                    // feeding Where when optimizations are disabled.
+                    inputs.push(operand_name(graph, true_id));
 
+                    let false_type = type_overrides
+                        .get(&false_id)
+                        .copied()
+                        .unwrap_or(false_operand.descriptor.data_type);
                     let false_input_name = operand_name(graph, false_id);
-                    let false_cast_output_name = format!("{}_false_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_false_{}", op_name, cast_counter),
-                        false_input_name,
-                        false_cast_output_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs.push(false_cast_output_name);
+                    if false_type != target_type {
+                        let false_cast_output_name =
+                            format!("{}_false_cast_{}", op_name, cast_counter);
+                        nodes.push(Self::create_cast_node(
+                            &format!("{}_cast_false_{}", op_name, cast_counter),
+                            false_input_name,
+                            false_cast_output_name.clone(),
+                            Self::data_type_code(target_type),
+                        ));
+                        cast_counter += 1;
+                        inputs.push(false_cast_output_name);
+                    } else {
+                        inputs.push(false_input_name);
+                    }
 
                     let output_operand_id = op
                         .output_operand()
@@ -10913,6 +10908,86 @@ mod tests {
         let converter = OnnxConverter;
         let result = converter.convert(&graph);
         result.unwrap();
+    }
+
+    #[test]
+    fn test_where_same_dtype_inputs_emit_no_value_casts() {
+        // Identity casts on Where value inputs break ORT fp16 graphs at
+        // GraphOptimizationLevel::Disable (InsertedPrecisionFreeCast quirk).
+        let operands = vec![
+            Operand {
+                kind: OperandKind::Input,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Uint8,
+                    shape: s(&[2]),
+                    pending_permutation: vec![],
+                },
+                name: Some("cond".to_string()),
+            },
+            Operand {
+                kind: OperandKind::Input,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float16,
+                    shape: s(&[2]),
+                    pending_permutation: vec![],
+                },
+                name: Some("t".to_string()),
+            },
+            Operand {
+                kind: OperandKind::Input,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float16,
+                    shape: s(&[2]),
+                    pending_permutation: vec![],
+                },
+                name: Some("f".to_string()),
+            },
+            Operand {
+                kind: OperandKind::Output,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float16,
+                    shape: s(&[2]),
+                    pending_permutation: vec![],
+                },
+                name: Some("out".to_string()),
+            },
+        ];
+
+        let operations = vec![Operation::Where {
+            condition: 0,
+            true_value: 1,
+            false_value: 2,
+            options: None,
+            outputs: vec![3],
+        }];
+
+        let graph = GraphInfo {
+            operands,
+            input_operands: vec![0, 1, 2],
+            output_operands: vec![3],
+            operations,
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let model =
+            ModelProto::decode(OnnxConverter.convert(&graph).unwrap().data.as_slice()).unwrap();
+        let gp = model.graph.unwrap();
+
+        let where_node = gp
+            .node
+            .iter()
+            .find(|n| n.op_type == "Where")
+            .expect("Where node present");
+        assert_eq!(where_node.input[1], "t");
+        assert_eq!(where_node.input[2], "f");
+        assert!(
+            !gp.node
+                .iter()
+                .any(|n| n.name.contains("_cast_true_") || n.name.contains("_cast_false_")),
+            "same-dtype Where value inputs must not get identity casts",
+        );
     }
 
     #[cfg(not(feature = "dynamic-inputs"))]
