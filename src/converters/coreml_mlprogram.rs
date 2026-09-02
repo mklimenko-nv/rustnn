@@ -83,6 +83,31 @@ fn convert_zp_bytes(src: &[u8], src_dtype: &DataType, tgt_dtype: &DataType) -> V
             }
             out
         }
+        // Float32 <-> Float16: quantize/dequantize scale constants whose float type
+        // doesn't match the float tensor ("input and scale must have the same data type").
+        (DataType::Float32, DataType::Float16) => {
+            let count = src.len() / 4;
+            let mut out = Vec::with_capacity(count * 2);
+            for i in 0..count {
+                let v = f32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+            }
+            out
+        }
+        (DataType::Float16, DataType::Float32) => {
+            let count = src.len() / 2;
+            let mut out = Vec::with_capacity(count * 4);
+            for i in 0..count {
+                let bits = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
+            }
+            out
+        }
         _ => src.to_vec(),
     }
 }
@@ -1525,12 +1550,22 @@ impl CoremlMlProgramConverter {
     /// CoreML's native op can't express it. int4/uint4 tensors are excluded (they cannot
     /// be materialized at all) and scalar tensors keep the native rank-0 fast path.
     fn qdq_should_decompose(graph: &GraphInfo, op: &Operation) -> bool {
-        let (quant_id, tensor_shape_id, scale_id) = match op {
+        let (quant_id, tensor_shape_id, scale_id, zero_point_id) = match op {
             // dequantize: the quantized tensor is the input; its type/shape drive the check.
-            Operation::DequantizeLinear { input, scale, .. } => (*input, *input, *scale),
+            Operation::DequantizeLinear {
+                input,
+                scale,
+                zero_point,
+                ..
+            } => (*input, *input, *scale, *zero_point),
             // quantize: the quantized tensor is the output; the float input carries the shape.
-            Operation::QuantizeLinear { input, scale, .. } => match op.output_operand() {
-                Some(out) => (out, *input, *scale),
+            Operation::QuantizeLinear {
+                input,
+                scale,
+                zero_point,
+                ..
+            } => match op.output_operand() {
+                Some(out) => (out, *input, *scale, *zero_point),
                 None => return false,
             },
             _ => return false,
@@ -1542,6 +1577,18 @@ impl CoremlMlProgramConverter {
         ) else {
             return false;
         };
+        // CoreML's native quantize/dequantize require const scale/zero_point;
+        // runtime-computed ones (e.g. DynamicQuantizeLinear lowering) must be
+        // decomposed into elementwise arithmetic.
+        if scale_op.kind != crate::graph::OperandKind::Constant {
+            return true;
+        }
+        if let Some(zp_id) = zero_point_id
+            && let Some(zp_op) = graph.operand(zp_id)
+            && zp_op.kind != crate::graph::OperandKind::Constant
+        {
+            return true;
+        }
         let quant_dt = quant_op.descriptor.data_type.clone();
         if tensor_op.descriptor.shape.is_empty() {
             // Scalars normally use the native rank-0 fast path, but int4/uint4 have no
@@ -2194,7 +2241,7 @@ impl CoremlMlProgramConverter {
         ));
 
         // 2. scale -> reshape to interleaved.
-        let scale_name = operand_name(graph, scale_id);
+        let scale_name = Self::output_name_for_operand(graph, scale_id, overrides);
         let scale_r_name = format!("{}_dq_scale_r", output_name);
         let scale_r_type =
             Self::value_type_for_static_shape(scale_r_name.clone(), out_dtype, &interleaved_scale);
@@ -2212,7 +2259,7 @@ impl CoremlMlProgramConverter {
 
         // 3. (input - zeroPoint), if a zero_point is present.
         let minus_zp_name = if let Some(zp_id) = zp_id {
-            let zp_name = operand_name(graph, zp_id);
+            let zp_name = Self::output_name_for_operand(graph, zp_id, overrides);
             let zp_f_name = format!("{}_dq_zp_f", output_name);
             let zp_f_type =
                 Self::value_type_for_static_shape(zp_f_name.clone(), out_dtype, &scale_shape);
@@ -2369,7 +2416,7 @@ impl CoremlMlProgramConverter {
         ));
 
         // 2. cast scale -> fp32, reshape to interleaved form.
-        let scale_name = operand_name(graph, scale_id);
+        let scale_name = Self::output_name_for_operand(graph, scale_id, overrides);
         let scale_f_name = format!("{}_q_scale_f", output_name);
         let scale_f_type =
             Self::value_type_for_static_shape(scale_f_name.clone(), float_dtype, &scale_shape);
@@ -2421,7 +2468,7 @@ impl CoremlMlProgramConverter {
 
         // 4. add the zero_point (cast to float, reshaped), if present.
         let biased_name = if let Some(zp_id) = zp_id {
-            let zp_name = operand_name(graph, zp_id);
+            let zp_name = Self::output_name_for_operand(graph, zp_id, overrides);
             let zp_f_name = format!("{}_q_zp_f", output_name);
             let zp_f_type =
                 Self::value_type_for_static_shape(zp_f_name.clone(), float_dtype, &scale_shape);
@@ -4927,6 +4974,31 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 if let (Some(&zp_id), Some(expected_dt)) = (input_ids.get(2), zp_expected_type) {
                     zp_id_to_dtype.insert(zp_id, expected_dt);
                 }
+                // CoreML requires scale's float type to match the float tensor
+                // (quantize: the input; dequantize: the output). Coerce constant
+                // scales that disagree (e.g. an fp16 tensor with an fp32 scale).
+                let float_dt = if op_lower == "quantizelinear" {
+                    input_ids
+                        .first()
+                        .and_then(|&id| graph_info.operand(id))
+                        .map(|o| o.descriptor.data_type.clone())
+                } else {
+                    op.output_operand()
+                        .and_then(|id| graph_info.operand(id))
+                        .map(|o| o.descriptor.data_type.clone())
+                };
+                if let (Some(&scale_id), Some(float_dt)) = (input_ids.get(1), float_dt)
+                    && matches!(float_dt, DataType::Float32 | DataType::Float16)
+                    && let Some(scale_op) = graph_info.operand(scale_id)
+                    && matches!(
+                        scale_op.descriptor.data_type,
+                        DataType::Float32 | DataType::Float16
+                    )
+                    && scale_op.descriptor.data_type != float_dt
+                    && scale_op.kind == crate::graph::OperandKind::Constant
+                {
+                    zp_id_to_dtype.insert(scale_id, float_dt);
+                }
                 // For dequantize, CoreML also requires the INPUT (index 0) to be int8 or uint8.
                 // If the input is a constant Int32 tensor, coerce its bytes to int8/uint8 so
                 // CoreML accepts it. Non-constant Int32 inputs are handled with a cast op below.
@@ -5382,7 +5454,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             }
                         })?;
                         if input_operand.descriptor.data_type == DataType::Uint8 {
-                            let bool_input_name = format!("{}_bool", input_names[index]);
+                            // Suffix with the consuming op's output id: a bare
+                            // `{input}_bool` collides with the producer's own
+                            // `{output}_bool` raw result when the input comes
+                            // from another comparison/logical op ("Block
+                            // redefines I/O name").
+                            let bool_input_name =
+                                format!("{}_bool_{}", input_names[index], output_id);
                             let bool_input_type = Self::create_value_with_mil_type(
                                 graph_info,
                                 input_id,
@@ -6939,6 +7017,167 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            // layer/instance normalization with a runtime (non-constant) scale or
+            // bias: CoreML's native layer_norm/instance_norm require const
+            // gamma/beta ("Param 'gamma' must be const"), so run the native op
+            // without them and apply `y = norm(x) * scale + bias` with explicit
+            // mul/add, reshaping scale/bias to a broadcast-compatible shape.
+            // Both params are stripped together: the native op computes
+            // `norm * gamma + beta`, so applying one after the fact while the
+            // other stays inside would change the result.
+            if matches!(
+                op,
+                Operation::LayerNormalization { .. } | Operation::InstanceNormalization { .. }
+            ) {
+                let (scale_id, bias_id) = match op {
+                    Operation::LayerNormalization { options, .. } => (
+                        options.as_ref().and_then(|o| o.scale),
+                        options.as_ref().and_then(|o| o.bias),
+                    ),
+                    Operation::InstanceNormalization { options, .. } => (
+                        options.as_ref().and_then(|o| o.scale),
+                        options.as_ref().and_then(|o| o.bias),
+                    ),
+                    _ => (None, None),
+                };
+                let is_runtime = |id: Option<u32>| {
+                    id.and_then(|id| graph_info.operand(id))
+                        .map(|o| o.kind != crate::graph::OperandKind::Constant)
+                        .unwrap_or(false)
+                };
+                if is_runtime(scale_id) || is_runtime(bias_id) {
+                    let x_id = *op.input_operands().first().ok_or_else(|| {
+                        GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("{} has no input operand", op.op_type()),
+                        }
+                    })?;
+                    let x_op =
+                        graph_info
+                            .operand(x_id)
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("input operand {x_id} not found"),
+                            })?;
+                    let x_shape = x_op.descriptor.static_or_max_shape();
+                    let rank = x_shape.len();
+                    let mil_dtype = Self::graph_value_mil_type(&x_op.descriptor.data_type)?;
+                    let out_id =
+                        op.output_operand()
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("{} has no output operand", op.op_type()),
+                            })?;
+                    let (out_name, out_type) =
+                        Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
+
+                    // Broadcast target: scale/bias expanded to the input rank with
+                    // 1s on non-normalized (layer) / non-channel (instance) dims.
+                    let target: Vec<u32> = match op {
+                        Operation::LayerNormalization { options, .. } => {
+                            let axes: Vec<usize> = options
+                                .as_ref()
+                                .and_then(|o| o.axes.as_ref())
+                                .map(|ax| ax.iter().map(|&a| a as usize).collect())
+                                .unwrap_or_else(|| {
+                                    if rank > 1 {
+                                        (1..rank).collect()
+                                    } else {
+                                        vec![0]
+                                    }
+                                });
+                            (0..rank)
+                                .map(|i| if axes.contains(&i) { x_shape[i] } else { 1 })
+                                .collect()
+                        }
+                        _ => {
+                            let nhwc = match op {
+                                Operation::InstanceNormalization { options, .. } => options
+                                    .as_ref()
+                                    .map(|o| o.layout.eq_ignore_ascii_case("nhwc"))
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            let c_idx = if nhwc { rank.saturating_sub(1) } else { 1 };
+                            (0..rank)
+                                .map(|i| if i == c_idx { x_shape[i] } else { 1 })
+                                .collect()
+                        }
+                    };
+
+                    let mut stripped = op.clone();
+                    match &mut stripped {
+                        Operation::LayerNormalization { options, .. } => {
+                            if let Some(o) = options {
+                                o.scale = None;
+                                o.bias = None;
+                            }
+                        }
+                        Operation::InstanceNormalization { options, .. } => {
+                            if let Some(o) = options {
+                                o.scale = None;
+                                o.bias = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                    let norm_name = format!("{out_name}_nogb_{out_id}");
+                    let mut norm_overrides = operand_name_overrides.clone();
+                    norm_overrides.insert(out_id, norm_name.clone());
+                    let mil = self.convert_operation_with_overrides(
+                        graph_info,
+                        &stripped,
+                        &norm_overrides,
+                    )?;
+                    main_block.operations.push(mil);
+
+                    let mut cur = norm_name;
+                    let steps: Vec<(&str, u32, &str)> = scale_id
+                        .map(|id| ("mul", id, "gamma"))
+                        .into_iter()
+                        .chain(bias_id.map(|id| ("add", id, "beta")))
+                        .collect();
+                    let last = steps.len().saturating_sub(1);
+                    for (i, (mil_op, param_id, tag)) in steps.into_iter().enumerate() {
+                        let param_name = Self::output_name_for_operand(
+                            graph_info,
+                            param_id,
+                            &operand_name_overrides,
+                        );
+                        let bcast = Self::rnn_reshape(
+                            &mut main_block,
+                            &param_name,
+                            &target,
+                            format!("{out_name}_{tag}_bcast_{out_id}"),
+                            mil_dtype,
+                        );
+                        let (step_name, step_type) = if i == last {
+                            (out_name.clone(), out_type.clone())
+                        } else {
+                            let name = format!("{out_name}_{tag}_applied_{out_id}");
+                            let ty = Self::create_value_with_mil_type(
+                                graph_info,
+                                out_id,
+                                name.clone(),
+                                mil_dtype,
+                            )?;
+                            (name, ty)
+                        };
+                        let mut io = HashMap::new();
+                        io.insert("x".to_string(), Self::create_name_argument(cur.clone()));
+                        io.insert("y".to_string(), Self::create_name_argument(bcast));
+                        main_block.operations.push(Self::create_mil_operation(
+                            mil_op,
+                            io,
+                            vec![step_type],
+                        ));
+                        cur = step_name;
+                    }
+                    let _ = cur;
+                    continue;
+                }
+            }
+
             // `where` (MIL: select) — CoreML requires the condition to be bool,
             // but WebNN encodes booleans as uint8. Insert a cast when needed.
             if op_type_lower == "where" {
@@ -6956,7 +7195,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             cond_id,
                             &operand_name_overrides,
                         );
-                        let bool_cond_name = format!("{cond_name}_bool");
+                        // Suffix with this op's output id: a bare `{cond}_bool`
+                        // collides with the producing comparison's own
+                        // `{output}_bool` raw result ("Block redefines I/O name").
+                        let where_out = op.output_operand().unwrap_or(cond_id);
+                        let bool_cond_name = format!("{cond_name}_bool_{where_out}");
                         let bool_cond_type = Self::create_value_with_mil_type(
                             graph_info,
                             cond_id,
@@ -8921,6 +9164,42 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             main_block.outputs.push(output_name);
         }
 
+        // CoreML rejects, at MLModel load time ("Error in declaring input X with
+        // error -1."), a function input that no operation consumes — e.g.
+        // castLike's target_type (only its dtype matters, never its values) or
+        // an input whose sole consumer was constant-folded away. Drop such
+        // inputs from the function signature and, below, from the model
+        // description. Dispatch may still bind a tensor for them: CoreML
+        // ignores extra features at prediction time.
+        let mut referenced_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            fn walk_block_names(block: &Block, names: &mut std::collections::HashSet<String>) {
+                use crate::protos::coreml::mil_spec::argument::binding::Binding;
+                for op in &block.operations {
+                    for arg in op.inputs.values() {
+                        for b in &arg.arguments {
+                            if let Some(Binding::Name(n)) = &b.binding {
+                                names.insert(n.clone());
+                            }
+                        }
+                    }
+                    for nested in &op.blocks {
+                        walk_block_names(nested, names);
+                    }
+                }
+            }
+            walk_block_names(&main_block, &mut referenced_names);
+        }
+        main_function
+            .inputs
+            .retain(|nv| referenced_names.contains(&nv.name));
+        let declared_input_names: std::collections::HashSet<String> = main_function
+            .inputs
+            .iter()
+            .map(|nv| nv.name.clone())
+            .collect();
+
         // Add block to function
         main_function.opset = "CoreML7".to_string(); // Specify the active block specialization
         main_function
@@ -8946,6 +9225,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         for &input_id in &graph_info.input_operands {
             if let Some(operand) = graph_info.operand(input_id) {
                 let input_name = operand_name(graph_info, input_id);
+                // Unused inputs were dropped from the function signature above;
+                // the model description must match it.
+                if !declared_input_names.contains(&input_name) {
+                    continue;
+                }
                 input_descriptions.push(FeatureDescription {
                     name: input_name,
                     r#type: Some(Self::create_feature_type(&operand.descriptor)?),

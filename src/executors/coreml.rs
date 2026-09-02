@@ -91,6 +91,16 @@ pub unsafe extern "C" fn rustnn_coreml_predict(
 /// `__bridge_retained` cast.
 struct ReleaseOnDrop(*mut Object);
 
+impl ReleaseOnDrop {
+    /// Take the pointer back out without releasing, handing ownership (+1)
+    /// to the caller.
+    fn into_inner(self) -> *mut Object {
+        let ptr = self.0;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
         unsafe {
@@ -366,6 +376,8 @@ fn compile_model_from_url(
     autoreleasepool(|| unsafe {
         let (compiled_url, compiled_dir, temp_model) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, None)?;
+        // Owned (+1) by us; released when this function returns on any path.
+        let _compiled_url_guard = ReleaseOnDrop(compiled_url);
         let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
         let mut candidates = vec![(preferred_code, preferred_name)];
         if preferred_code != 0 {
@@ -389,8 +401,8 @@ fn compile_model_from_url(
                 last_error = format!("MLModel load failed: {}", shim_error_to_string(&error));
                 continue;
             }
-            // The shim returns a borrowed model. Retain it beyond this pool.
-            let _: *mut Object = msg_send![model, retain];
+            // The shim returns an owned (+1) model; `CompiledCoremlModel`'s
+            // Drop releases it.
             return Ok(CompiledCoremlModel {
                 model,
                 compute_unit: name,
@@ -1057,6 +1069,8 @@ fn run_impl_zeroed_with_weights(
     unsafe {
         let (compiled_url, compiled_path_buf, temp_mlmodel) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, compiled_path)?;
+        // Owned (+1) by us; released when this function returns on any path.
+        let _compiled_url_guard = ReleaseOnDrop(compiled_url);
 
         // Try only Neural Engine + GPU (best performance on Apple Silicon)
         // Fallback to ALL if that fails
@@ -1088,6 +1102,8 @@ fn run_impl_zeroed_with_weights(
                 });
                 continue;
             }
+            // Owned (+1) by us for this attempt; released at end of iteration.
+            let _model_guard = ReleaseOnDrop(model);
             let model_description: *mut Object = msg_send![model, modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
@@ -1232,6 +1248,8 @@ fn run_impl_with_inputs_with_weights(
     unsafe {
         let (compiled_url, compiled_path_buf, temp_mlmodel) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, cache_path)?;
+        // Owned (+1) by us; released when this function returns on any path.
+        let _compiled_url_guard = ReleaseOnDrop(compiled_url);
 
         // Try only Neural Engine + GPU (best performance on Apple Silicon)
         // Fallback to ALL if that fails
@@ -1263,6 +1281,8 @@ fn run_impl_with_inputs_with_weights(
                 });
                 continue;
             }
+            // Owned (+1) by us for this attempt; released at end of iteration.
+            let _model_guard = ReleaseOnDrop(model);
 
             // Get model input descriptions to query expected data types
             let model_description: *mut Object = msg_send![model, modelDescription];
@@ -1531,6 +1551,10 @@ unsafe fn prepare_compiled_model(
     unsafe { prepare_compiled_model_with_weights(model_bytes, None, cached_compiled) }
 }
 
+/// Compile a model to a `.mlmodelc`, optionally persisting it to `cached_compiled`.
+///
+/// On success the returned NSURL is owned (+1); the caller must release it
+/// (e.g. via [`ReleaseOnDrop`]) once the model has been loaded.
 pub(crate) unsafe fn prepare_compiled_model_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
@@ -1553,6 +1577,9 @@ pub(crate) unsafe fn prepare_compiled_model_with_weights(
             reason: format!("MLModel compile failed: {}", shim_error_to_string(&error)),
         });
     }
+    // The shim returns an owned (+1) URL; the guard releases it on every path
+    // that doesn't hand it back to the caller.
+    let compiled_url_guard = ReleaseOnDrop(compiled_url);
 
     let compiled_path_obj: *mut Object = msg_send![compiled_url, path];
     let compiled_src_path = PathBuf::from(unsafe { nsstring_to_string(compiled_path_obj) });
@@ -1567,10 +1594,17 @@ pub(crate) unsafe fn prepare_compiled_model_with_weights(
             });
         }
         let persisted_url = unsafe { nsurl_from_path(path)? };
+        // `nsurl_from_path` returns an autoreleased URL; retain it so both
+        // branches hand the caller an owned (+1) reference.
+        let _: *mut Object = msg_send![persisted_url, retain];
         return Ok((persisted_url, path.to_path_buf(), Some(temp_mlmodel)));
     }
 
-    Ok((compiled_url, compiled_src_path, Some(temp_mlmodel)))
+    Ok((
+        compiled_url_guard.into_inner(),
+        compiled_src_path,
+        Some(temp_mlmodel),
+    ))
 }
 
 #[allow(dead_code)]
