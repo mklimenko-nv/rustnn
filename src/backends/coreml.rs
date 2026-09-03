@@ -98,6 +98,16 @@ fn supports_in_memory_asset(graph: &GraphInfo) -> bool {
         Operation::Neg { input, .. } => graph
             .operand(*input)
             .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32),
+        // The in-memory compiler constant-folds integer `real_div` chains with
+        // float division (200/16 stays 12.5 through subsequent folded ops)
+        // instead of truncating, corrupting e.g. packed-nibble unpack chains
+        // (div/mul/sub); the URL compiler folds with integer semantics.
+        Operation::Div { a, .. } => graph.operand(*a).is_some_and(|operand| {
+            !matches!(
+                operand.descriptor.data_type,
+                DataType::Float32 | DataType::Float16
+            )
+        }),
         _ => false,
     })
 }
