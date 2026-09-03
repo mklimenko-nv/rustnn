@@ -7276,6 +7276,50 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            // identity over a constant: CoreML's compiler elides `identity`
+            // ops, and for a const input the plan builder then fails with
+            // "Variable is not associated with a name" (error -5) because the
+            // alias name was dropped. Emit an exact `mul(x, 1)` instead, which
+            // survives compilation. Identity of non-const values is unaffected.
+            if matches!(op, Operation::Identity { .. })
+                && let Some(&id_in) = op.input_operands().first()
+                && let Some(id_in_op) = graph_info.operand(id_in)
+                && id_in_op.kind == crate::graph::OperandKind::Constant
+                // Scalars keep the plain identity: they pass CoreML's lax
+                // identity type-check, while mul's strict inference rejects
+                // the rank-1 [1] type the graph declares for them.
+                && !id_in_op.descriptor.shape.is_empty()
+                && matches!(
+                    id_in_op.descriptor.data_type,
+                    DataType::Float32 | DataType::Float16 | DataType::Int32
+                )
+                && let Some(out_id) = op.output_operand()
+            {
+                let (_, out_type) =
+                    Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
+                let one = match id_in_op.descriptor.data_type {
+                    DataType::Float16 => Self::create_immediate_float16(1.0),
+                    DataType::Int32 => Self::create_immediate_int(1),
+                    _ => Self::create_immediate_float(1.0),
+                };
+                let mut mul_in = HashMap::new();
+                mul_in.insert(
+                    "x".to_string(),
+                    Self::create_name_argument(Self::output_name_for_operand(
+                        graph_info,
+                        id_in,
+                        &operand_name_overrides,
+                    )),
+                );
+                mul_in.insert("y".to_string(), one);
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_ops::MUL,
+                    mul_in,
+                    vec![out_type],
+                ));
+                continue;
+            }
+
             // tile / expand over int8/uint8: MIL `tile` only accepts
             // bool/int32/fp16/fp32 (WebNN expand lowers to tile). Cast to int32,
             // run the op, cast back — exact for all 8-bit values.
