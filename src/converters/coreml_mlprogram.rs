@@ -7276,6 +7276,100 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            // tile / expand over int8/uint8: MIL `tile` only accepts
+            // bool/int32/fp16/fp32 (WebNN expand lowers to tile). Cast to int32,
+            // run the op, cast back — exact for all 8-bit values.
+            if matches!(op, Operation::Tile { .. } | Operation::Expand { .. })
+                && let Some(&tile_in_id) = op.input_operands().first()
+                && let Some(tile_in_op) = graph_info.operand(tile_in_id)
+                && matches!(
+                    tile_in_op.descriptor.data_type,
+                    DataType::Int8 | DataType::Uint8
+                )
+                && let Some(out_id) = op.output_operand()
+                && !tile_in_op.descriptor.shape.is_empty()
+            {
+                let (out_name, out_type) =
+                    Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
+                let int32 = crate::protos::coreml::mil_spec::DataType::Int32 as i32;
+                let in_shape = tile_in_op.descriptor.static_or_max_shape();
+
+                let cast_in_name = format!("{out_name}_int_in");
+                let cast_in_type =
+                    Self::value_type_for_static_shape(cast_in_name.clone(), int32, &in_shape);
+                main_block.operations.push(Self::create_cast_operation(
+                    Self::output_name_for_operand(graph_info, tile_in_id, &operand_name_overrides),
+                    cast_in_type,
+                    "int32",
+                ));
+
+                // Expand with a rank-raising input consumes a helper reshape named
+                // after this op's output (see the expand emission); emit it here
+                // with the int32 dtype so the reference resolves.
+                if matches!(op, Operation::Expand { .. }) {
+                    let out_shape = graph_info
+                        .operand(out_id)
+                        .map(|o| o.descriptor.static_or_max_shape())
+                        .unwrap_or_default();
+                    if in_shape.len() < out_shape.len() {
+                        let output_rank = out_shape.len();
+                        let mut reshaped_dims = vec![1u32; output_rank];
+                        for i in 0..in_shape.len() {
+                            reshaped_dims[output_rank - i - 1] = in_shape[in_shape.len() - i - 1];
+                        }
+                        let rs_name =
+                            format!("{}_expand_reshaped", operand_name(graph_info, out_id));
+                        let rs_type = Self::value_type_for_static_shape(
+                            rs_name.clone(),
+                            int32,
+                            &reshaped_dims,
+                        );
+                        let mut rs_in: HashMap<String, Argument> = HashMap::new();
+                        rs_in.insert(
+                            "x".to_string(),
+                            Self::create_name_argument(cast_in_name.clone()),
+                        );
+                        rs_in.insert(
+                            "shape".to_string(),
+                            Self::create_int_array_argument(
+                                reshaped_dims.iter().map(|&v| v as i32).collect(),
+                            ),
+                        );
+                        main_block.operations.push(Self::create_mil_operation(
+                            "reshape",
+                            rs_in,
+                            vec![rs_type],
+                        ));
+                    }
+                }
+
+                let int_out_name = format!("{out_name}_int_out");
+                let mut int_overrides = operand_name_overrides.clone();
+                int_overrides.insert(tile_in_id, cast_in_name);
+                int_overrides.insert(out_id, int_out_name.clone());
+                let mut mil =
+                    self.convert_operation_with_overrides(graph_info, op, &int_overrides)?;
+                // The generic emission types the output after the operand (int8/
+                // uint8); the tile actually produces int32 here.
+                for nv in &mut mil.outputs {
+                    if let Some(vt) = nv.r#type.as_mut()
+                        && let Some(crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                            tt,
+                        )) = vt.r#type.as_mut()
+                    {
+                        tt.data_type = int32;
+                    }
+                }
+                main_block.operations.push(mil);
+
+                main_block.operations.push(Self::create_cast_operation(
+                    int_out_name,
+                    out_type,
+                    Self::cast_dtype_string_for_graph_type(&tile_in_op.descriptor.data_type)?,
+                ));
+                continue;
+            }
+
             // conv2d / convTranspose2d with a runtime (non-constant) bias: MIL
             // declares conv bias const, and CoreML silently miscompiles instead of
             // rejecting (conv2d consumes the bias buffer as weights; convTranspose2d
