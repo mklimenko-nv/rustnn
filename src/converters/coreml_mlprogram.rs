@@ -7276,6 +7276,43 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            // Integer division: MIL `real_div` on integer operands has no
+            // reliable integer semantics — several CoreML compiler builds
+            // constant-fold it with float division (200/16 stays 12.5 through
+            // subsequent folded ops), corrupting e.g. packed-nibble unpack
+            // chains. Emit `floor_div`, which is integer-defined everywhere.
+            // (floor differs from ORT's truncation only for negative
+            // quotients, which no supported lowering produces.)
+            if matches!(op, Operation::Div { .. })
+                && let Some(&div_in) = op.input_operands().first()
+                && let Some(div_in_op) = graph_info.operand(div_in)
+                && !matches!(
+                    div_in_op.descriptor.data_type,
+                    DataType::Float32 | DataType::Float16
+                )
+                && let Some(out_id) = op.output_operand()
+            {
+                let (_, out_type) =
+                    Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
+                let names =
+                    Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                let mut div_in_args = HashMap::new();
+                div_in_args.insert(
+                    "x".to_string(),
+                    Self::create_name_argument(names[0].clone()),
+                );
+                div_in_args.insert(
+                    "y".to_string(),
+                    Self::create_name_argument(names[1].clone()),
+                );
+                main_block.operations.push(Self::create_mil_operation(
+                    "floor_div",
+                    div_in_args,
+                    vec![out_type],
+                ));
+                continue;
+            }
+
             // identity over a constant: CoreML's compiler elides `identity`
             // ops, and for a const input the plan builder then fails with
             // "Variable is not associated with a name" (error -5) because the
