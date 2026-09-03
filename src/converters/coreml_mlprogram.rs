@@ -3971,7 +3971,9 @@ impl CoremlMlProgramConverter {
 
                 // WebNN averagePool2d excludes padded elements from the divisor (a
                 // boundary window covering N real elements divides by N, not the kernel
-                // area). Only average pooling accepts this parameter.
+                // area). Only average pooling accepts this parameter. Do NOT
+                // switch this to false: CoreML then miscounts the divisor for
+                // asymmetric custom padding (end-side excluded, begin included).
                 if matches!(&op, Operation::AveragePool2d { .. }) {
                     inputs.insert(
                         "exclude_padding_from_average".to_string(),
@@ -4239,9 +4241,14 @@ impl CoremlMlProgramConverter {
 
                         // Determine input name for tile operation
                         let tile_input_name = if input_rank < output_rank {
-                            // A reshape was added, use the reshaped output name
-                            // The reshape output name is: {input_name}_expand_reshaped
-                            format!("{}_expand_reshaped", input_names[0])
+                            // Matches the producer site's output-derived name.
+                            format!(
+                                "{}_expand_reshaped",
+                                operand_name(
+                                    graph,
+                                    op.output_operand().unwrap_or(op.input_operands()[0])
+                                )
+                            )
                         } else {
                             // No reshape, use original input
                             input_names[0].clone()
@@ -5160,7 +5167,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     if filter_layout != expected_layout {
                         let filter_operand_id = op.input_operands()[1];
 
-                        if let Some(filter_operand) = graph_info.operand(filter_operand_id) {
+                        // Dedup: two convs sharing one filter (tied weights) must
+                        // not both define {filter}_transposed. This reuses the FIRST
+                        // consumer's permutation; sharing a filter under different
+                        // layouts would need per-consumer names.
+                        if !operand_name_overrides.contains_key(&filter_operand_id)
+                            && !deferred_transposes.contains_key(&filter_operand_id)
+                            && let Some(filter_operand) = graph_info.operand(filter_operand_id)
+                        {
                             // Calculate transpose permutation
                             let perm = match (op_type_lower.as_str(), filter_layout) {
                                 // Conv2d conversions to oihw [O, I, H, W]
@@ -5260,8 +5274,10 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 if input_layout == "nhwc" && !op.input_operands().is_empty() {
                     let input_operand_id = op.input_operands()[0];
 
-                    // Only transpose if not already transposed
+                    // Only transpose if not already transposed (deferred entries
+                    // only insert their override at flush time, so check both).
                     if !operand_name_overrides.contains_key(&input_operand_id)
+                        && !deferred_transposes.contains_key(&input_operand_id)
                         && let Some(input_operand) = graph_info.operand(input_operand_id)
                     {
                         // NHWC -> NCHW transposition: [0, 3, 1, 2]
@@ -5332,9 +5348,67 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
+        // CoreML's model compiler fuses a `pad` op that directly feeds a pool into
+        // the pool's own padding. The fused pool drops the pad's constant value
+        // and, for asymmetric padding, miscounts the average divisor (end-side
+        // padding is dropped from the denominator regardless of
+        // exclude_padding_from_average). Insert a mul-by-1.0 between the pad and
+        // the pool to defeat the fusion (a MIL identity op is itself elided by
+        // the compiler and does not help).
+        let pad_output_ids: std::collections::HashSet<u32> = graph_info
+            .operations
+            .iter()
+            .filter(|p| matches!(p, Operation::Pad { .. }))
+            .filter_map(|p| p.output_operand())
+            .collect();
+        let mut pad_unfused: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
         // Convert all operations to MIL operations
         for op in &graph_info.operations {
             let op_type_lower = op.op_type().to_lowercase();
+
+            if matches!(
+                op,
+                Operation::AveragePool2d { .. }
+                    | Operation::MaxPool2d { .. }
+                    | Operation::L2Pool2d { .. }
+            ) && let Some(&pool_in_id) = op.input_operands().first()
+                && pad_output_ids.contains(&pool_in_id)
+                && !pad_unfused.contains(&pool_in_id)
+                && let Some(pool_in_operand) = graph_info.operand(pool_in_id)
+                && matches!(
+                    pool_in_operand.descriptor.data_type,
+                    DataType::Float32 | DataType::Float16
+                )
+            {
+                let in_name =
+                    Self::output_name_for_operand(graph_info, pool_in_id, &operand_name_overrides);
+                let unfused_name = format!("{in_name}_pad_unfused");
+                let out_type = Self::create_value_with_mil_type(
+                    graph_info,
+                    pool_in_id,
+                    unfused_name.clone(),
+                    Self::mil_data_type(&pool_in_operand.descriptor.data_type)?,
+                )?;
+                let mut mul_inputs = HashMap::new();
+                mul_inputs.insert("x".to_string(), Self::create_name_argument(in_name));
+                mul_inputs.insert(
+                    "y".to_string(),
+                    if matches!(pool_in_operand.descriptor.data_type, DataType::Float16) {
+                        Self::create_immediate_float16(1.0)
+                    } else {
+                        Self::create_immediate_float(1.0)
+                    },
+                );
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_ops::MUL,
+                    mul_inputs,
+                    vec![out_type],
+                ));
+                operand_name_overrides.insert(pool_in_id, unfused_name);
+                pad_unfused.insert(pool_in_id);
+                // Fall through: the pool below consumes the un-fusable mul output.
+            }
 
             // Rank-0 (scalar) no-ops: transpose/tile/slice/expand/pad/reshape that map a
             // 0D scalar to a 0D scalar. CoreML rejects those ops on rank-0 tensors, so emit
@@ -5460,7 +5534,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             // from another comparison/logical op ("Block
                             // redefines I/O name").
                             let bool_input_name =
-                                format!("{}_bool_{}", input_names[index], output_id);
+                                format!("{}_bool_{}_{}", input_names[index], output_id, index);
                             let bool_input_type = Self::create_value_with_mil_type(
                                 graph_info,
                                 input_id,
@@ -5930,9 +6004,21 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     }
 
                     //Create reshape operation
-                    let input_name = operand_name(graph_info, op.input_operands()[0]);
-                    // Use input name to create unique intermediate name (don't rely on output_operands)
-                    let reshape_output_name = format!("{}_expand_reshaped", input_name);
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        op.input_operands()[0],
+                        &operand_name_overrides,
+                    );
+                    // Named after this expand's own output (unique per op; an
+                    // input-derived name collides when two expands share an input).
+                    // The consumer site derives the same name.
+                    let reshape_output_name = format!(
+                        "{}_expand_reshaped",
+                        operand_name(
+                            graph_info,
+                            op.output_operand().unwrap_or(op.input_operands()[0])
+                        )
+                    );
 
                     let mut reshape_inputs: HashMap<String, Argument> = HashMap::new();
                     reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
@@ -5943,8 +6029,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         ),
                     );
 
-                    // Create tensor type for reshape output
-                    let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
+                    // graph_value_mil_type: wide ints travel as int32 proxies.
+                    let dtype = Self::graph_value_mil_type(&input_operand.descriptor.data_type)?;
                     let dimensions: Vec<Dimension> = reshaped_dims
                         .iter()
                         .map(|&d| Dimension {
@@ -6287,8 +6373,20 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         }
                     })?;
                 {
-                    let input_name = operand_name(graph_info, op.input_operands()[0]);
-                    let hardsigmoid_output_name = format!("{}_hardswish_hardsigmoid", input_name);
+                    let input_name = Self::output_name_for_operand(
+                        graph_info,
+                        op.input_operands()[0],
+                        &operand_name_overrides,
+                    );
+                    // Named after this op's output: shared inputs must not collide.
+                    let hardsigmoid_output_name = format!(
+                        "{}_hardswish_hardsigmoid",
+                        Self::output_name_for_operand(
+                            graph_info,
+                            op.output_operand().unwrap_or(op.input_operands()[0]),
+                            &operand_name_overrides,
+                        )
+                    );
 
                     // Create hardsigmoid operation with alpha=1/6, beta=0.5
                     let mut hardsigmoid_inputs: HashMap<String, Argument> = HashMap::new();
@@ -7178,6 +7276,117 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            // conv2d / convTranspose2d with a runtime (non-constant) bias: MIL
+            // declares conv bias const, and CoreML silently miscompiles instead of
+            // rejecting (conv2d consumes the bias buffer as weights; convTranspose2d
+            // drops the bias). Emit the conv without bias and add it explicitly,
+            // reshaped to [1, C_out, 1, 1]. NCHW-only: NHWC convs take a dedicated
+            // transpose-wrapped path below that this pre-pass would bypass.
+            if matches!(
+                op,
+                Operation::Conv2d { .. } | Operation::ConvTranspose2d { .. }
+            ) {
+                let (conv_bias_id, layout_default) = match op {
+                    Operation::Conv2d { options, .. } => (
+                        options.as_ref().and_then(|o| o.bias),
+                        options
+                            .as_ref()
+                            .map(|o| {
+                                o.input_layout.is_empty()
+                                    || o.input_layout.eq_ignore_ascii_case("nchw")
+                            })
+                            .unwrap_or(true),
+                    ),
+                    Operation::ConvTranspose2d { options, .. } => (
+                        options.as_ref().and_then(|o| o.bias),
+                        options
+                            .as_ref()
+                            .map(|o| {
+                                o.input_layout.is_empty()
+                                    || o.input_layout.eq_ignore_ascii_case("nchw")
+                            })
+                            .unwrap_or(true),
+                    ),
+                    _ => (None, true),
+                };
+                let bias_runtime = conv_bias_id
+                    .and_then(|id| graph_info.operand(id))
+                    .map(|o| o.kind != crate::graph::OperandKind::Constant)
+                    .unwrap_or(false);
+                if bias_runtime && layout_default {
+                    let bias_id = conv_bias_id.unwrap();
+                    let out_id =
+                        op.output_operand()
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("{} has no output operand", op.op_type()),
+                            })?;
+                    let out_op =
+                        graph_info
+                            .operand(out_id)
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("output operand {out_id} not found"),
+                            })?;
+                    let out_rank = out_op.descriptor.shape.len();
+                    let mil_dtype = Self::graph_value_mil_type(&out_op.descriptor.data_type)?;
+                    let (out_name, out_type) =
+                        Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
+
+                    let bias_name =
+                        Self::output_name_for_operand(graph_info, bias_id, &operand_name_overrides);
+                    let c_out = graph_info
+                        .operand(bias_id)
+                        .map(|o| o.descriptor.static_or_max_shape())
+                        .and_then(|sh| sh.first().copied())
+                        .unwrap_or(1);
+                    let mut bias_shape = vec![1u32; out_rank.max(1)];
+                    let c_idx = if out_rank >= 2 { 1 } else { 0 };
+                    bias_shape[c_idx] = c_out;
+
+                    let mut stripped = op.clone();
+                    match &mut stripped {
+                        Operation::Conv2d { options, .. } => {
+                            if let Some(o) = options {
+                                o.bias = None;
+                            }
+                        }
+                        Operation::ConvTranspose2d { options, .. } => {
+                            if let Some(o) = options {
+                                o.bias = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                    let nobias_name = format!("{out_name}_nobias_{out_id}");
+                    let mut nobias_overrides = operand_name_overrides.clone();
+                    nobias_overrides.insert(out_id, nobias_name.clone());
+                    let mil = self.convert_operation_with_overrides(
+                        graph_info,
+                        &stripped,
+                        &nobias_overrides,
+                    )?;
+                    main_block.operations.push(mil);
+
+                    let bias_bcast = Self::rnn_reshape(
+                        &mut main_block,
+                        &bias_name,
+                        &bias_shape,
+                        format!("{out_name}_bias_bcast_{out_id}"),
+                        mil_dtype,
+                    );
+                    let mut add_in = HashMap::new();
+                    add_in.insert("x".to_string(), Self::create_name_argument(nobias_name));
+                    add_in.insert("y".to_string(), Self::create_name_argument(bias_bcast));
+                    main_block.operations.push(Self::create_mil_operation(
+                        "add",
+                        add_in,
+                        vec![out_type],
+                    ));
+                    continue;
+                }
+            }
+
             // `where` (MIL: select) — CoreML requires the condition to be bool,
             // but WebNN encodes booleans as uint8. Insert a cast when needed.
             if op_type_lower == "where" {
@@ -7608,13 +7817,26 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 if let Some(&input_id) = op.input_operands().first() {
                     if let Some(input_op) = graph_info.operand(input_id) {
                         let input_rank = input_op.descriptor.shape.len();
-                        let mean_is_nonconstant_for_rank_check = op
-                            .input_operands()
-                            .get(1)
-                            .and_then(|&mid| graph_info.operand(mid))
-                            .map(|o| o.kind != crate::graph::OperandKind::Constant)
-                            .unwrap_or(false);
-                        if input_rank < 3 && !mean_is_nonconstant_for_rank_check {
+                        // Runtime params route to the decomposition below; this
+                        // path's native batch_norm requires them all const.
+                        let nonconst_param = |id: Option<u32>| {
+                            id.and_then(|pid| graph_info.operand(pid))
+                                .map(|o| o.kind != crate::graph::OperandKind::Constant)
+                                .unwrap_or(false)
+                        };
+                        let (bn_scale_id, bn_bias_id) = match op {
+                            Operation::BatchNormalization { options, .. } => (
+                                options.as_ref().and_then(|o| o.scale),
+                                options.as_ref().and_then(|o| o.bias),
+                            ),
+                            _ => (None, None),
+                        };
+                        let any_param_nonconstant =
+                            nonconst_param(op.input_operands().get(1).copied())
+                                || nonconst_param(op.input_operands().get(2).copied())
+                                || nonconst_param(bn_scale_id)
+                                || nonconst_param(bn_bias_id);
+                        if input_rank < 3 && !any_param_nonconstant {
                             let axis = match op {
                                 Operation::BatchNormalization { options, .. } => {
                                     options.as_ref().map(|o| o.axis as usize).unwrap_or(1)
@@ -8133,18 +8355,25 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     let epsilon = options.as_ref().map(|o| o.epsilon as f32).unwrap_or(1e-5);
                     let axis = options.as_ref().map(|o| o.axis as usize).unwrap_or(1);
 
-                    let mean_is_nonconstant = mean_id
-                        .and_then(|id| graph_info.operand(id))
-                        .map(|o| o.kind != crate::graph::OperandKind::Constant)
-                        .unwrap_or(false);
+                    let is_runtime_param = |id: Option<u32>| {
+                        id.and_then(|id| graph_info.operand(id))
+                            .map(|o| o.kind != crate::graph::OperandKind::Constant)
+                            .unwrap_or(false)
+                    };
+                    let mean_is_nonconstant = is_runtime_param(mean_id);
 
                     let input_id = op.input_operands().first().copied();
                     let input_operand = input_id.and_then(|id| graph_info.operand(id));
                     let input_rank = input_operand.map(|o| o.descriptor.shape.len()).unwrap_or(0);
 
-                    // Use decomposition when mean is non-constant or axis is non-standard (not 1).
-                    // For axis==1 with constant mean, the native batch_norm path (fallthrough) works.
-                    let use_decomposition = mean_is_nonconstant || (axis != 1 && input_rank >= 2);
+                    // Decompose when any of mean/variance/gamma/beta is a runtime
+                    // value (native batch_norm requires them all const) or when
+                    // axis is non-standard (not 1).
+                    let use_decomposition = mean_is_nonconstant
+                        || is_runtime_param(variance_id)
+                        || is_runtime_param(scale_id)
+                        || is_runtime_param(bias_id)
+                        || (axis != 1 && input_rank >= 2);
 
                     if use_decomposition {
                         if let (Some(input_id), Some(mean_id_v), Some(variance_id_v)) =
@@ -8186,35 +8415,47 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             let dtype = Self::mil_data_type(&inp_op.descriptor.data_type)?;
                             let is_f16 = inp_op.descriptor.data_type == DataType::Float16;
 
-                            // When axis is not the last dimension, reshape mean/variance for
-                            // correct broadcasting: [C] → [1, C, 1, 1, ...] with 1s elsewhere.
+                            // When axis is not the last dimension, [C]-shaped params
+                            // (mean/variance/gamma/beta) need an explicit reshape to
+                            // [1,..,C,..,1] — MIL broadcasting aligns trailing dims.
+                            let bcast: Option<(Vec<u32>, Vec<Dimension>)> =
+                                if axis != input_rank.saturating_sub(1) && input_rank > 1 {
+                                    let c_size = inp_op
+                                        .descriptor
+                                        .shape
+                                        .get(axis)
+                                        .map(|d| match d {
+                                            GraphDimension::Static(v) => *v,
+                                            GraphDimension::Dynamic(d) => d.max_size,
+                                        })
+                                        .unwrap_or(1);
+                                    let mut bcast_shape = vec![1u32; input_rank];
+                                    bcast_shape[axis] = c_size;
+                                    let bcast_dims: Vec<Dimension> = bcast_shape
+                                        .iter()
+                                        .map(|&d| Dimension {
+                                            dimension: Some(dimension::Dimension::Constant(
+                                                dimension::ConstantDimension { size: d as u64 },
+                                            )),
+                                        })
+                                        .collect();
+                                    Some((bcast_shape, bcast_dims))
+                                } else {
+                                    None
+                                };
+
+                            // Reshape mean/variance to the broadcast shape when needed.
                             // Also return the effective var shape so downstream add/sqrt types match.
-                            let (mean_for_sub, var_for_div, effective_var_shape) = if axis
-                                != input_rank.saturating_sub(1)
-                                && input_rank > 1
+                            let (mean_for_sub, var_for_div, effective_var_shape) = if let Some((
+                                bcast_shape,
+                                bcast_dims,
+                            )) = &bcast
                             {
-                                let c_size = inp_op
-                                    .descriptor
-                                    .shape
-                                    .get(axis)
-                                    .map(|d| match d {
-                                        GraphDimension::Static(v) => *v,
-                                        GraphDimension::Dynamic(d) => d.max_size,
-                                    })
-                                    .unwrap_or(1);
-                                let mut bcast_shape = vec![1u32; input_rank];
-                                bcast_shape[axis] = c_size;
+                                let bcast_shape = bcast_shape.clone();
+                                let bcast_dims = bcast_dims.clone();
                                 let effective_var_shape: Vec<GraphDimension> = bcast_shape
                                     .iter()
                                     .map(|&d| GraphDimension::Static(d))
-                                    .collect();
-                                let bcast_dims: Vec<Dimension> = bcast_shape
-                                    .iter()
-                                    .map(|&d| Dimension {
-                                        dimension: Some(dimension::Dimension::Constant(
-                                            dimension::ConstantDimension { size: d as u64 },
-                                        )),
-                                    })
                                     .collect();
 
                                 let mean_rs_name = format!("{}_bn_mean_rs", output_name);
@@ -8382,6 +8623,44 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 vec![make_intermediate(normed_name.clone())],
                             ));
 
+                            // Reshape a [C] param to `bcast` (same treatment as mean/var).
+                            let bcast_param = |src_name: String,
+                                               tag: &str,
+                                               ops: &mut Vec<MilOperation>|
+                             -> String {
+                                let Some((bcast_shape, bcast_dims)) = &bcast else {
+                                    return src_name;
+                                };
+                                let rs_name = format!("{}_bn_{}_rs", output_name, tag);
+                                let rs_type = NamedValueType {
+                                        name: rs_name.clone(),
+                                        r#type: Some(ValueType {
+                                            r#type: Some(
+                                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                                    TensorType {
+                                                        rank: input_rank as i64,
+                                                        data_type: dtype,
+                                                        dimensions: bcast_dims.clone(),
+                                                        attributes: HashMap::new(),
+                                                    },
+                                                ),
+                                            ),
+                                        }),
+                                    };
+                                let mut rs_in: HashMap<String, Argument> = HashMap::new();
+                                rs_in.insert("x".to_string(), Self::create_name_argument(src_name));
+                                rs_in.insert(
+                                    "shape".to_string(),
+                                    Self::create_immediate_int_array(bcast_shape),
+                                );
+                                ops.push(Self::create_mil_operation(
+                                    "reshape",
+                                    rs_in,
+                                    vec![rs_type],
+                                ));
+                                rs_name
+                            };
+
                             // Apply scale (gamma) and bias (beta) if present
                             let after_scale = if let Some(sc_id) = scale_id {
                                 let sc_name = Self::output_name_for_operand(
@@ -8389,6 +8668,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     sc_id,
                                     &operand_name_overrides,
                                 );
+                                let sc_name =
+                                    bcast_param(sc_name, "gamma", &mut main_block.operations);
                                 let scaled_name = format!("{}_bn_scaled", output_name);
                                 let mut mul_in: HashMap<String, Argument> = HashMap::new();
                                 mul_in.insert(
@@ -8412,6 +8693,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     bi_id,
                                     &operand_name_overrides,
                                 );
+                                let bi_name =
+                                    bcast_param(bi_name, "beta", &mut main_block.operations);
                                 let biased_name = output_name.clone();
                                 let mut add_in: HashMap<String, Argument> = HashMap::new();
                                 add_in.insert(
@@ -8971,7 +9254,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         input_id,
                         &operand_name_overrides,
                     );
-                    let reshaped_input_name = format!("{}_reduce1d", input_name);
+                    // Output-id suffix: two reduces sharing one 0-D operand must not collide.
+                    let reshaped_input_name = format!(
+                        "{}_reduce1d_{}",
+                        input_name,
+                        op.output_operand().unwrap_or(input_id)
+                    );
                     let mil_dtype = Self::mil_data_type(&input_dtype)?;
 
                     // Build the [1] dimension for the reshaped input

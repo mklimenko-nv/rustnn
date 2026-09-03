@@ -87,8 +87,9 @@ pub unsafe extern "C" fn rustnn_coreml_predict(
 }
 
 /// Releases an owned (+1) Objective-C object when dropped (including on early
-/// `return`/`?`), balancing the retain transferred to us by the shim's
-/// `__bridge_retained` cast.
+/// `return`/`?`), balancing any +1 ownership we hold: the retain transferred by
+/// the shim's `__bridge_retained` casts, or objects we created via
+/// `new`/`alloc`+`init`.
 struct ReleaseOnDrop(*mut Object);
 
 impl ReleaseOnDrop {
@@ -333,6 +334,7 @@ pub(crate) fn compile_model(
         let mut last_error = String::from("MLModel load failed");
         for (code, name) in candidates {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let _config_guard = ReleaseOnDrop(config);
             let () = msg_send![config, setComputeUnits: code];
             match load_model_asset(asset, config) {
                 Ok(model) => {
@@ -387,6 +389,7 @@ fn compile_model_from_url(
         let mut last_error = String::from("MLModel load failed");
         for (code, name) in candidates {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let _config_guard = ReleaseOnDrop(config);
             let () = msg_send![config, setComputeUnits: code];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
@@ -569,6 +572,7 @@ pub(crate) fn run_coreml_bytes(
                 reason: ns_error_to_string(create_error, "MLDictionaryFeatureProvider init failed"),
             });
         }
+        let _provider_guard = ReleaseOnDrop(provider);
 
         let mut output_provider: *mut Object = ptr::null_mut();
         let mut error = [0u8; 1024];
@@ -1075,13 +1079,15 @@ fn run_impl_zeroed_with_weights(
         // Try only Neural Engine + GPU (best performance on Apple Silicon)
         // Fallback to ALL if that fails
         let targets = [
-            (3i64, "CPU_AND_NE"), // Neural Engine + GPU (best for Apple Silicon)
-            (0i64, "ALL"),        // Fallback to all available compute units
+            (3i64, "CPU_AND_NE"), // CPU + Neural Engine (best for Apple Silicon)
+            (2i64, "ALL"),        // All available compute units
+            (0i64, "CPU_ONLY"),   // Guaranteed-to-load last resort
         ];
         let mut attempts = Vec::new();
 
         for (code, name) in targets {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let _config_guard = ReleaseOnDrop(config);
             let () = msg_send![config, setComputeUnits: code];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
@@ -1170,6 +1176,7 @@ fn run_impl_zeroed_with_weights(
                 });
                 continue;
             }
+            let _provider_guard = ReleaseOnDrop(provider);
 
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
@@ -1254,13 +1261,15 @@ fn run_impl_with_inputs_with_weights(
         // Try only Neural Engine + GPU (best performance on Apple Silicon)
         // Fallback to ALL if that fails
         let targets = [
-            (3i64, "CPU_AND_NE"), // Neural Engine + GPU (best for Apple Silicon)
-            (0i64, "ALL"),        // Fallback to all available compute units
+            (3i64, "CPU_AND_NE"), // CPU + Neural Engine (best for Apple Silicon)
+            (2i64, "ALL"),        // All available compute units
+            (0i64, "CPU_ONLY"),   // Guaranteed-to-load last resort
         ];
         let mut attempts = Vec::new();
 
         for (code, name) in targets {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let _config_guard = ReleaseOnDrop(config);
             let () = msg_send![config, setComputeUnits: code];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
@@ -1357,6 +1366,7 @@ fn run_impl_with_inputs_with_weights(
                 });
                 continue;
             }
+            let _provider_guard = ReleaseOnDrop(provider);
 
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
@@ -1588,7 +1598,11 @@ pub(crate) unsafe fn prepare_compiled_model_with_weights(
         if path.exists() {
             let _ = std::fs::remove_dir_all(path);
         }
-        if let Err(err) = copy_dir_recursively(&compiled_src_path, path) {
+        let copy_result = copy_dir_recursively(&compiled_src_path, path);
+        // Drop CoreML's temp .mlmodelc either way; the non-cached paths delete
+        // it via their callers.
+        let _ = std::fs::remove_dir_all(&compiled_src_path);
+        if let Err(err) = copy_result {
             return Err(GraphError::CoremlRuntimeFailed {
                 reason: format!("failed to persist compiled model: {}", err),
             });
@@ -1843,6 +1857,9 @@ unsafe fn create_multi_array(shape: &[i64], data_type: i32) -> Result<*mut Objec
             reason: unsafe { ns_error_to_string(error, "MLMultiArray init failed") },
         });
     }
+    // Hand callers a pool-backed reference; MLFeatureValue retains the array
+    // for as long as the feature dictionary needs it.
+    let array: *mut Object = msg_send![array, autorelease];
     Ok(array)
 }
 
