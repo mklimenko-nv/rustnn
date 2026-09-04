@@ -1525,11 +1525,35 @@ impl CoremlMlProgramConverter {
         Some(pad)
     }
 
+    /// Derive the per-channel axis for a single-non-unit-dim `scale_shape`
+    /// against `input_shape`. A rank-aligned scale (same rank as the input)
+    /// names its axis by the position of its non-unit dim — unambiguous even
+    /// when several input dims share the channel length (square weights);
+    /// only a rank-mismatched scale falls back to the first input dim
+    /// matching the channel count. Returns `None` unless the input dim at
+    /// the derived axis exactly equals the scale length: a single-axis
+    /// BLOCKWISE scale (length that merely divides some input dim) has no
+    /// per-channel axis.
+    fn qdq_per_channel_axis(input_shape: &[u32], scale_shape: &[u32]) -> Option<usize> {
+        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
+        if squeezed.len() != 1 {
+            return None;
+        }
+        let len = squeezed[0];
+        let axis = if scale_shape.len() == input_shape.len() {
+            scale_shape.iter().position(|&d| d != 1).unwrap_or(0)
+        } else {
+            input_shape.iter().position(|&d| d == len)?
+        };
+        (input_shape.get(axis) == Some(&len)).then_some(axis)
+    }
+
     /// Whether a quantize/dequantize with this quantized integer type and scale shape
     /// can use CoreML's native `quantize`/`dequantize`. CoreML supports only int8/uint8
-    /// quantized tensors with a scalar (per-tensor) or single-axis 1-D (per-channel)
-    /// scale; int32 tensors, block-wise scales, and multi-axis scales are not supported
-    /// and must be decomposed into elementwise arithmetic.
+    /// quantized tensors with a scalar (per-tensor) or single-axis (per-channel) scale
+    /// that exactly covers its input axis; int32 tensors, block-wise scales, and
+    /// multi-axis scales are not supported and must be decomposed into elementwise
+    /// arithmetic.
     fn qdq_native_supported(
         quant_dtype: &DataType,
         input_shape: &[u32],
@@ -1538,9 +1562,10 @@ impl CoremlMlProgramConverter {
         if !matches!(quant_dtype, DataType::Int8 | DataType::Uint8) {
             return false;
         }
-        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
-        // per-tensor (scalar), or per-channel (one non-unit dim equal to some input dim).
-        squeezed.is_empty() || (squeezed.len() == 1 && input_shape.contains(&squeezed[0]))
+        // per-tensor (scalar), or per-channel (a valid axis exactly covered by the
+        // scale — a blockwise scale that merely divides an input dim yields no axis).
+        scale_shape.iter().all(|&d| d == 1)
+            || Self::qdq_per_channel_axis(input_shape, scale_shape).is_some()
     }
 
     /// Whether a quantize/dequantize op must be lowered to elementwise arithmetic because
@@ -2212,25 +2237,16 @@ impl CoremlMlProgramConverter {
                 }
             }
         }
-        // A per-channel scale must exactly cover the derived axis: a
-        // single-axis BLOCKWISE scale (length that merely divides some input
-        // dim) can slip through qdq_native_supported's contains() check but
-        // constexpr_affine_dequantize cannot express it.
+        // A per-channel scale must exactly cover the derived axis:
+        // constexpr_affine_dequantize cannot express a single-axis BLOCKWISE
+        // scale. qdq_native_supported enforces the same rule, but re-check via
+        // the shared helper so this path never depends on that gate's internals.
         let scale_shape = scale_op.descriptor.static_or_max_shape();
         let input_shape = input_op.descriptor.static_or_max_shape();
-        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
-        if let Some(&len) = squeezed.first() {
-            if squeezed.len() != 1 {
-                return false;
-            }
-            let axis = if scale_shape.len() == input_shape.len() {
-                scale_shape.iter().position(|&d| d != 1).unwrap_or(0)
-            } else {
-                input_shape.iter().position(|&d| d == len).unwrap_or(0)
-            };
-            if input_shape.get(axis) != Some(&len) {
-                return false;
-            }
+        if scale_shape.iter().any(|&d| d != 1)
+            && Self::qdq_per_channel_axis(&input_shape, &scale_shape).is_none()
+        {
+            return false;
         }
         true
     }
@@ -2408,21 +2424,11 @@ impl CoremlMlProgramConverter {
         let scale_shape = scale_op.descriptor.static_or_max_shape();
         let input_shape = input_op.descriptor.static_or_max_shape();
         let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
-        // Per-channel: derive the axis from the scale layout; 0 for per-tensor.
-        // A rank-aligned scale (e.g. [1, N] against [K, N]) names its axis by
-        // position — unambiguous even for square weights. Only a rank-mismatched
-        // scale falls back to the first input dim matching the channel count
-        // (mirrors the native dequantize path).
-        let axis = match squeezed.first() {
-            Some(&len) if squeezed.len() == 1 && len > 1 => {
-                if scale_shape.len() == input_shape.len() {
-                    scale_shape.iter().position(|&d| d != 1).unwrap_or(0) as u32
-                } else {
-                    input_shape.iter().position(|&d| d == len).unwrap_or(0) as u32
-                }
-            }
-            _ => 0,
-        };
+        // Per-channel: derive the axis from the scale layout (rank-aligned
+        // scales name their axis by position — unambiguous even for square
+        // weights); 0 for per-tensor. constexpr_dequantize_supported already
+        // validated the axis, so None here only means per-tensor.
+        let axis = Self::qdq_per_channel_axis(&input_shape, &scale_shape).unwrap_or(0) as u32;
         let param_shape: &[u32] = if squeezed.len() == 1 && squeezed[0] > 1 {
             &squeezed
         } else {
@@ -3895,31 +3901,27 @@ impl CoremlMlProgramConverter {
                             Self::create_argument(&input_names[2]),
                         );
                     }
-                    // When scale is truly per-channel (rank-1 with >1 elements), CoreML requires
+                    // When scale is truly per-channel (one non-unit dim), CoreML requires
                     // an explicit axis. For per-tensor (scalar or single-element), omit axis.
                     // Note: single-element scales [1] are squeezed to scalar at constant emit
                     // time; emitting axis alongside a scalar scale causes a CoreML compile error.
                     // Multi-dimensional scales are squeezed to 1D at emission time (all size-1
-                    // dimensions removed). Compute the effective squeezed length here so we can
-                    // detect the per-channel case even when the WebNN descriptor says rank > 1.
+                    // dimensions removed). qdq_native_supported gated this op, so every
+                    // per-channel scale reaching here has a valid derived axis (rank-aligned
+                    // derivation disambiguates square/coincident input dims).
                     if let Some(scale_op) = graph.operand(*scale_id) {
                         let scale_shape = scale_op.descriptor.static_or_max_shape();
-                        // Effective shape after squeezing out all size-1 dims (mirrors the
-                        // constant emission pre-scan for scale_ids_to_squeeze).
-                        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
-                        let effective_rank = if squeezed.is_empty() { 0 } else { squeezed.len() };
-                        let effective_len = squeezed.first().copied().unwrap_or(scale_shape.first().copied().unwrap_or(0));
-                        let is_per_channel = effective_rank == 1 && effective_len > 1;
-                        if is_per_channel {
-                            let axis = graph.operand(*inp_id)
-                                .and_then(|inp| {
-                                    inp.descriptor.static_or_max_shape()
-                                        .iter()
-                                        .position(|&d| d == effective_len)
-                                        .map(|i| i as u32)
-                                })
-                                .unwrap_or(0);
-                            inputs.insert("axis".to_string(), Self::create_immediate_int(axis));
+                        let axis = graph.operand(*inp_id).and_then(|inp| {
+                            Self::qdq_per_channel_axis(
+                                &inp.descriptor.static_or_max_shape(),
+                                &scale_shape,
+                            )
+                        });
+                        if let Some(axis) = axis {
+                            inputs.insert(
+                                "axis".to_string(),
+                                Self::create_immediate_int(axis as u32),
+                            );
                         }
                     }
                 }
@@ -10820,6 +10822,194 @@ mod tests {
 
         assert!(main_block.operations.iter().any(|op| op.r#type == "mul"));
         assert!(main_block.operations.iter().any(|op| op.r#type == "add"));
+    }
+
+    /// Decode a converted model and return its main CoreML7 block.
+    fn decode_main_block(data: &[u8]) -> crate::protos::coreml::mil_spec::Block {
+        let model = Model::decode(data).expect("decode coreml model");
+        let program = match model.r#type.expect("model type") {
+            crate::protos::coreml::specification::model::Type::MlProgram(program) => program,
+            _ => panic!("expected MLProgram model"),
+        };
+        program
+            .functions
+            .get("main")
+            .expect("main function")
+            .block_specializations
+            .get("CoreML7")
+            .expect("CoreML7 block")
+            .clone()
+    }
+
+    /// Unpack a scalar immediate int argument (e.g. the `axis` input of a
+    /// native `dequantize` op) from a decoded MIL operation.
+    fn immediate_int_argument(arg: &Argument) -> i32 {
+        use crate::protos::coreml::mil_spec::{tensor_value, value};
+        let Some(Binding::Value(v)) = arg.arguments.first().and_then(|b| b.binding.as_ref()) else {
+            panic!("expected immediate value binding");
+        };
+        let Some(value::Value::ImmediateValue(imm)) = &v.value else {
+            panic!("expected immediate value");
+        };
+        let Some(value::immediate_value::Value::Tensor(t)) = &imm.value else {
+            panic!("expected tensor value");
+        };
+        let Some(tensor_value::Value::Ints(ints)) = &t.value else {
+            panic!("expected int tensor");
+        };
+        ints.values[0]
+    }
+
+    /// Graph: dequantizeLinear(int8 constant of `input_shape`, f32 constant
+    /// scale of `scale_shape`, no zero point) -> f32 output. Without a zero
+    /// point a per-channel scale can't use constexpr_affine_dequantize, so the
+    /// op exercises the native/decomposed dequantize paths.
+    fn create_dequantize_graph(input_shape: &[u32], scale_shape: &[u32]) -> GraphInfo {
+        let mut graph = GraphInfo {
+            input_operands: vec![],
+            output_operands: vec![2],
+            operands: vec![],
+            operations: vec![],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: true,
+        };
+        graph.operands.push(Operand {
+            name: Some("weights".to_string()),
+            kind: OperandKind::Constant,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Int8,
+                shape: s(input_shape),
+                pending_permutation: vec![],
+            },
+        });
+        let input_len = input_shape.iter().product::<u32>() as usize;
+        graph.constant_operand_ids_to_handles.insert(
+            0,
+            ConstantData {
+                data: vec![1u8; input_len],
+                label: None,
+            },
+        );
+        graph.operands.push(Operand {
+            name: Some("scale".to_string()),
+            kind: OperandKind::Constant,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: s(scale_shape),
+                pending_permutation: vec![],
+            },
+        });
+        let scale_len = scale_shape.iter().product::<u32>() as usize;
+        graph.constant_operand_ids_to_handles.insert(
+            1,
+            ConstantData {
+                data: 0.5f32.to_le_bytes().repeat(scale_len),
+                label: None,
+            },
+        );
+        graph.operands.push(Operand {
+            name: Some("output".to_string()),
+            kind: OperandKind::Output,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: s(input_shape),
+                pending_permutation: vec![],
+            },
+        });
+        graph.operations.push(op_from_operator_options(
+            "dequantizeLinear",
+            vec![0, 1],
+            Some(2),
+            vec![],
+            OperatorOptions::default(),
+        ));
+        graph
+    }
+
+    #[test]
+    fn test_qdq_per_channel_axis_rank_aligned() {
+        type C = CoremlMlProgramConverter;
+        // Square weight: both input dims match the scale length; rank
+        // alignment picks the scale's own non-unit position, not the first
+        // coincident input dim.
+        assert_eq!(C::qdq_per_channel_axis(&[4, 4], &[1, 4]), Some(1));
+        assert_eq!(C::qdq_per_channel_axis(&[4, 4], &[4, 1]), Some(0));
+        // Rank-mismatched scales fall back to the first matching input dim.
+        assert_eq!(C::qdq_per_channel_axis(&[3, 4], &[4]), Some(1));
+        // Blockwise: the scale length divides input dim 1 but coincidentally
+        // equals input dim 0 — no valid per-channel axis.
+        assert_eq!(C::qdq_per_channel_axis(&[64, 128], &[1, 64]), None);
+        // Per-tensor scales have no per-channel axis.
+        assert_eq!(C::qdq_per_channel_axis(&[4, 4], &[1, 1]), None);
+        assert_eq!(C::qdq_per_channel_axis(&[4, 4], &[]), None);
+    }
+
+    #[test]
+    fn test_qdq_native_rejects_coincident_blockwise_scale() {
+        // Input [64, 128] with rank-aligned scale [1, 64]: blockwise along
+        // axis 1 (block 2). The squeezed length 64 coincides with input dim 0,
+        // which previously passed the contains() check as "per-channel".
+        assert!(!CoremlMlProgramConverter::qdq_native_supported(
+            &DataType::Int8,
+            &[64, 128],
+            &[1, 64],
+        ));
+        // Exact per-channel and per-tensor scales stay native.
+        assert!(CoremlMlProgramConverter::qdq_native_supported(
+            &DataType::Int8,
+            &[64, 128],
+            &[1, 128],
+        ));
+        assert!(CoremlMlProgramConverter::qdq_native_supported(
+            &DataType::Int8,
+            &[64, 128],
+            &[1, 1],
+        ));
+    }
+
+    #[test]
+    fn test_dequantize_square_matrix_per_channel_axis() {
+        // Square int8 weight [4, 4] with rank-aligned scale [1, 4]: the scale
+        // names axis 1; first-match derivation would silently pick axis 0.
+        let graph = create_dequantize_graph(&[4, 4], &[1, 4]);
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("square-matrix per-channel dequantize should convert");
+        let block = decode_main_block(&converted.data);
+        let deq = block
+            .operations
+            .iter()
+            .find(|op| op.r#type == "dequantize")
+            .expect("per-channel int8 dequantize should use the native op");
+        let axis = deq
+            .inputs
+            .get("axis")
+            .expect("per-channel dequantize emits axis");
+        assert_eq!(immediate_int_argument(axis), 1);
+    }
+
+    #[test]
+    fn test_dequantize_coincident_blockwise_scale_decomposes() {
+        // Input [4, 8] with scale [1, 4]: blockwise along axis 1 (block 2)
+        // whose length coincides with input dim 0. Native dequantize can't
+        // express it; it must lower to the elementwise decomposition.
+        let graph = create_dequantize_graph(&[4, 8], &[1, 4]);
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("blockwise dequantize should convert via decomposition");
+        let block = decode_main_block(&converted.data);
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| op.r#type == "dequantize" || op.r#type == "constexpr_affine_dequantize"),
+            "coincident blockwise scale must not use native/constexpr dequantize"
+        );
+        assert!(
+            block.operations.iter().any(|op| op.r#type == "mul"),
+            "elementwise decomposition should emit mul"
+        );
     }
 
     #[cfg(not(feature = "dynamic-inputs"))]
