@@ -10,6 +10,7 @@ use std::io::Write;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use block::ConcreteBlock;
@@ -313,17 +314,26 @@ fn compute_unit_for_device(
 /// Load a CoreML model directly from protobuf bytes and retain it for repeated
 /// dispatch, falling back to CPU-only if the preferred compute units fail.
 pub(crate) fn compile_model(
-    model_bytes: &[u8],
-    weights_data: Option<&[u8]>,
+    model_bytes: Vec<u8>,
+    weights_data: Option<Vec<u8>>,
     device_type: crate::backend_selection::DeviceType,
     use_in_memory_asset: bool,
 ) -> Result<CompiledCoremlModel, GraphError> {
+    // Owned so the in-memory path can hand the buffers to NSData without
+    // copying (weight blobs reach hundreds of MB); the Arcs keep them valid
+    // for the URL fallback below even after the NSData objects are released.
+    let model_bytes = Arc::new(model_bytes);
+    let weights_data = weights_data.map(Arc::new);
     if !use_in_memory_asset {
-        return compile_model_from_url(model_bytes, weights_data, device_type);
+        return compile_model_from_url(
+            &model_bytes,
+            weights_data.as_deref().map(Vec::as_slice),
+            device_type,
+        );
     }
     let memory_result = autoreleasepool(|| unsafe {
         let (asset, specification_data, retained_weights_data) =
-            create_in_memory_model_asset(model_bytes, weights_data)?;
+            create_in_memory_model_asset(&model_bytes, weights_data.as_ref())?;
 
         let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
         let mut candidates: Vec<(i64, &'static str)> = vec![(preferred_code, preferred_name)];
@@ -360,12 +370,15 @@ pub(crate) fn compile_model(
         Err(GraphError::CoremlRuntimeFailed { reason: last_error })
     });
     memory_result.or_else(|memory_error| {
-        compile_model_from_url(model_bytes, weights_data, device_type).map_err(|url_error| {
-            GraphError::CoremlRuntimeFailed {
-                reason: format!(
-                    "in-memory model load failed ({memory_error}); URL fallback failed ({url_error})"
-                ),
-            }
+        compile_model_from_url(
+            &model_bytes,
+            weights_data.as_deref().map(Vec::as_slice),
+            device_type,
+        )
+        .map_err(|url_error| GraphError::CoremlRuntimeFailed {
+            reason: format!(
+                "in-memory model load failed ({memory_error}); URL fallback failed ({url_error})"
+            ),
         })
     })
 }
@@ -423,12 +436,41 @@ fn compile_model_from_url(
     })
 }
 
+/// Wrap an `Arc`-owned buffer in an `NSData` WITHOUT copying. The NSData's
+/// deallocator drops an `Arc` clone, so the bytes stay valid for as long as
+/// EITHER the caller's `Arc` or the `NSData` lives — however long CoreML
+/// internally retains the latter. Returns an owned (+1) object.
+unsafe fn nsdata_from_arc(buffer: &Arc<Vec<u8>>) -> Result<*mut Object, GraphError> {
+    let bytes = buffer.as_ptr() as *mut c_void;
+    let length = buffer.len();
+    let raw = Arc::into_raw(Arc::clone(buffer)) as usize;
+    // NSData calls the deallocator exactly once, when its storage is freed.
+    let deallocator = ConcreteBlock::new(move |_bytes: *mut c_void, _length: usize| {
+        drop(unsafe { Arc::from_raw(raw as *const Vec<u8>) });
+    })
+    .copy();
+    let data: *mut Object = msg_send![class!(NSData), alloc];
+    let data: *mut Object = msg_send![data,
+        initWithBytesNoCopy: bytes
+        length: length
+        deallocator: &*deallocator];
+    if data.is_null() {
+        // Never observed in practice; leak the Arc clone rather than risk a
+        // double-free if the failed init already consumed the deallocator.
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: "failed to create NSData for CoreML model bytes".to_string(),
+        });
+    }
+    Ok(data)
+}
+
 /// Create an `MLModelAsset` whose specification and optional external weight blob
-/// are entirely memory-backed. The returned Objective-C objects are retained and
-/// must remain alive for at least as long as the loaded `MLModel`.
+/// are entirely memory-backed (zero-copy views over the given buffers). The
+/// returned Objective-C objects are retained and must remain alive for at least
+/// as long as the loaded `MLModel`.
 unsafe fn create_in_memory_model_asset(
-    model_bytes: &[u8],
-    weights: Option<&[u8]>,
+    model_bytes: &Arc<Vec<u8>>,
+    weights: Option<&Arc<Vec<u8>>>,
 ) -> Result<(*mut Object, *mut Object, Option<*mut Object>), GraphError> {
     let Some(asset_class) = Class::get("MLModelAsset") else {
         return Err(GraphError::CoremlRuntimeFailed {
@@ -436,27 +478,18 @@ unsafe fn create_in_memory_model_asset(
         });
     };
 
-    let specification_data: *mut Object =
-        msg_send![class!(NSData), dataWithBytes: model_bytes.as_ptr() length: model_bytes.len()];
-    if specification_data.is_null() {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: "failed to create NSData for CoreML model specification".to_string(),
-        });
-    }
-    let _: *mut Object = msg_send![specification_data, retain];
+    let specification_data: *mut Object = unsafe { nsdata_from_arc(model_bytes)? };
 
     let mut error: *mut Object = ptr::null_mut();
     let (asset, weights_data): (*mut Object, Option<*mut Object>) = match weights {
         Some(weights) => {
-            let weights_data: *mut Object =
-                msg_send![class!(NSData), dataWithBytes: weights.as_ptr() length: weights.len()];
-            if weights_data.is_null() {
-                let _: () = msg_send![specification_data, release];
-                return Err(GraphError::CoremlRuntimeFailed {
-                    reason: "failed to create NSData for CoreML model weights".to_string(),
-                });
-            }
-            let _: *mut Object = msg_send![weights_data, retain];
+            let weights_data: *mut Object = match unsafe { nsdata_from_arc(weights) } {
+                Ok(data) => data,
+                Err(err) => {
+                    let _: () = msg_send![specification_data, release];
+                    return Err(err);
+                }
+            };
 
             // BlobFileValue stores `@model_path/weights/weights.bin`. For an
             // in-memory asset CoreML expects the path relative to `@model_path`.

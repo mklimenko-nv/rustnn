@@ -2145,6 +2145,342 @@ impl CoremlMlProgramConverter {
         Ok((interleaved_input, interleaved_scale))
     }
 
+    /// Whether a `dequantizeLinear` should be emitted as MIL's
+    /// `constexpr_affine_dequantize`: quantized data, scale and zeroPoint are
+    /// all graph constants (a compressed weight), the data is non-scalar
+    /// int8/uint8, and the scale layout is one the native op could express
+    /// (per-tensor scalar or single-axis per-channel).
+    ///
+    /// Espresso constant-folds a regular `dequantize` (or the elementwise
+    /// decomposition) over a constant into a dense float tensor at compile
+    /// time — minutes of CPU and GBs of RAM for transformer-sized weights.
+    /// The constexpr form is CoreML's weight-compression representation and
+    /// keeps the weight packed through compilation.
+    fn constexpr_dequantize_supported(graph: &GraphInfo, op: &Operation) -> bool {
+        let Operation::DequantizeLinear {
+            input,
+            scale,
+            zero_point,
+            ..
+        } = op
+        else {
+            return false;
+        };
+        // qdq_should_decompose == false already guarantees const scale/zp and
+        // a scalar or single-axis per-channel scale.
+        if Self::qdq_should_decompose(graph, op) {
+            return false;
+        }
+        let (Some(input_op), Some(scale_op)) = (graph.operand(*input), graph.operand(*scale))
+        else {
+            return false;
+        };
+        if input_op.kind != crate::graph::OperandKind::Constant {
+            return false;
+        }
+        if !matches!(
+            input_op.descriptor.data_type,
+            DataType::Int8 | DataType::Uint8
+        ) {
+            return false;
+        }
+        if input_op.descriptor.shape.is_empty() {
+            return false;
+        }
+        // constexpr_affine_dequantize requires scale and zero_point to be both
+        // scalar or both per-channel vectors; a synthesized zero point is
+        // always scalar, so a missing zeroPoint pairs only with a scalar scale.
+        match zero_point {
+            None => {
+                let per_channel = scale_op
+                    .descriptor
+                    .static_or_max_shape()
+                    .iter()
+                    .any(|&d| d != 1);
+                if per_channel {
+                    return false;
+                }
+            }
+            Some(zp) => {
+                // The blob payload was written with the zero point's own dtype;
+                // a dtype-coerced zero point (e.g. int32) would mismatch it.
+                let Some(zp_op) = graph.operand(*zp) else {
+                    return false;
+                };
+                if zp_op.descriptor.data_type != input_op.descriptor.data_type {
+                    return false;
+                }
+            }
+        }
+        // A per-channel scale must exactly cover the derived axis: a
+        // single-axis BLOCKWISE scale (length that merely divides some input
+        // dim) can slip through qdq_native_supported's contains() check but
+        // constexpr_affine_dequantize cannot express it.
+        let scale_shape = scale_op.descriptor.static_or_max_shape();
+        let input_shape = input_op.descriptor.static_or_max_shape();
+        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
+        if let Some(&len) = squeezed.first() {
+            if squeezed.len() != 1 {
+                return false;
+            }
+            let axis = if scale_shape.len() == input_shape.len() {
+                scale_shape.iter().position(|&d| d != 1).unwrap_or(0)
+            } else {
+                input_shape.iter().position(|&d| d == len).unwrap_or(0)
+            };
+            if input_shape.get(axis) != Some(&len) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A compile-time `Value` for one `constexpr_affine_dequantize` parameter:
+    /// a `BlobFileValue` when the constant's payload is already in the weight
+    /// file (all non-scalar weight dtypes are), otherwise an immediate tensor
+    /// built from the graph's constant bytes.
+    fn constexpr_param_value(
+        graph: &GraphInfo,
+        weight_builder: &super::WeightFileBuilder,
+        operand_id: u32,
+        dims: &[u32],
+    ) -> Result<crate::protos::coreml::mil_spec::Value, GraphError> {
+        use crate::protos::coreml::mil_spec::{
+            Dimension, TensorType, TensorValue, Value, ValueType, dimension, tensor_value, value,
+            value_type,
+        };
+
+        let operand = graph
+            .operand(operand_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("constexpr operand {} not found", operand_id),
+            })?;
+        let mil_type = Self::mil_data_type(&operand.descriptor.data_type)?;
+        let dimensions: Vec<Dimension> = dims
+            .iter()
+            .map(|&d| Dimension {
+                dimension: Some(dimension::Dimension::Constant(
+                    dimension::ConstantDimension { size: d as u64 },
+                )),
+            })
+            .collect();
+        let value_type = ValueType {
+            r#type: Some(value_type::Type::TensorType(TensorType {
+                rank: dimensions.len() as i64,
+                data_type: mil_type,
+                dimensions,
+                attributes: HashMap::new(),
+            })),
+        };
+
+        let inner = if let Some(offset) = weight_builder.get_offset(operand_id) {
+            value::Value::BlobFileValue(value::BlobFileValue {
+                file_name: "@model_path/weights/weights.bin".to_string(),
+                offset,
+            })
+        } else {
+            let constant = graph
+                .constant_operand_ids_to_handles
+                .get(&operand_id)
+                .ok_or_else(|| GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!("constexpr operand {} has no constant data", operand_id),
+                })?;
+            let tensor_value = match operand.descriptor.data_type {
+                DataType::Float32 => TensorValue {
+                    value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
+                        values: constant
+                            .data
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect(),
+                    })),
+                },
+                DataType::Float16 | DataType::Int8 | DataType::Uint8 => TensorValue {
+                    value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
+                        values: constant.data.clone().into(),
+                    })),
+                },
+                other => {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".to_string(),
+                        reason: format!("unsupported constexpr parameter dtype {other:?}"),
+                    });
+                }
+            };
+            value::Value::ImmediateValue(value::ImmediateValue {
+                value: Some(value::immediate_value::Value::Tensor(tensor_value)),
+            })
+        };
+        Ok(Value {
+            doc_string: String::new(),
+            r#type: Some(value_type),
+            value: Some(inner),
+        })
+    }
+
+    /// Immediate rank-0 zero of the given quantized dtype (int8/uint8), the
+    /// synthesized `zero_point` for `constexpr_affine_dequantize`.
+    fn constexpr_zero_value(
+        data_type: &DataType,
+    ) -> Result<crate::protos::coreml::mil_spec::Value, GraphError> {
+        use crate::protos::coreml::mil_spec::{
+            TensorType, TensorValue, Value, ValueType, tensor_value, value, value_type,
+        };
+
+        let mil_type = match data_type {
+            DataType::Int8 | DataType::Uint8 => Self::mil_data_type(data_type)?,
+            other => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!("no quantized zero-point immediate for {other:?}"),
+                });
+            }
+        };
+        Ok(Value {
+            doc_string: String::new(),
+            r#type: Some(ValueType {
+                r#type: Some(value_type::Type::TensorType(TensorType {
+                    data_type: mil_type,
+                    rank: 0,
+                    dimensions: vec![],
+                    attributes: HashMap::new(),
+                })),
+            }),
+            value: Some(value::Value::ImmediateValue(value::ImmediateValue {
+                value: Some(value::immediate_value::Value::Tensor(TensorValue {
+                    value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
+                        values: vec![0u8].into(),
+                    })),
+                })),
+            })),
+        })
+    }
+
+    /// Emit `constexpr_affine_dequantize` (dequantized = scale * (data - zp))
+    /// for a dequantizeLinear over constant weights. CoreML requires constexpr
+    /// parameters as compile-time value ATTRIBUTES (immediate or blob-file),
+    /// not name-bound inputs; large payloads reuse the blob offsets the const
+    /// emission pass already wrote.
+    fn emit_constexpr_affine_dequantize(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        weight_builder: &super::WeightFileBuilder,
+        main_block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let Operation::DequantizeLinear {
+            input,
+            scale,
+            zero_point,
+            ..
+        } = op
+        else {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "emit_constexpr_affine_dequantize called on non-dequantize op".to_string(),
+            });
+        };
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "dequantizeLinear has no output operand".to_string(),
+            })?;
+        let (_output_name, output_type) = Self::create_output_value(graph, output_id, overrides)?;
+
+        let input_op = graph
+            .operand(*input)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("dequantize input operand {} not found", input),
+            })?;
+        let scale_op = graph
+            .operand(*scale)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("dequantize scale operand {} not found", scale),
+            })?;
+
+        // The constant pre-scan squeezes scale/zeroPoint const ops; use the
+        // same squeezed layout here (scalar, or 1-D of the channel length).
+        let scale_shape = scale_op.descriptor.static_or_max_shape();
+        let input_shape = input_op.descriptor.static_or_max_shape();
+        let squeezed: Vec<u32> = scale_shape.iter().copied().filter(|&d| d != 1).collect();
+        // Per-channel: derive the axis from the scale layout; 0 for per-tensor.
+        // A rank-aligned scale (e.g. [1, N] against [K, N]) names its axis by
+        // position — unambiguous even for square weights. Only a rank-mismatched
+        // scale falls back to the first input dim matching the channel count
+        // (mirrors the native dequantize path).
+        let axis = match squeezed.first() {
+            Some(&len) if squeezed.len() == 1 && len > 1 => {
+                if scale_shape.len() == input_shape.len() {
+                    scale_shape.iter().position(|&d| d != 1).unwrap_or(0) as u32
+                } else {
+                    input_shape.iter().position(|&d| d == len).unwrap_or(0) as u32
+                }
+            }
+            _ => 0,
+        };
+        let param_shape: &[u32] = if squeezed.len() == 1 && squeezed[0] > 1 {
+            &squeezed
+        } else {
+            &[]
+        };
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "quantized_data".to_string(),
+            Self::constexpr_param_value(graph, weight_builder, *input, &input_shape)?,
+        );
+        attributes.insert(
+            "scale".to_string(),
+            Self::constexpr_param_value(graph, weight_builder, *scale, param_shape)?,
+        );
+        let zp_value = match zero_point {
+            Some(zp) => Self::constexpr_param_value(graph, weight_builder, *zp, param_shape)?,
+            None => Self::constexpr_zero_value(&input_op.descriptor.data_type)?,
+        };
+        attributes.insert("zero_point".to_string(), zp_value);
+        attributes.insert("axis".to_string(), Self::constexpr_axis_value(axis));
+
+        main_block.operations.push(MilOperation {
+            r#type: "constexpr_affine_dequantize".to_string(),
+            inputs: HashMap::new(),
+            outputs: vec![output_type],
+            attributes,
+            ..Default::default()
+        });
+        Ok(())
+    }
+
+    /// Immediate int32 scalar `Value` (attribute form of `create_immediate_int`).
+    fn constexpr_axis_value(axis: u32) -> crate::protos::coreml::mil_spec::Value {
+        use crate::protos::coreml::mil_spec::{
+            DataType as MilDataType, TensorType, TensorValue, Value, ValueType, tensor_value,
+            value, value_type,
+        };
+        Value {
+            doc_string: String::new(),
+            r#type: Some(ValueType {
+                r#type: Some(value_type::Type::TensorType(TensorType {
+                    data_type: MilDataType::Int32 as i32,
+                    rank: 0,
+                    dimensions: vec![],
+                    attributes: HashMap::new(),
+                })),
+            }),
+            value: Some(value::Value::ImmediateValue(value::ImmediateValue {
+                value: Some(value::immediate_value::Value::Tensor(TensorValue {
+                    value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
+                        values: vec![axis as i32],
+                    })),
+                })),
+            })),
+        }
+    }
+
     /// Lower `dequantizeLinear` as `(input - zeroPoint) * scale` in elementwise form.
     ///
     /// Handles quantized types and scale shapes CoreML's native `dequantize` cannot:
@@ -7852,6 +8188,30 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 continue;
             }
 
+            // dequantize over constant weights becomes constexpr_affine_dequantize:
+            // Espresso keeps the packed representation through compilation instead of
+            // constant-folding into a dense float tensor.
+            if op_type_lower == "dequantizelinear"
+                && Self::constexpr_dequantize_supported(graph_info, op)
+            {
+                Self::emit_constexpr_affine_dequantize(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &weight_builder,
+                    &mut main_block,
+                )?;
+                // A dequantized conv filter carries a deferred layout transpose
+                // keyed on this output; flush it like every other emission path.
+                if let Some(output_id) = op.output_operand()
+                    && let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
+                continue;
+            }
             // quantize/dequantize that CoreML's native op can't express (int32 tensors,
             // block-wise or multi-axis scales) is lowered to elementwise arithmetic.
             // int4/uint4 tensors can't be materialized at all, so leave those to the native
@@ -7863,6 +8223,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     &operand_name_overrides,
                     &mut main_block,
                 )?;
+                if let Some(output_id) = op.output_operand()
+                    && let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
                 continue;
             }
             if op_type_lower == "quantizelinear" && Self::qdq_should_decompose(graph_info, op) {

@@ -69,8 +69,8 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
             .convert(&graph_info)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         let model = compile_model(
-            &converted.data,
-            converted.weights_data.as_deref(),
+            converted.data,
+            converted.weights_data,
             self.device_type,
             supports_in_memory_asset(&graph_info),
         )
