@@ -560,6 +560,47 @@ impl CoremlMlProgramConverter {
         let output_type =
             Self::create_named_value_type(name, dtype, &operand.descriptor.shape, false);
 
+        // Non-scalar weight-carrying constants go into the blob weight file
+        // (BlobFileValue), never as immediate proto values: CoreML's on-device
+        // compiler re-serializes immediate constants through its textual MIL
+        // writer (MIL::Text::BasicSerializer), which takes minutes and
+        // gigabytes for large weights. Mirrors Chromium's
+        // graph_builder_coreml.cc, which blob-writes all non-scalar weights.
+        let blob_type = match operand.descriptor.data_type {
+            crate::graph::DataType::Float16 => {
+                Some(super::weight_file_builder::blob_data_type::FLOAT16)
+            }
+            crate::graph::DataType::Float32 => {
+                Some(super::weight_file_builder::blob_data_type::FLOAT32)
+            }
+            crate::graph::DataType::Uint8 => {
+                Some(super::weight_file_builder::blob_data_type::UINT8)
+            }
+            crate::graph::DataType::Int8 => Some(super::weight_file_builder::blob_data_type::INT8),
+            _ => None,
+        };
+        if let Some(mil_data_type) = blob_type.filter(|_| !operand.descriptor.shape.is_empty()) {
+            let offset =
+                weight_builder.add_weight(operand_id, mil_data_type, &constant_data.data)?;
+            let blob_file_value = Value {
+                doc_string: String::new(),
+                r#type: output_type.r#type.clone(),
+                value: Some(value::Value::BlobFileValue(value::BlobFileValue {
+                    file_name: "@model_path/weights/weights.bin".to_string(),
+                    offset,
+                })),
+            };
+            let mut attributes = HashMap::new();
+            attributes.insert("val".to_string(), blob_file_value);
+            return Ok(MilOperation {
+                r#type: "const".to_string(),
+                inputs: HashMap::new(),
+                outputs: vec![output_type],
+                attributes,
+                ..Default::default()
+            });
+        }
+
         // Create tensor value from constant data
         let tensor_value = match operand.descriptor.data_type {
             crate::graph::DataType::Float32 => {
@@ -600,57 +641,13 @@ impl CoremlMlProgramConverter {
                     })),
                 }
             }
-            crate::graph::DataType::Float16 => {
-                // CoreML MLProgram (MIL) requires non-scalar Float16 constants to be stored
-                // in a separate weight file with BlobFileValue references, not as immediate values.
-                // Only scalar (0D) Float16 can be stored as immediate bytes.
-                //
-                // Chromium's implementation uses WeightsFileHandle::Write() which:
-                // - For scalars (empty shape): stores as immediate value
-                // - For non-scalars: writes to weights.bin with 64-byte alignment
-                //
-                // Reference: chromium/src/services/webnn/coreml/graph_builder_coreml.cc
-
-                let is_scalar = operand.descriptor.shape.is_empty();
-
-                if !is_scalar {
-                    // Non-scalar Float16: add to weight file and return BlobFileValue
-                    let offset = weight_builder.add_weight(
-                        operand_id,
-                        super::weight_file_builder::blob_data_type::FLOAT16,
-                        &constant_data.data,
-                    )?;
-
-                    // Create BlobFileValue reference
-                    let blob_file_value = Value {
-                        doc_string: String::new(),
-                        r#type: output_type.r#type.clone(),
-                        value: Some(value::Value::BlobFileValue(value::BlobFileValue {
-                            file_name: "@model_path/weights/weights.bin".to_string(),
-                            offset,
-                        })),
-                    };
-
-                    // Create const operation with BlobFileValue
-                    let mut attributes = HashMap::new();
-                    attributes.insert("val".to_string(), blob_file_value);
-
-                    return Ok(MilOperation {
-                        r#type: "const".to_string(),
-                        inputs: HashMap::new(),
-                        outputs: vec![output_type],
-                        attributes,
-                        ..Default::default()
-                    });
-                }
-
-                // Scalar Float16: store as immediate bytes
-                TensorValue {
-                    value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
-                        values: constant_data.data.clone().into(),
-                    })),
-                }
-            }
+            // Non-scalar Float16 went to the weight file above; only scalar
+            // (0D) Float16 can be stored as immediate bytes.
+            crate::graph::DataType::Float16 => TensorValue {
+                value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
+                    values: constant_data.data.clone().into(),
+                })),
+            },
             crate::graph::DataType::Int8 | crate::graph::DataType::Uint8 => TensorValue {
                 value: Some(tensor_value::Value::Bytes(tensor_value::RepeatedBytes {
                     values: constant_data.data.clone().into(),
@@ -4821,6 +4818,17 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
         // Create weight file builder for Float16 constants
         let mut weight_builder = super::WeightFileBuilder::new();
+        // Upper bound: every constant blob-written, plus a 64-byte metadata
+        // block and up-to-64-byte alignment padding each. Reserved capacity is
+        // virtual until written, so overshooting for immediate-value constants
+        // costs nothing.
+        weight_builder.reserve(
+            graph_info
+                .constant_operand_ids_to_handles
+                .values()
+                .map(|c| c.data.len() + 128)
+                .sum(),
+        );
 
         // Create MLProgram
         let mut program = Program {
@@ -10114,8 +10122,10 @@ mod tests {
     }
 
     #[test]
-    fn test_float32_constant_no_weight_file() {
-        // Create a graph with Float32 constant (should NOT use weight file)
+    fn test_float32_constant_uses_weight_file() {
+        // Non-scalar Float32 constants go to the weight file like Float16:
+        // immediate values are re-serialized through CoreML's textual MIL
+        // writer at compile time, which is pathological for large weights.
         let mut graph = GraphInfo {
             input_operands: vec![],
             output_operands: vec![1],
@@ -10165,11 +10175,17 @@ mod tests {
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph).unwrap();
 
-        // Verify NO weights_data (Float32 uses immediate values)
-        assert!(
-            result.weights_data.is_none(),
-            "Float32 constants should not use weight file"
+        // Non-scalar Float32 lands in the weight file with FLOAT32 metadata.
+        let weights = result
+            .weights_data
+            .expect("non-scalar Float32 constants should use the weight file");
+        assert_eq!(
+            &weights[68..72],
+            &2u32.to_le_bytes(),
+            "BlobDataType::FLOAT32"
         );
+        assert_eq!(&weights[72..80], &4u64.to_le_bytes(), "size_in_bytes = 4");
+        assert_eq!(&weights[128..132], &1.0f32.to_le_bytes(), "payload data");
     }
 
     #[test]
