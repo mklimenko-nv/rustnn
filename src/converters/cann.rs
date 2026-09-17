@@ -1918,6 +1918,7 @@ pub(crate) fn encode_via_adapter(_graph: &GraphInfo) -> Result<Vec<u8>, GraphErr
     })
 }
 
+/// Converts a graph to a CANN offline model through the `hiai-rs` adapter.
 pub struct CannConverter;
 
 impl GraphConverter for CannConverter {
