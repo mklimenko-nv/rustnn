@@ -22,7 +22,7 @@ Unavailable backends are skipped at startup with a log message.
 # Fetch WPT corpus (optional — first run auto-fetches if missing)
 make fetch-wpt
 
-# Full suite on ONNX CPU (~2482 cases, ~15–25 s)
+# Full suite on ONNX CPU (well under a minute in a release build)
 make test-wpt
 
 # Filter by operation name
@@ -152,7 +152,7 @@ python scripts/analyze_wpt_audit.py reports/wpt-trtx-audit.json
 At the end of the run:
 
 ```
-[WPT audit] 2482 passed, 143 flagged -> reports/wpt-trtx-audit.json
+[WPT audit] <passed> passed, <flagged> flagged -> reports/wpt-trtx-audit.json
 ```
 
 ### Audit JSON fields
@@ -245,4 +245,4 @@ A scheduled workflow (`.github/workflows/snapshot-sync.yml`) runs these and open
 
 **Parse warnings (`file_errors`)** — Some WPT files may fail to parse; warnings are logged but do not fail the run.
 
-**Slow TRTX runs** — TensorRT engine compilation per trial makes debug builds slow (~25–30 min for 2482 cases). Use `make test-wpt-op OP=<op>` to iterate on a single operation.
+**Slow TRTX runs** — TensorRT engine compilation per trial makes a full debug-build run take tens of minutes. Use `make test-wpt-op OP=<op>` to iterate on a single operation.
