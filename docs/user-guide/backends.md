@@ -88,7 +88,7 @@ Per-backend data type restrictions and the cases that still fail are tracked in
 | TensorRT-RTX | `make test-wpt-trtx` (PASS snapshots, GPU required) | `cargo test --test test_trtx_execution --features trtx-runtime` | compile check only, no GPU runner |
 | CoreML | `make test-wpt-coreml` (expected-failure list) | unit tests with `--features coreml-runtime` | yes (macOS) |
 | LiteRT | `make test-wpt-litert` (PASS snapshots and expected-failure list) | `cargo test --test test_litert_execution --features litert-runtime` | yes (Linux, non-blocking) |
-| CANN | not run | `make cann-device-test` on an OpenHarmony device; `cargo test --lib --features cann-runtime-mock` | mock build and tests |
+| CANN | `make test-wpt-cann` (expected-failure list; cross-compiled, runs on the device over `hdc`) | `make cann-device-test` on an OpenHarmony device; `cargo test --lib --features cann-runtime-mock` | mock build and tests |
 
 The [WPT Conformance Guide](../testing/wpt-test-guide.md) explains filtering by operation and
 regenerating snapshots after a converter change.

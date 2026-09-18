@@ -82,6 +82,7 @@
 //! | `litert-runtime` | LiteRT (TensorFlow Lite) backend through `litert-sys`; needs `flatc` at build time |
 //! | `cann-runtime` | Huawei CANN/HiAI backend on OpenHarmony; `cann-runtime-mock` validates without a device |
 //! | `webnn-runtime` | Browser WebNN backend for `wasm32-unknown-unknown` (`webnn-wpt-tests` embeds the WPT corpus) |
+//! | `wpt-embed-corpus` | Embed the WPT conformance corpus into the test binary at build time, for targets without Node.js such as the on-device CANN run (`make test-wpt-cann`) |
 //! | `dynamic-inputs` | Accept [`graph::Dimension::Dynamic`] shapes bounded by `max_size` |
 //! | `zstd-cache-compression` | Compress the on-disk engine caches (enabled by `trtx-runtime`) |
 //! | `native-examples` | Build the larger examples (`fast_style_transfer_builder_api`, `smollm_mlcontext`) |

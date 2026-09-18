@@ -13,6 +13,7 @@ The in-repo WPT harness runs upstream [WebNN conformance tests](https://github.c
 - **TensorRT-RTX** (optional) for the `trtx` backend: `trtx-runtime` feature and an NVIDIA GPU
 - **LiteRT** (optional) for the `litert` backend: `litert-runtime` feature and `flatc` at build time; `make test-wpt-litert` sets the library path
 - **CoreML** (optional, macOS) for the `coreml` backend: `coreml-runtime` feature
+- **CANN** (optional) for the `cann` backend: the OpenHarmony SDK, the CANN DDK and a device reachable over `hdc`; the corpus is embedded into the cross-compiled binary with the `wpt-embed-corpus` feature
 
 Unavailable backends are skipped at startup with a log message.
 
@@ -77,9 +78,10 @@ trtx::clamp::clamp_uint64_1D_tensor_with_bigint_max
 | `make test-wpt-trtx` | Full suite, TensorRT backend |
 | `make test-wpt-litert` | Full suite, LiteRT backend |
 | `make test-wpt-coreml` | Full suite, CoreML backend (macOS); `make test-wpt-coreml-report` also writes the JSON report |
+| `make test-wpt-cann` | Full suite on the CANN/HiAI NPU (cross-compiled for OpenHarmony, run over `hdc`); see [On-device (CANN/HiAI)](#on-device-cannhiai) |
 | `make test-wpt-op OP=<name>` | Filter trials by operation (e.g. `OP=add`, `OP=dequantize`); `WPT_BACKEND=<backend>` selects the backend |
 | `make test-wpt-report` | Full run with JSON/HTML reports even on failures; `WPT_BACKEND=onnx|trtx|litert|coreml` picks the backend |
-| `make wpt-sync-onnx`, `wpt-sync-litert`, `wpt-sync-coreml`, `wpt-sync-trtx` | Regenerate PASS snapshots and expected-failure lists against the pinned corpus |
+| `make wpt-sync-onnx`, `wpt-sync-litert`, `wpt-sync-coreml`, `wpt-sync-trtx`, `wpt-sync-cann` | Regenerate PASS snapshots and expected-failure lists against the pinned corpus |
 
 Equivalent `cargo` invocations:
 
@@ -105,17 +107,38 @@ Set `WPT_BACKEND` to limit which backends register trials:
 | `trtx` | TensorRT-RTX | `MLPowerPreference::HighPerformance`, `accelerated=true`; requires the `trtx-runtime` feature |
 | `litert` | LiteRT | requires the `litert-runtime` feature |
 | `coreml` | CoreML | macOS, requires the `coreml-runtime` feature |
+| `cann` | CANN/HiAI NPU | `MLPowerPreference::Default`, `accelerated=true`; requires the `cann-runtime` feature and runs on the device only |
 
 Aliases: `ort`, `cpu`, `onnx-cpu`, `ort-cpu` (onnx); `tensorrt`, `trt` (trtx); `tflite` (litert); `core-ml`, `mlprogram` (coreml).
 
 When `WPT_BACKEND` is unset, all **available** backends register trials. Unavailable backends (e.g. TRTX without a GPU) are skipped with a log message — they do not count as skips in the summary.
+
+## On-device (CANN/HiAI)
+
+The CANN backend runs on a Huawei Ascend NPU. The corpus is embedded into the
+cross-compiled test binary at build time and shipped with the binary.
+
+```bash
+export OHOS_SDK_NATIVE=/path/to/OpenHarmony/<version>/sdk/native
+export CANN_DDK=/path/to/CANN-Kit-next/ddk/
+make test-wpt-cann
+```
+
+`make test-wpt-cann`:
+
+1. cross-compiles `run_wpt_conformance` for `aarch64-unknown-linux-ohos`
+   (`--features cann-runtime,wpt-embed-corpus`),
+2. pushes the test binary and the `libhiai*.so` DDK libraries to
+   `/data/local/tmp/cann-wpt`,
+3. runs the trials single-threaded with `WPT_BACKEND=cann`, and
+4. retrieves the JSON report to `reports/wpt-cann-conformance.json`.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WPT_DIR` | `.cache/wpt` | Path to WPT checkout |
-| `WPT_BACKEND` | (all available) | Limit backend: `onnx`, `trtx`, `litert` or `coreml` |
+| `WPT_BACKEND` | (all available) | Limit backend: `onnx`, `trtx`, `litert`, `coreml` or `cann` |
 | `WPT_REPORT_JSON` | (none; `reports/wpt-conformance.json` when `CI` is set) | Write structured pass/fail JSON report |
 | `WPT_REPORT_HTML` | (derived from JSON path) | HTML report path; set to empty string to disable |
 | `WPT_AUDIT` | (off) | Enable per-pass error metrics collection (see [Audit mode](#audit-mode)) |
@@ -229,6 +252,7 @@ make wpt-sync-onnx     # ONNX PASS snapshots
 make wpt-sync-litert   # LiteRT PASS snapshots + expected-failures
 make wpt-sync-coreml   # macOS: coreml expected-failures
 make wpt-sync-trtx     # TensorRT PASS snapshots (requires a GPU)
+make wpt-sync-cann     # CANN expected-failures (requires a device)
 ```
 
 A scheduled workflow (`.github/workflows/snapshot-sync.yml`) runs these and opens a PR.

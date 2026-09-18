@@ -57,7 +57,7 @@ and integer precision limits of the hardware rather than from missing lowerings.
 | TensorRT-RTX | Native lowering with refittable weights, engine and runtime caches, CUDA graphs. WPT snapshots are maintained by contributors with GPUs; CI only compiles the backend |
 | CoreML | MLProgram lowering; runs the full WPT suite in CI on macOS with an expected-failure list |
 | LiteRT | TFLite lowering; runs in CI (non-blocking) with snapshots and an expected-failure list |
-| CANN | Runs on OpenHarmony devices; mock mode in CI |
+| CANN | Runs on OpenHarmony devices; WPT with `make test-wpt-cann` on a device; mock mode in CI |
 | Browser WebNN (wasm32) | Generated bindings and a graph-compilation test in Chrome; no `MLContext` backend yet |
 
 ## Known gaps
