@@ -148,13 +148,13 @@ Then:
 
 | Workflow | Trigger | Content |
 |---|---|---|
-| `ci.yml` | push, pull request | Cargo.lock consistency, `cargo fmt --check`, `cargo check` per feature (including wasm32, and CoreML on macOS), `cargo test --lib` on Linux and macOS plus the CANN mock, rustdoc with `-D warnings`, operator report drift check and generator tests, MkDocs strict build, version check on tags |
+| `ci.yml` | push, pull request | Cargo.lock consistency, `cargo fmt --check`, `cargo check` per feature (including wasm32, and CoreML on macOS), `cargo test --lib` on Linux and macOS plus the CANN mock, rustdoc with `-D warnings`, operator report drift check and generator tests, MkDocs strict build |
 | `wpt-conformance.yml` | push, pull request | WPT suites for ONNX Runtime (Linux), LiteRT (Linux, non-blocking) and CoreML (macOS) |
 | `wpt-conformance-nightly.yml` | schedule | Full WPT run with JSON and HTML reports; publishes the dashboard together with the docs site |
 | `wpt-sync.yml` | weekly, manual | Regenerates snapshots and expected failures against the pinned WPT revision and opens a pull request |
 | `rustnnpt-gate.yml` | pull request | Runs the external rustnnpt conformance runner against the PR's rustnn and enforces a minimum pass rate |
 | `docs.yml`, `docs-pr.yml` | push to `main`, pull request | MkDocs strict build, rustdoc embedded under `/api/`, WPT report embedded, link check on PRs, deploy to GitHub Pages from `main` |
-| `publish.yml` | GitHub release | fmt, clippy, tests, `cargo publish` |
+| `publish.yml` | GitHub release, manual | release tag matches `Cargo.toml`, fmt, clippy, tests, `cargo publish` |
 
 TensorRT-RTX has no GPU runner. CI compiles it (`cargo check -F trtx-runtime --all-targets`);
 contributors run `make test-wpt-trtx` locally before and after changing the converter.
@@ -162,9 +162,10 @@ contributors run `make test-wpt-trtx` locally before and after changing the conv
 ## Releasing
 
 Bump `version` in `Cargo.toml`, update `Cargo.lock`, tag `vX.Y.Z` and create a GitHub release.
-`publish.yml` runs formatting, Clippy and library tests before publishing to crates.io. Check
-that the tag matches the package version. docs.rs builds the API docs with the features listed
-under `[package.metadata.docs.rs]`.
+`publish.yml` fails when the release tag does not match the `Cargo.toml` version, then runs
+formatting, Clippy and library tests before publishing to crates.io. The cargo-c metadata in
+`Cargo.toml` (`[package.metadata.capi.*]`) carries the version twice more; keep the three in
+sync. docs.rs builds the API docs with the features listed under `[package.metadata.docs.rs]`.
 
 Before publishing, run `cargo package --list` and ensure every Markdown `include_str!` input is
 present, then `cargo package` to verify the packaged crate builds. The active docs are compiler

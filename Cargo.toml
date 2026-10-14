@@ -1,6 +1,6 @@
 [package]
 name = "rustnn"
-version = "0.5.11"
+version = "0.6.0"
 edition = "2024"
 # Keep in sync with the `channel` in rust-toolchain.toml.
 rust-version = "1.97"
@@ -216,6 +216,10 @@ litert-sys = { version = "0.2.1", optional = true }
 flatbuffers = { version = "25.12", optional = true }
 regex = "1.11"
 hiai-rs = { version = "0.1.0", optional = true }
+# TODO(0.6.0 publish): `cargo publish` rejects git dependencies. Release webnn-graph (main is
+# 4 commits past 0.3.0 and rustnn needs its packed 4-bit SafeTensors support) with a versioned
+# webnn-onnx-utils dependency, then switch both lines below to crates.io versions. Switching
+# only webnn-onnx-utils now would compile the crate twice (webnn-graph still pulls the git copy).
 webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main" }
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
 
@@ -322,7 +326,7 @@ filename = "rustnn"
 # Used as the package description in the pkg-config file and defaults to the crate description.
 description = "C API for the rustnn WebNN implementation"
 # Used as the package version in the pkg-config file and defaults to the crate version.
-version = "0.5.11"
+version = "0.6.0"
 # Used as the Requires field in the pkg-config file, if defined
 #requires = "gstreamer-1.0, gstreamer-base-1.0"
 # Used as the Requires.private field in the pkg-config file, if defined
@@ -337,7 +341,7 @@ version = "0.5.11"
 name = "rustnn"
 # Used as library version and defaults to the crate version. How this is used
 # depends on the target platform.
-version = "0.5.11"
+version = "0.6.0"
 # Used to disable versioning links when installing the dynamic library
 versioning = true
 # Instead of using semver, select a fixed number of version components for your SONAME version suffix:

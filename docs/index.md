@@ -9,9 +9,9 @@ neural network graphs with a WebNN-style builder, validates and shape-infers the
 them on a pluggable backend.
 
 **Experimental.** rustnn is a development release. APIs change without notice and the crate is
-not meant for production use. The API on this site is on the `main` branch and is used as a git
-dependency; the `rustnn` crate on crates.io (0.5.x) is the earlier converter and loader crate
-without `MLContext`.
+not meant for production use. This site documents the `main` branch; the `rustnn` crate on
+crates.io (0.6.0 and later) carries the same `MLContext` API, while the 0.5.x releases were the
+earlier converter and loader crate.
 
 Start with [Getting Started](user-guide/getting-started.md) for installation, then the
 [crate's runnable example](https://rustnn.github.io/rustnn/api/rustnn/#example).
