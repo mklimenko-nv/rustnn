@@ -50,6 +50,7 @@ changes listed under Changed.
 - The selected backend is reported as a span event instead of a `log` line, and messages the spans
   already carry as fields moved from `debug` to `trace`.
 - **Breaking:** `MLContext::dispatch`, `MLGraphBuilder::build` and `rustnn_save_webnn` take `MLNamedTensors` and `MLNamedOperands` (`BTreeMap`) instead of `HashMap` (#202).
+- `webnn-graph` 0.4 and `webnn-onnx-utils` 0.1.1 are taken from crates.io instead of git branches, which is what allows this crate to be published.
 - **Breaking:** `MLGraphBuilder::conv2_with_options` renamed to `conv2d_with_options` (the deprecated alias was removed in #264); `MLTensor::destoy` renamed to `destroy`.
 - Errors are `Send + Sync` (#170); backend traits require `Send + Sync` (#145, #147).
 - Dispatch validates tensor bindings: shapes and data types (#126, #132) and duplicate tensors (#220).

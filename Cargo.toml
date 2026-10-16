@@ -216,12 +216,8 @@ litert-sys = { version = "0.2.1", optional = true }
 flatbuffers = { version = "25.12", optional = true }
 regex = "1.11"
 hiai-rs = { version = "0.1.0", optional = true }
-# TODO(0.6.0 publish): `cargo publish` rejects git dependencies. Release webnn-graph (main is
-# 4 commits past 0.3.0 and rustnn needs its packed 4-bit SafeTensors support) with a versioned
-# webnn-onnx-utils dependency, then switch both lines below to crates.io versions. Switching
-# only webnn-onnx-utils now would compile the crate twice (webnn-graph still pulls the git copy).
-webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main" }
-webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
+webnn-graph = "0.4"
+webnn-onnx-utils = "0.1.1"
 
 cudarc = { version = "0.19", features = ["cuda-13020"], optional = true }
 log = "0.4.29"
