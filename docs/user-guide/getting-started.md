@@ -18,15 +18,16 @@ contains paths longer than 260 characters.
 
 ## Add the crate
 
-The WebNN API described on this site is on the `main` branch and not yet published. The
-`rustnn` crate on crates.io (0.5.x) is the earlier converter and loader crate without
-`MLContext`; the docs.rs pages describe that release. Use the git dependency until the next
-publish:
+The WebNN `MLContext` API is published on crates.io from version 0.6.0 (the 0.5.x releases were
+the earlier converter and loader crate). Add the crate with a backend feature:
 
 ```toml
 [dependencies]
-rustnn = { git = "https://github.com/rustnn/rustnn", features = ["onnx-runtime"] }
+rustnn = { version = "0.6", features = ["onnx-runtime"] }
 ```
+
+To follow unreleased changes on `main`, use the git dependency instead:
+`rustnn = { git = "https://github.com/rustnn/rustnn", features = ["onnx-runtime"] }`.
 
 Features select backends and go on this dependency line. Without a backend feature the crate
 validates and converts graphs but cannot execute them. The full feature list is in the crate
