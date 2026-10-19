@@ -1,0 +1,10 @@
+---
+source: tests/run_wpt_conformance.rs
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
+---
+(
+    "cast_rounding.https.any.js",
+    "cast float32 -> float16 -> float32 subnormal values and signed underflow input with only the widened output",
+    "onnx",
+    "PASS",
+)

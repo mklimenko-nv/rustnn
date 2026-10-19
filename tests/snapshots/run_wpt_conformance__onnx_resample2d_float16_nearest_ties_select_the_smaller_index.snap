@@ -1,0 +1,10 @@
+---
+source: tests/run_wpt_conformance.rs
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
+---
+(
+    "resample2d-nearest-half-pixel.https.any.js",
+    "resample2d float16 nearest ties select the smaller index",
+    "onnx",
+    "PASS",
+)
