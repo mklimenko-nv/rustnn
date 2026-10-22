@@ -82,6 +82,7 @@
 //!
 //! | Feature | Effect |
 //! |---|---|
+//! | `cli` (default) | Build the CLI with `clap`, `tracing-subscriber` and ONNX conversion (`onnx`) |
 //! | `onnx` | ONNX converter and `protos::onnx` (default; enabled by `onnx-runtime`). Without it, `webnn-onnx-utils` is not built |
 //! | `onnx-runtime` | ONNX Runtime backend through the `ort` crate (dynamic loading, `ORT_DYLIB_PATH`) |
 //! | `trtx-runtime` | NVIDIA TensorRT-RTX backend through the `trtx` crate; `trtx-runtime-mock` builds without a GPU |
