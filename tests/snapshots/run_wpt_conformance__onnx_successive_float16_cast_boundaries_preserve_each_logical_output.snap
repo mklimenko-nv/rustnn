@@ -1,0 +1,10 @@
+---
+source: tests/run_wpt_conformance.rs
+expression: "(&file_name, &test_name, &backend_prefix, \"PASS\")"
+---
+(
+    "cast_rounding.https.any.js",
+    "successive float16 cast boundaries preserve each logical output",
+    "onnx",
+    "PASS",
+)
