@@ -110,6 +110,9 @@ jobs:
             target
             ${{ matrix.backend.id == 'litert' && '~/.cache/litert-sys' || '' }}
           key: ${{ runner.os }}-${{ runner.arch }}-wpt-${{ matrix.backend.id }}-cargo-v2-${{ hashFiles('Cargo.lock') }}
+          # A Cargo.lock change restores the previous cache and rebuilds only what changed.
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-wpt-${{ matrix.backend.id }}-cargo-v2-
 
       - name: Fetch WPT corpus
         run: node scripts/fetch_wpt.mjs

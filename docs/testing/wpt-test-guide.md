@@ -100,6 +100,10 @@ trtx::clamp::clamp_uint64_1D_tensor_with_bigint_max
 | `make test-wpt-tolerance` | Backend-independent tolerance regressions |
 | `make test-wpt-tolerance-parity` | Compare strict finite ULP metrics with the fetched upstream JavaScript helpers |
 
+The CoreML targets build with `--no-default-features --features coreml-runtime`: the trials need
+neither the CLI, the ONNX converter nor the Burn backend. Every full-suite target builds the
+tolerance-parity test with the same cargo flags as its harness, so rustnn compiles once per run.
+
 Equivalent `cargo` invocations:
 
 ```bash
@@ -114,7 +118,8 @@ WPT_BACKEND=trtx cargo test --test run_wpt_conformance \
 cargo test --test run_wpt_conformance --features onnx-runtime -- relu --test-threads 1
 
 # CoreML, trials in parallel (libtest's default is one thread per core)
-WPT_BACKEND=coreml cargo test --test run_wpt_conformance --features coreml-runtime -- coreml
+WPT_BACKEND=coreml cargo test --test run_wpt_conformance \
+  --no-default-features --features coreml-runtime -- coreml
 ```
 
 ## Backend selection

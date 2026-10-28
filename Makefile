@@ -183,7 +183,7 @@ test-webnn-wpt-chrome-headless: require-wpt-cache webnn-chromedriver
 # WPT conformance (requires Node.js, WPT cache; set WPT_BACKEND=onnx|trtx to pick backend)
 test-wpt: onnxruntime-download
 	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- --test-threads 1
-	$(MAKE) test-wpt-tolerance-parity
+	$(MAKE) test-wpt-tolerance-parity WPT_PARITY_CARGO_FLAGS="--features onnx-runtime"
 
 test-wpt-trtx: onnxruntime-download trtxruntime-download
 	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
@@ -205,17 +205,23 @@ test-wpt-litert:
 # other backends are not validated for parallel trials and keep --test-threads 1.
 WPT_COREML_TEST_THREADS ?=
 WPT_COREML_TEST_THREADS_FLAG = $(if $(strip $(WPT_COREML_TEST_THREADS)),--test-threads $(strip $(WPT_COREML_TEST_THREADS)))
+# The CoreML WPT build needs none of the default features (CLI, ONNX converter, Burn CPU).
+WPT_COREML_CARGO_FLAGS ?= --no-default-features --features coreml-runtime
 
 test-wpt-coreml:
-	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) $(WPT_COREML_TEST_THREADS_FLAG)
-	$(MAKE) test-wpt-tolerance-parity
+	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance $(WPT_COREML_CARGO_FLAGS) -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) $(WPT_COREML_TEST_THREADS_FLAG)
+	$(MAKE) test-wpt-tolerance-parity WPT_PARITY_CARGO_FLAGS="$(WPT_COREML_CARGO_FLAGS)"
 
 .PHONY: test-wpt-burn-cpu wpt-sync-burn-cpu test-wpt-tolerance test-wpt-tolerance-parity
 test-wpt-tolerance:
 	$(CARGO) test --test test_wpt_tolerance --test test_wpt_report
 
+# WPT targets pass the cargo flags of their harness build in WPT_PARITY_CARGO_FLAGS, so one
+# run compiles rustnn once; building the two test binaries with different feature sets
+# compiled it twice. Standalone, the test builds with the default features.
+WPT_PARITY_CARGO_FLAGS ?=
 test-wpt-tolerance-parity: require-wpt-cache
-	$(CARGO) test --test test_wpt_tolerance strict_comparator_matches_upstream_javascript -- --ignored
+	$(CARGO) test $(WPT_PARITY_CARGO_FLAGS) --test test_wpt_tolerance strict_comparator_matches_upstream_javascript -- --ignored
 
 .PHONY: test-coreml-gather
 test-coreml-gather:
@@ -256,8 +262,8 @@ test-coreml-kv-benchmark:
 
 test-wpt-coreml-report:
 	@mkdir -p reports
-	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml $(WPT_COREML_TEST_THREADS_FLAG)
-	$(MAKE) test-wpt-tolerance-parity
+	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance $(WPT_COREML_CARGO_FLAGS) -- coreml $(WPT_COREML_TEST_THREADS_FLAG)
+	$(MAKE) test-wpt-tolerance-parity WPT_PARITY_CARGO_FLAGS="$(WPT_COREML_CARGO_FLAGS)"
 
 test-wpt-cann: require-wpt-cache validate-cann-env
 	@mkdir -p reports
@@ -271,11 +277,13 @@ test-wpt-op: onnxruntime-download
 	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- $(OP) --test-threads 1
 
 WPT_BACKEND ?= onnx
+# Cargo flags of the selected backend's WPT build, shared by the harness and the parity test.
+WPT_CARGO_FLAGS = $(if $(filter coreml,$(WPT_BACKEND)),$(WPT_COREML_CARGO_FLAGS),--features $(WPT_BACKEND)-runtime)
 # Full WPT run with JSON/HTML reports; exits 0 even if trials fail (for nightly pages).
 test-wpt-report: fetch-wpt onnxruntime-download
 	@mkdir -p reports
-	$(MAKE) test-wpt-tolerance-parity
-	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- $(if $(filter coreml,$(WPT_BACKEND)),$(WPT_COREML_TEST_THREADS_FLAG),--test-threads 1)
+	$(MAKE) test-wpt-tolerance-parity WPT_PARITY_CARGO_FLAGS="$(WPT_CARGO_FLAGS)"
+	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance $(WPT_CARGO_FLAGS) -- $(if $(filter coreml,$(WPT_BACKEND)),$(WPT_COREML_TEST_THREADS_FLAG),--test-threads 1)
 
 # ONNX: onnx_expected_failures.txt.
 wpt-sync-onnx: fetch-wpt
