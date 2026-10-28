@@ -199,8 +199,15 @@ test-wpt-litert:
 	@WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
 	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
 
+# CoreML trials run on libtest's default thread count (one thread per available core): the
+# harness creates one MLContext per thread, and a parallel run was validated to produce the
+# same per-case results as a serial one. WPT_COREML_TEST_THREADS=N overrides the count. The
+# other backends are not validated for parallel trials and keep --test-threads 1.
+WPT_COREML_TEST_THREADS ?=
+WPT_COREML_TEST_THREADS_FLAG = $(if $(strip $(WPT_COREML_TEST_THREADS)),--test-threads $(strip $(WPT_COREML_TEST_THREADS)))
+
 test-wpt-coreml:
-	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) --test-threads 1
+	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) $(WPT_COREML_TEST_THREADS_FLAG)
 	$(MAKE) test-wpt-tolerance-parity
 
 .PHONY: test-wpt-burn-cpu wpt-sync-burn-cpu test-wpt-tolerance test-wpt-tolerance-parity
@@ -249,7 +256,7 @@ test-coreml-kv-benchmark:
 
 test-wpt-coreml-report:
 	@mkdir -p reports
-	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml $(WPT_COREML_TEST_THREADS_FLAG)
 	$(MAKE) test-wpt-tolerance-parity
 
 test-wpt-cann: require-wpt-cache validate-cann-env
@@ -268,7 +275,7 @@ WPT_BACKEND ?= onnx
 test-wpt-report: fetch-wpt onnxruntime-download
 	@mkdir -p reports
 	$(MAKE) test-wpt-tolerance-parity
-	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
+	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- $(if $(filter coreml,$(WPT_BACKEND)),$(WPT_COREML_TEST_THREADS_FLAG),--test-threads 1)
 
 # ONNX: onnx_expected_failures.txt.
 wpt-sync-onnx: fetch-wpt
@@ -540,6 +547,7 @@ help:
 	@echo "  test-wpt-burn-cpu  - Run WPT suite via Burn NdArray CPU"
 	@echo "  wpt-sync-burn-cpu  - Regenerate Burn CPU expected failures"
 	@echo "  test-wpt-litert    - Run WPT suite via LiteRT"
+	@echo "  test-wpt-coreml    - Run WPT suite via CoreML (macOS; trials run in parallel, WPT_COREML_TEST_THREADS=N overrides)"
 	@echo "  wpt-sync-onnx      - Regenerate ONNX expected-failures"
 	@echo "  wpt-sync-litert    - Regenerate LiteRT expected-failures"
 	@echo "  wpt-sync-coreml    - Regenerate CoreML expected-failures (macOS)"

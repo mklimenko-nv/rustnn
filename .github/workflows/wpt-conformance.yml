@@ -25,10 +25,39 @@ jobs:
             label: LiteRT
             continue_on_error: true
             os: ubuntu-latest
+          # CoreML runs its trials in parallel (WPT_COREML_TEST_THREADS in the Makefile).
+          # Each thread count is its own job so the timings on the hosted runner can be
+          # compared in the job summaries; `threads: ''` is libtest's default, one per core.
           - id: coreml
             label: CoreML
             continue_on_error: false
             os: macos-latest
+            threads: ''
+          - id: coreml
+            label: CoreML (1 thread)
+            continue_on_error: false
+            os: macos-latest
+            threads: '1'
+          - id: coreml
+            label: CoreML (2 threads)
+            continue_on_error: false
+            os: macos-latest
+            threads: '2'
+          - id: coreml
+            label: CoreML (3 threads)
+            continue_on_error: false
+            os: macos-latest
+            threads: '3'
+          - id: coreml
+            label: CoreML (4 threads)
+            continue_on_error: false
+            os: macos-latest
+            threads: '4'
+          - id: coreml
+            label: CoreML (6 threads)
+            continue_on_error: false
+            os: macos-latest
+            threads: '6'
     runs-on: ${{ matrix.backend.os }}
     continue-on-error: ${{ matrix.backend.continue_on_error }}
     steps:
@@ -90,7 +119,34 @@ jobs:
         env:
           RUSTNN_GIT_SHA: ${{ github.sha }}
           RUSTNN_GIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-        run: make test-wpt-report WPT_BACKEND=${{ matrix.backend.id }}
+          # Empty for the non-CoreML backends and for libtest's default thread count.
+          WPT_COREML_TEST_THREADS: ${{ matrix.backend.threads }}
+        # `shell: bash` enables pipefail, so a failing run is not hidden by tee.
+        shell: bash
+        run: make test-wpt-report WPT_BACKEND=${{ matrix.backend.id }} 2>&1 | tee wpt-run.log
+
+      - name: Summarize the trial run
+        if: always() && matrix.backend.id != 'burn-cpu'
+        env:
+          WPT_COREML_TEST_THREADS: ${{ matrix.backend.threads }}
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.backend.label }}"
+            if [ "$RUNNER_OS" = macOS ]; then
+              echo "- runner: $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) logical CPUs, $(uname -m)"
+            else
+              echo "- runner: $(nproc) logical CPUs, $(uname -m)"
+            fi
+            if [ "${{ matrix.backend.id }}" = coreml ]; then
+              echo "- WPT_COREML_TEST_THREADS: ${WPT_COREML_TEST_THREADS:-(libtest default)}"
+            fi
+            if [ -f wpt-run.log ]; then
+              grep -m1 '^\[WPT\] result:' wpt-run.log | sed 's/^/- /' || echo '- no [WPT] result line (the run did not complete)'
+              # The last libtest summary is the WPT run; the tolerance-parity test prints one first.
+              grep '^test result:' wpt-run.log | tail -1 | sed 's/^/- libtest: /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run Burn CPU WPT conformance tests
         if: matrix.backend.id == 'burn-cpu'
@@ -108,14 +164,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.backend.id }}-wpt-conformance-report
+          name: ${{ matrix.backend.id }}${{ matrix.backend.threads && format('-{0}-threads', matrix.backend.threads) || '' }}-wpt-conformance-report
           path: reports/wpt-conformance.json
 
       - name: Upload WPT conformance HTML report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.backend.id }}-wpt-conformance-html-report
+          name: ${{ matrix.backend.id }}${{ matrix.backend.threads && format('-{0}-threads', matrix.backend.threads) || '' }}-wpt-conformance-html-report
           path: reports/wpt-conformance.html
 
 

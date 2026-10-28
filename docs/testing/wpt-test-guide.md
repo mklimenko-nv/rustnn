@@ -48,7 +48,11 @@ WPT_COREML_TENSOR_MODE=backings make test-wpt-coreml
 WPT_COREML_FLOAT16=exact WPT_COREML_DEVICE=gpu make test-wpt-coreml
 ```
 
-Always use `--test-threads 1` for WPT runs. Parallel execution is not validated for `MLContext` thread safety.
+Use `--test-threads 1` for WPT runs on every backend except CoreML: those backends are not
+validated for concurrent use across libtest threads. The CoreML targets run the trials in
+parallel on libtest's default thread count, one `MLContext` per thread (`wpt_context_pool.rs`),
+which produces the same per-case results as a serial run; `WPT_COREML_TEST_THREADS=N`
+overrides the count.
 
 ## How it works
 
@@ -89,7 +93,7 @@ trtx::clamp::clamp_uint64_1D_tensor_with_bigint_max
 | `make test-wpt-trtx` | Full suite, TensorRT backend |
 | `make test-wpt-cann` | Full suite on the CANN/HiAI NPU (cross-compiled for OHOS, run over `hdc`) |
 | `make test-wpt-litert` | Full suite, LiteRT backend |
-| `make test-wpt-coreml` | Full suite, CoreML backend (macOS); `make test-wpt-coreml-report` also writes the JSON report |
+| `make test-wpt-coreml` | Full suite, CoreML backend (macOS), trials run in parallel (`WPT_COREML_TEST_THREADS=N` overrides); `make test-wpt-coreml-report` also writes the JSON report |
 | `make test-wpt-op OP=<name>` | Filter trials by operation (e.g. `OP=add`, `OP=dequantize`); `WPT_BACKEND=<backend>` selects the backend |
 | `make test-wpt-report` | Full run with JSON/HTML reports even on failures; `WPT_BACKEND=onnx|trtx|litert|coreml` picks the backend |
 | `make wpt-sync-onnx`, `wpt-sync-litert`, `wpt-sync-coreml`, `wpt-sync-trtx`, `wpt-sync-cann` | Regenerate PASS snapshots and expected-failure lists against the pinned corpus |
@@ -108,6 +112,9 @@ WPT_BACKEND=trtx cargo test --test run_wpt_conformance \
 
 # Filter trials (libtest substring match on trial name)
 cargo test --test run_wpt_conformance --features onnx-runtime -- relu --test-threads 1
+
+# CoreML, trials in parallel (libtest's default is one thread per core)
+WPT_BACKEND=coreml cargo test --test run_wpt_conformance --features coreml-runtime -- coreml
 ```
 
 ## Backend selection

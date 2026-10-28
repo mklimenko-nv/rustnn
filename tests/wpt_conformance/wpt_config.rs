@@ -2,9 +2,10 @@
 
 /// Reuse one [`MLContext`](rustnn::mlcontext::MLContext) per [`WptBackend`](super::wpt_backend::WptBackend) per test thread.
 ///
-/// Default is `false`: benchmarks showed no ONNX CPU speedup, `OrtContext` retains tensors across
-/// trials when reused, and backends are not validated for concurrent use across libtest threads.
-/// When `true`, trials on the same thread share a context via `wpt_context_pool` (thread-local).
+/// When `true`, trials on the same thread share a context via `wpt_context_pool` (thread-local),
+/// so no context is ever shared between libtest threads. CoreML is validated for parallel trials
+/// and its Make targets use libtest's default thread count; the other backends are not validated
+/// for concurrent use and their targets pass `--test-threads 1`.
 pub const REUSE_ML_CONTEXT: bool = true;
 
 /// Opt in to upstream budgets instead of the historical compatibility floors.
