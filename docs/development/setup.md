@@ -35,7 +35,9 @@ The mock backend features and `dynamic-inputs`, `native-examples`, `pollster`, a
 
 The default `cli` feature builds the `rustnn` binary and pulls in `clap` and
 `tracing-subscriber`, and enables `onnx` for CLI conversion. Library consumers can drop
-these with `default-features = false`.
+these with `default-features = false`. `native-examples` enables the dependencies of the
+large examples (`image`, `reqwest`, `tokenizers`, `tokio`); they are optional dependencies
+rather than dev-dependencies, so `cargo test` does not compile them.
 
 ## Build and test
 

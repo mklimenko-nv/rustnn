@@ -155,7 +155,7 @@ ownership rules, package layout, and exact build and run commands.
 | `dynamic-inputs` | Dynamic dimensions bounded by a maximum size |
 | `webnn-runtime` | Browser WebNN bindings for `wasm32-unknown-unknown` (in progress) |
 | `trtx-enterprise` | The TensorRT backend linked against full TensorRT 10 (`nvinfer`) instead of TensorRT-RTX; RTX-only features such as CUDA graphs are compiled out. Used for validation, not a supported deployment target |
-| `native-examples` | Compiles the large example programs |
+| `native-examples` | Compiles the large example programs and their dependencies (`image`, `reqwest`, `tokenizers`, `tokio`), which nothing else needs |
 
 Full list and environment variables: crate docs (`make docs-api`) or
 [Backends](https://rustnn.github.io/rustnn/api/rustnn/backend_selection/).
