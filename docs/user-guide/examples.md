@@ -3,14 +3,15 @@
 ## Example programs
 
 The `examples/` directory contains complete programs. Build them with the features they need;
-the two largest are gated behind the `native-examples` feature so that `cargo build` stays
-fast.
+the three that decode images, download weights or run a tokenizer are gated behind the
+`native-examples` feature, which also enables those dependencies, so library and test builds
+never compile them.
 
 | Program | What it shows | Run |
 |---|---|---|
 | `fast_style_transfer_builder_api.rs` | Builds the fast style transfer network with the builder API (`conv2d`, `conv_transpose2d`, instance normalization with a fallback composed from reductions, `pad`), downloads the weights from the WebNN test-data repository, and pipelines inferences over pre-allocated tensors | `cargo run --release --features native-examples,onnx-runtime --example fast_style_transfer_builder_api -- --input photo.jpg --output styled.png` |
 | `smollm_mlcontext.rs` | Text generation with SmolLM-135M from an onnx2webnn export: loads `.webnn` plus weights, uses dynamic tensor shapes for the KV cache (`rustnn_set_tensor_capacity`, `rustnn_resize_tensor`) and a tokenizer | `cargo run --release --features native-examples,onnx-runtime,dynamic-inputs --example smollm_mlcontext -- --model model.webnn --tokenizer tokenizer.json --max-new-tokens 32` |
-| `resnet50_webnn_rust.rs` | ResNet-50 classification and a latency benchmark from a `.webnn` export, with ImageNet preprocessing of a JPEG or PNG input | `cargo run --release --features onnx-runtime --example resnet50_webnn_rust -- --model resnet50_Opset16.webnn --input cat.jpg --labels examples/imagenet_classes.txt --bench` |
+| `resnet50_webnn_rust.rs` | ResNet-50 classification and a latency benchmark from a `.webnn` export, with ImageNet preprocessing of a JPEG or PNG input | `cargo run --release --features native-examples,onnx-runtime --example resnet50_webnn_rust -- --model resnet50_Opset16.webnn --input cat.jpg --labels examples/imagenet_classes.txt --bench` |
 | `gpt2_webnn_rust.rs` | Older generation loops built on the legacy executor path (`ConverterRegistry` plus `run_onnx_with_inputs`) instead of `MLContext` |  |
 
 Replace `onnx-runtime` with `trtx-runtime` to run the same programs on TensorRT-RTX. All of

@@ -55,7 +55,9 @@ litert-runtime = ["litert", "litert-sys", "dep:flatbuffers"]
 cann-runtime = ["dep:hiai-rs"]
 cann-runtime-mock = []
 burn-runtime-cpu = ["dep:postcard", "dep:burn-tensor", "dep:burn-ndarray", "dep:getrandom"]
-native-examples = []
+# Enables the dependencies of the large example programs (see the `[[example]]` targets with
+# `required-features`); they are not dev-dependencies, so test builds never compile them.
+native-examples = ["dep:futures-util", "dep:image", "dep:reqwest", "dep:tokenizers", "dep:tokio"]
 wpt-embed-corpus = []
 webnn-wpt-tests = ["wpt-embed-corpus"]
 webnn-runtime = [
@@ -272,21 +274,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 safetensors = "0.8"
 half = "2.4"
-image = { version = "0.25", default-features = false, features = [
-    "jpeg",
-    "png",
-] }
 anyhow = "1.0.102"
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-] }
 libtest-mimic = "0.8.2"
 pretty_env_logger = "0.5.0"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# Example-only dependencies, compiled only with the `native-examples` feature.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures-util = { version = "0.3", optional = true }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+], optional = true }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
@@ -310,6 +313,11 @@ required-features = ["native-examples"]
 [[example]]
 name = "smollm_mlcontext"
 path = "examples/smollm_mlcontext.rs"
+required-features = ["native-examples"]
+
+[[example]]
+name = "resnet50_webnn_rust"
+path = "examples/resnet50_webnn_rust.rs"
 required-features = ["native-examples"]
 
 [lib]
